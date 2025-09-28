@@ -26,13 +26,13 @@ def init_db():
     """)
 
     cursor.execute("""
-    CREATE TABLE IF NOT EXISTS tags (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        file_id INTEGER NOT NULL,
-        tag TEXT NOT NULL,
-        FOREIGN KEY(file_id) REFERENCES files(id),
-        UNIQUE(file_id, tag)
-    )
+        CREATE TABLE IF NOT EXISTS tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER,
+            tag TEXT,
+            UNIQUE(file_id, tag),
+            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        )
     """)
 
     conn.commit()
@@ -48,7 +48,8 @@ def close_connection(conn):
 def reset_db():
     """
     Elimina y recrea las tablas. 
-    Útil para pruebas (¡no usar en producción!).
+    Esto es solo para probar, no podemos usar esta vaina en el proyecto entero porque
+    así como por arte de magia se borra la basedato y yo mato a una gente.
     """
     conn, cursor = get_connection()
     cursor.execute("DROP TABLE IF EXISTS tags")

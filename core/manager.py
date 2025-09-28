@@ -21,8 +21,11 @@ def add_files(file_list, tag_list):
 
         # Insertar etiquetas
         for tag in tag_list:
+            if " " in tag:
+                print(f"[WARNING] Etiqueta inválida '{tag}', se reemplazó por '{tag.replace(' ', '_')}'")
+                tag = tag.replace(" ", "_")
             cursor.execute("INSERT OR IGNORE INTO tags (file_id, tag) VALUES (?, ?)", (file_id, tag))
-        print("ya meti las etiquetas")
+            print("ya meti las etiquetas")
     conn.commit()
     close_connection(conn)
     print("[INFO] Archivos agregados correctamente.")

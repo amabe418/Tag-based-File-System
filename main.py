@@ -38,13 +38,17 @@ def main():
     elif command == "reset":
         print("Base de datos reseteada.")
         database.reset_db()
-    
+
+def launch_gui():
+    root = tk.Tk()
+    root.title("Tag-Based File System")
+    app = MainWindow(root)
+    root.geometry("1000x600")
+    root.mainloop()
+
 if __name__ == "__main__":
     database.init_db() # Inicializamos la bd antes de ejercer cualquier accion
     if not sys.argv[1:]:
-        root = tk.Tk()
-        root.title("Tag-Based File System")
-        app = MainWindow(root)
-        root.mainloop()
+        launch_gui()
     else:
         main()

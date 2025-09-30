@@ -10,6 +10,9 @@ class MainWindow(tk.Frame):
         self.create_widgets()
 
     def create_widgets(self):
+        """
+        Crea todos los botones y la tabla de la interfaz.
+        """
         # Marco donde agregaremos los botones
         frame_buttons = tk.Frame(self)
         frame_buttons.pack(pady=5)
@@ -33,8 +36,12 @@ class MainWindow(tk.Frame):
         self.tree.heading("path", text="Nombre")
         self.tree.heading("tags", text="Etiquetas")
         self.tree.pack(fill="both", expand=True, padx=10, pady=10)
+        self.refresh_list()
 
     def add_files(self):
+        """
+        Agrega el conjunto de archivos a la base de datos.
+        """
         dialog = AddFileDialog(self)
         self.wait_window(dialog)  # espera hasta que se cierre el diálogo
 
@@ -45,10 +52,15 @@ class MainWindow(tk.Frame):
         if dialog.result:
             file_names, tags = dialog.result
             print(dialog.result)
-            manager.add_files(file_names,tags)  # aquí puedes guardar también el nombre si lo necesitas
+            manager.add_files(file_names,tags)  # guardamos los archivos
             messagebox.showinfo("Éxito", f"Archivo(s): '{', '.join(file_names)}' \n agregado con etiquetas: {', '.join(tags)}.")
+        
+        self.refresh_list() # mostramos todos los archivos
     
     def refresh_list(self):
+        """
+        Refresca la tabla que muestra todos los ficheros.
+        """
         # Limpia la tabla
         for row in self.tree.get_children():
             self.tree.delete(row)

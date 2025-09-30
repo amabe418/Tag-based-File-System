@@ -3,12 +3,15 @@ from tkinter import filedialog, messagebox
 import os
 
 class AddFileDialog(tk.Toplevel):
+    """
+    Cuadro de dialogo para agregar un conjunto de archivos.
+    """
     def __init__(self, parent):
         super().__init__(parent)
         self.title("Agregar archivo(s)")
         self.result = None
 
-        # Mostrar archivos seleccionados
+        # Cuadro de entrada del conjunto de archivos
         tk.Label(self, text="Nombre(s) de archivo(s) (separados por coma)\nEj: archivo1, archivo2, ...").grid(row=1, column=0, sticky="nw", padx=5, pady=5)
         self.files_entry = tk.Entry(self, width=40)
         self.files_entry.grid(row=1, column=1, columnspan=2, padx=5, pady=5)
@@ -25,7 +28,6 @@ class AddFileDialog(tk.Toplevel):
         self.grab_set()  # modal
 
     def on_ok(self):
-
         file_names = [fn.strip() for fn in self.files_entry.get().split(",")]
         print(file_names)
 

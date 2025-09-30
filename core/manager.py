@@ -56,7 +56,8 @@ def query_files(query_tags):
         cursor.execute("""
             SELECT f.id, f.name, GROUP_CONCAT(t.tag)
             FROM files f
-            LEFT JOIN tags t ON f.id = t.file_id
+            LEFT JOIN file_tags ft ON f.id = ft.file_id
+            LEFT JOIN tags t ON ft.tag_id = t.id
             GROUP BY f.id
         """)
     else:
@@ -64,7 +65,8 @@ def query_files(query_tags):
         sql = f"""
         SELECT f.id, f.name, GROUP_CONCAT(t.tag)
         FROM files f
-        JOIN tags t ON f.id = t.file_id
+        JOIN file_tags ft ON f.id = ft.file_id
+        JOIN tags t ON ft.tag_id = t.id
         WHERE t.tag IN ({placeholders})
         GROUP BY f.id
         HAVING COUNT(DISTINCT t.tag) = ?
@@ -76,6 +78,7 @@ def query_files(query_tags):
     return results
 
 
+
 def list_files(query_tags):
     """
     Lista en consola los ficheros que cumplen con la consulta.
@@ -85,23 +88,25 @@ def list_files(query_tags):
     print (files)
     for _, name, tags in files:
         print(f"{name} | Etiquetas: {tags}")
+    return files
 
 
-# def delete_files(query_tags):
-#     """
-#     Elimina los ficheros que cumplen con la consulta.
-#     """
-#     conn, cursor = get_connection()
-#     files = query_files(query_tags)
+def delete_files(query_tags):
+    """
+    Elimina los ficheros que cumplen con la consulta.
+    """
+    conn, cursor = get_connection()
+    files = query_files(query_tags)
 
-#     for file_id, name, _ in files:
-#         cursor.execute("DELETE FROM tags WHERE file_id = ?", (file_id,))
-#         cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
-#         print(f"[INFO] Eliminado: {name}")
-
-#     conn.commit()
-#     close_connection(conn)
-#     print(f"[INFO] {len(files)} archivos eliminados.")
+    for file_id, name, _ in files:
+            # Primero eliminar relaciones file_tags
+            cursor.execute("DELETE FROM file_tags WHERE file_id = ?", (file_id,))
+            # Luego eliminar el fichero
+            cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
+            print(f"[INFO] Eliminado: {name}")
+    conn.commit()
+    close_connection(conn)
+    print(f"[INFO] {len(files)} archivos eliminados.")
 
 
 # def add_tags(query_tags, new_tags):

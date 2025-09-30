@@ -43,7 +43,7 @@ def launch_gui():
     root = tk.Tk()
     root.title("Tag-Based File System")
     app = MainWindow(root)
-    root.geometry("1000x600")
+    root.geometry("1300x600")
     root.mainloop()
 
 if __name__ == "__main__":

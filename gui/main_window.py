@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from core import manager  # nuestro backend centralizado
 from gui.add_file_dialog import AddFileDialog
+from gui.list_files_dialog import ListFilesDialog
 
 class MainWindow(tk.Frame):
     def __init__(self, master=None):
@@ -21,8 +22,16 @@ class MainWindow(tk.Frame):
         btn_add = tk.Button(frame_buttons, text="➕ Agregar archivo(s)", command=self.add_files)
         btn_add.pack(side=tk.LEFT, padx=5)
 
-        btn_list = tk.Button(frame_buttons, text="📖 Listar archivos", command=self.refresh_list)
+        btn_list = tk.Button(frame_buttons, text="📖 Listar archivos", command=self.list_files)
         btn_list.pack(side=tk.LEFT, padx=5)
+
+        # TO DO
+        btn_add = tk.Button(frame_buttons, text="🗑️ Eliminar fichero(s)")
+        btn_add.pack(side=tk.LEFT, padx=5)
+
+        # TO DO
+        btn_add = tk.Button(frame_buttons, text="🔖❌ Eliminar etiqueta(s)")
+        btn_add.pack(side=tk.LEFT, padx=5)
 
         tree_frame = tk.Frame(self)
         tree_frame.pack(fill="both", expand=True, padx=10, pady=10)
@@ -57,15 +66,44 @@ class MainWindow(tk.Frame):
         
         self.refresh_list() # mostramos todos los archivos
     
-    def refresh_list(self):
+    def refresh_list(self, files=None):
         """
-        Refresca la tabla que muestra todos los ficheros.
+        Refresca la tabla para mostrar todos los ficheros.
         """
         # Limpia la tabla
         for row in self.tree.get_children():
             self.tree.delete(row)
 
-        # Obtiene archivos del manager
-        files = manager.list_files("")
-        for _, name, tags in files:
-            self.tree.insert("","end",values=([name],",".join([tags])))
+        # No se paso una lista de datos. Por tanto mostramos todos los resultados
+        if not files: 
+            # Obtiene archivos del manager
+            files = manager.list_files("")
+            for _, name, tags in files:
+                self.tree.insert("","end",values=([name],",".join([tags])))
+        else:
+            for _, name, tags in files:
+                self.tree.insert("","end",values=([name],",".join([tags])))
+
+    def list_files(self):
+        dialog = ListFilesDialog(self)
+        self.wait_window(dialog)
+
+        if dialog.result is not None:  # el usuario no canceló
+            tags = dialog.result
+            files = manager.list_files(tags)
+
+            if tags: # Se hizo una busqueda por etiquetas
+                head_message = "Archivos filtrados:"
+                body = f" se encontrarion {len(files)}"
+                tail_message = " con esas etiquetas."
+            else: # No se especificaron etiquetas para hacer la busqueda
+                head_message = "Mostrando todos los archivos:"
+                body = f" hay un total de {len(files)}"
+                tail_message = "."
+
+            # Mostramos el mensaje de exito o fracaso y refrescamos lista en la ventana principal para mostrar resultados 
+            if len(files):
+                messagebox.showinfo("Mostrando Archivos",message=head_message + body + tail_message)
+                self.refresh_list(files)
+            else:
+                messagebox.showinfo(":(", "No se encontraron archivos con las etiquetas especificadas.")

@@ -37,6 +37,15 @@ def main():
     elif command == "delete":
         tag_query = sys.argv[2:]
         manager.delete_files(tag_query)
+    elif command == "add-tags":
+        if len(sys.argv) < 4:
+            print("[ERROR] Uso: python main.py add-tags <tags_consulta> <nuevas_etiquetas>")
+            exit()
+
+        query_tags = sys.argv[2].split(",")
+        new_tags = sys.argv[3].split(",")
+
+        manager.add_tags(query_tags, new_tags)
     elif command == "reset":
         database.reset_db()
     

@@ -104,21 +104,33 @@ def delete_files(query_tags, db_path="database/db.db"):
     print(f"[INFO] {len(file_ids)} archivos eliminados.")
 
 
-# def add_tags(query_tags, new_tags):
-#     """
-#     Añade etiquetas a los ficheros que cumplen con la consulta.
-#     """
-#     conn, cursor = get_connection()
-#     files = query_files(query_tags)
+def add_tags(query_tags, new_tags, db_path="database/db.db"):
+    """
+    Añade etiquetas a los ficheros que cumplen con la consulta.
+    """
+    conn, cursor = get_connection(db_path)
+    files = query_files(query_tags, db_path)
 
-#     for file_id, name, _ in files:
-#         for tag in new_tags:
-#             cursor.execute("INSERT OR IGNORE INTO tags (file_id, tag) VALUES (?, ?)", (file_id, tag))
-#         print(f"[INFO] Etiquetas agregadas a {name}")
+    for file_id, name, _ in files:
+        for tag in new_tags:
+            # Normalizamos el tag (sin espacios, en minúsculas por consistencia)
+            tag = tag.strip()
 
-#     conn.commit()
-#     close_connection(conn)
+            # Insertar etiqueta en tags si no existe
+            cursor.execute("INSERT OR IGNORE INTO tags(tag) VALUES (?)", (tag,))
+            cursor.execute("SELECT id FROM tags WHERE tag = ?", (tag,))
+            tag_id = cursor.fetchone()[0]
 
+            # Relacionar el archivo con la etiqueta
+            cursor.execute(
+                "INSERT OR IGNORE INTO file_tags(file_id, tag_id) VALUES (?, ?)",
+                (file_id, tag_id)
+            )
+
+        print(f"[INFO] Etiquetas agregadas a {name}")
+
+    conn.commit()
+    close_connection(conn)
 
 # def delete_tags(query_tags, del_tags):
 #     """

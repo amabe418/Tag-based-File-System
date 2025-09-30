@@ -68,9 +68,11 @@ def list_files(query_tags):
     """
     files = query_files(query_tags)
     print("ya busque los ficheros")
-    print (files)
+    print(files)
     for _, name, tags in files:
         print(f"{name} | Etiquetas: {tags}")
+    
+    return files
 
 
 # def delete_files(query_tags):

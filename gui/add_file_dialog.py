@@ -1,19 +1,20 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox
+import os
 
 class AddFileDialog(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
-        self.title("Agregar archivo")
+        self.title("Agregar archivo(s)")
         self.result = None
 
-        # Nombre del archivo
-        tk.Label(self, text="Nombre:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        self.name_entry = tk.Entry(self, width=40)
-        self.name_entry.grid(row=1, column=1, columnspan=2, padx=5, pady=5)
+        # Mostrar archivos seleccionados
+        tk.Label(self, text="Nombre(s) de archivo(s) (separados por coma)\nEj: archivo1, archivo2, ...").grid(row=1, column=0, sticky="nw", padx=5, pady=5)
+        self.files_entry = tk.Entry(self, width=40)
+        self.files_entry.grid(row=1, column=1, columnspan=2, padx=5, pady=5)
 
         # Etiquetas
-        tk.Label(self, text="Etiquetas (separadas por coma)\nEj: etiqueta1, etiqueta2, ...").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        tk.Label(self, text="Etiqueta(s) (separadas por coma)\nEj: etiqueta1, etiqueta2, ...").grid(row=2, column=0, sticky="w", padx=5, pady=5)
         self.tags_entry = tk.Entry(self, width=40)
         self.tags_entry.grid(row=2, column=1, columnspan=2, padx=5, pady=5)
 
@@ -21,24 +22,26 @@ class AddFileDialog(tk.Toplevel):
         tk.Button(self, text="Aceptar", command=self.on_ok).grid(row=3, column=1, pady=10)
         tk.Button(self, text="Cancelar", command=self.destroy).grid(row=3, column=2, pady=10)
 
-        self.grab_set()  # Bloquea ventana principal hasta cerrar este dialog
-
-    def choose_file(self):
-        filepath = filedialog.askopenfilename()
-        if filepath:
-            self.file_entry.delete(0, tk.END)
-            self.file_entry.insert(0, filepath)
+        self.grab_set()  # modal
 
     def on_ok(self):
-        name = self.name_entry.get().strip()
-        tags = self.tags_entry.get().strip()
 
-        if not name:
-            messagebox.showwarning("Faltan datos", "Debe escribir un nombre.")
+        file_names = [fn.strip() for fn in self.files_entry.get().split(",")]
+        print(file_names)
+
+
+        if not file_names:
+            messagebox.showwarning("Faltan archivos", "Debe insertar al menos un archivo.")
             return
+
+        tags = self.tags_entry.get().strip().split(",")
         if not tags:
             messagebox.showwarning("Faltan datos", "Debe escribir al menos una etiqueta.")
             return
+        
+        # # Guardar resultado: lista de tuplas (nombre del archivo completo, tags)
+        self.result = [file_names, tags]
+        
+        # print(self.result) # debug
 
-        self.result = (name, [t.strip() for t in tags.split(",") if t.strip()])
         self.destroy()

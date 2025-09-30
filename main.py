@@ -2,11 +2,11 @@
 import sys
 from core import manager
 from core import database 
+import tkinter as tk
+from gui.main_window import MainWindow
 
 def main():
-    database.init_db()
-    command = sys.argv[1]
-    
+    command = sys.argv[1]    
     if command == "add":
         files = sys.argv[2].split(",")
 
@@ -39,4 +39,11 @@ def main():
         database.reset_db()
     
 if __name__ == "__main__":
-    main()
+    database.init_db() # Inicializamos la bd antes de ejercer cualquier accion
+    if not sys.argv[1:]:
+        root = tk.Tk()
+        root.title("Tag-Based File System")
+        app = MainWindow(root)
+        root.mainloop()
+    else:
+        main()

@@ -18,23 +18,32 @@ def init_db():
     """
     conn, cursor = get_connection()
 
+    # tabla de archivos
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE NOT NULL
     )
     """)
-
+    
+    # Tabla de etiquetas (únicas)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS tags (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id INTEGER,
-            tag TEXT,
-            UNIQUE(file_id, tag),
-            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+            tag TEXT UNIQUE
         )
     """)
-
+    
+    # Tabla intermedia archivo-etiqueta
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS file_tags (
+            file_id INTEGER,
+            tag_id INTEGER,
+            PRIMARY KEY(file_id, tag_id),
+            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+            FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
+        )
+    """)
     conn.commit()
     conn.close()
 

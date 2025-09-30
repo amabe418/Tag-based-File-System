@@ -5,31 +5,37 @@ def add_files(file_list, tag_list):
     """
     Agrega ficheros y sus etiquetas al sistema.
     """
+    if not tag_list:
+        print("[ERROR] No se pueden agregar ficheros sin etiquetas.")
+        return
+
     conn, cursor = get_connection()
 
     for file_name in file_list:
-        print(file_name)
-        # if not os.path.exists(file_name):
-        #     print(f"[WARNING] El fichero {file_name} no existe, se ignora.")
-        #     continue
-
         # Insertar fichero si no existe
         cursor.execute("INSERT OR IGNORE INTO files (name) VALUES (?)", (file_name,))
         cursor.execute("SELECT id FROM files WHERE name = ?", (file_name,))
         file_id = cursor.fetchone()[0]
-        print("ya meti el archivo")
 
-        # Insertar etiquetas
+        # Insertar etiquetas y la relación
         for tag in tag_list:
-            if " " in tag:
-                print(f"[WARNING] Etiqueta inválida '{tag}', se reemplazó por '{tag.replace(' ', '_')}'")
-                tag = tag.replace(" ", "_")
-            cursor.execute("INSERT OR IGNORE INTO tags (file_id, tag) VALUES (?, ?)", (file_id, tag))
-            print("ya meti las etiquetas")
+            tag = tag.strip()
+            if not tag:
+                continue
+
+            # Insertar etiqueta única
+            cursor.execute("INSERT OR IGNORE INTO tags (tag) VALUES (?)", (tag,))
+            cursor.execute("SELECT id FROM tags WHERE tag = ?", (tag,))
+            tag_id = cursor.fetchone()[0]
+
+            # Insertar relación archivo-etiqueta
+            cursor.execute("""
+                INSERT OR IGNORE INTO file_tags (file_id, tag_id) VALUES (?, ?)
+            """, (file_id, tag_id))
+
     conn.commit()
     close_connection(conn)
     print("[INFO] Archivos agregados correctamente.")
-
 
 def query_files(query_tags):
     """

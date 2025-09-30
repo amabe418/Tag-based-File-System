@@ -34,6 +34,9 @@ def main():
     elif command == "list":
         tag_query = sys.argv[2:]
         manager.list_files(tag_query)
+
+    elif command == "reset":
+        database.reset_db()
     
 if __name__ == "__main__":
     main()

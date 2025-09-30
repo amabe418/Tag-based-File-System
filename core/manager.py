@@ -132,17 +132,26 @@ def add_tags(query_tags, new_tags, db_path="database/db.db"):
     conn.commit()
     close_connection(conn)
 
-# def delete_tags(query_tags, del_tags):
-#     """
-#     Elimina etiquetas de los ficheros que cumplen con la consulta.
-#     """
-#     conn, cursor = get_connection()
-#     files = query_files(query_tags)
+def delete_tags(query_tags, del_tags):
+    """
+    Elimina etiquetas de los ficheros que cumplen con la consulta.
+    """
+    conn, cursor = get_connection()
+    files = query_files(query_tags)
 
-#     for file_id, name, _ in files:
-#         for tag in del_tags:
-#             cursor.execute("DELETE FROM tags WHERE file_id = ? AND tag = ?", (file_id, tag))
-#         print(f"[INFO] Etiquetas eliminadas de {name}")
+    for file_id, name, _ in files:
+        for tag in del_tags:
+            # Buscar el id de la etiqueta
+            cursor.execute("SELECT id FROM tags WHERE tag = ?", (tag,))
+            row = cursor.fetchone()
+            if row:
+                tag_id = row[0]
+                # Eliminar la relación en file_tags
+                cursor.execute(
+                    "DELETE FROM file_tags WHERE file_id = ? AND tag_id = ?",
+                    (file_id, tag_id)
+                )
+        print(f"[INFO] Etiquetas eliminadas de {name}")
 
-#     conn.commit()
-#     close_connection(conn)
+    conn.commit()
+    close_connection(conn)

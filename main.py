@@ -46,8 +46,30 @@ def main():
         new_tags = sys.argv[3].split(",")
 
         manager.add_tags(query_tags, new_tags)
+    elif command == "delete-tags":
+        if len(sys.argv) < 4:
+            print("[ERROR] Debes indicar etiquetas para eliminar.")
+        else:
+            query_tags = sys.argv[2].split(",")
+            del_tags_str = " ".join(sys.argv[3:]).strip()
+            del_tags = [t.strip() for t in del_tags_str.split(",")]
+
+            # Validación de etiquetas
+            for t in del_tags:
+                if " " in t:
+                    print(f"[ERROR] La etiqueta '{t}' contiene espacios. Usa guion bajo '_' en lugar de espacios.")
+                    exit()
+
+            manager.delete_tags(query_tags, del_tags)
+
     elif command == "reset":
         database.reset_db()
+    else:
+        print(f"[ERROR] las funciones permitidas son add, delete, list, add-tags, delete-tags")
+        exit()
+
+
+
     
 if __name__ == "__main__":
     main()

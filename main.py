@@ -36,6 +36,7 @@ def main():
         manager.list_files(tag_query)
 
     elif command == "reset":
+        print("Base de datos reseteada.")
         database.reset_db()
     
 if __name__ == "__main__":

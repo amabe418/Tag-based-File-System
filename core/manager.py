@@ -1,7 +1,7 @@
 import os
 from core.database import get_connection, close_connection
 
-def add_files(file_list, tag_list):
+def add_files(file_list, tag_list, db_path="database/db.db"):
     """
     Agrega ficheros y sus etiquetas al sistema.
     """
@@ -9,7 +9,7 @@ def add_files(file_list, tag_list):
         print("[ERROR] No se pueden agregar ficheros sin etiquetas.")
         return
 
-    conn, cursor = get_connection()
+    conn, cursor = get_connection(db_path)
 
     for file_name in file_list:
         file_name = file_name.strip()
@@ -45,16 +45,12 @@ def add_files(file_list, tag_list):
     close_connection(conn)
     print("[INFO] Archivos agregados correctamente.")
 
-def query_files(query_tags):
-    """
-    Devuelve todos los ficheros que cumplen con las etiquetas dadas.
-    Si query_tags está vacío, devuelve todos los ficheros.
-    """
-    conn, cursor = get_connection()
+def query_files(query_tags, db_path="database/db.db"):
+    conn, cursor = get_connection(db_path)
 
     if not query_tags:
         cursor.execute("""
-            SELECT f.id, f.name, GROUP_CONCAT(t.tag)
+            SELECT f.id, f.name, GROUP_CONCAT(DISTINCT t.tag)
             FROM files f
             LEFT JOIN file_tags ft ON f.id = ft.file_id
             LEFT JOIN tags t ON ft.tag_id = t.id
@@ -63,7 +59,7 @@ def query_files(query_tags):
     else:
         placeholders = ",".join("?" for _ in query_tags)
         sql = f"""
-        SELECT f.id, f.name, GROUP_CONCAT(t.tag)
+        SELECT f.id, f.name, GROUP_CONCAT(DISTINCT t.tag)
         FROM files f
         JOIN file_tags ft ON f.id = ft.file_id
         JOIN tags t ON ft.tag_id = t.id
@@ -78,7 +74,6 @@ def query_files(query_tags):
     return results
 
 
-
 def list_files(query_tags):
     """
     Lista en consola los ficheros que cumplen con la consulta.
@@ -91,22 +86,22 @@ def list_files(query_tags):
     return files
 
 
-def delete_files(query_tags):
-    """
-    Elimina los ficheros que cumplen con la consulta.
-    """
-    conn, cursor = get_connection()
-    files = query_files(query_tags)
+def delete_files(query_tags, db_path="database/db.db"):
+    conn, cursor = get_connection(db_path)
+    files = query_files(query_tags, db_path)
 
-    for file_id, name, _ in files:
-            # Primero eliminar relaciones file_tags
-            cursor.execute("DELETE FROM file_tags WHERE file_id = ?", (file_id,))
-            # Luego eliminar el fichero
-            cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
-            print(f"[INFO] Eliminado: {name}")
+    # Evitar IDs repetidos
+    file_ids = set(file_id for file_id, _, _ in files)
+
+    for file_id in file_ids:
+        # Primero eliminar relaciones file_tags
+        cursor.execute("DELETE FROM file_tags WHERE file_id = ?", (file_id,))
+        # Luego eliminar el fichero
+        cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
+
     conn.commit()
     close_connection(conn)
-    print(f"[INFO] {len(files)} archivos eliminados.")
+    print(f"[INFO] {len(file_ids)} archivos eliminados.")
 
 
 # def add_tags(query_tags, new_tags):

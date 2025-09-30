@@ -4,19 +4,19 @@ import os
 # Ruta por defecto de la base de datos
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "database", "db.db")
 
-def get_connection():
+def get_connection(db_path="database/db.db"):
     """
     Abre una conexión a la base de datos y devuelve (conn, cursor).
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     return conn, cursor
 
-def init_db():
+def init_db(db_path="database/db.db"):
     """
     Inicializa la base de datos creando las tablas necesarias si no existen.
     """
-    conn, cursor = get_connection()
+    conn, cursor = get_connection(db_path)
 
     # tabla de archivos
     cursor.execute("""

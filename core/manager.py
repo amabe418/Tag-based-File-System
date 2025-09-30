@@ -12,10 +12,18 @@ def add_files(file_list, tag_list):
     conn, cursor = get_connection()
 
     for file_name in file_list:
-        # Insertar fichero si no existe
-        cursor.execute("INSERT OR IGNORE INTO files (name) VALUES (?)", (file_name,))
+        file_name = file_name.strip()
+
+        # Revisar si ya existe
         cursor.execute("SELECT id FROM files WHERE name = ?", (file_name,))
-        file_id = cursor.fetchone()[0]
+        exists = cursor.fetchone()
+        if exists:
+            print(f"[ERROR] El fichero '{file_name}' ya existe en la base de datos. No se puede volver a agregar.")
+            continue  # saltamos este fichero, pero seguimos con los demás
+
+        # Insertar fichero
+        cursor.execute("INSERT INTO files (name) VALUES (?)", (file_name,))
+        file_id = cursor.lastrowid
 
         # Insertar etiquetas y la relación
         for tag in tag_list:

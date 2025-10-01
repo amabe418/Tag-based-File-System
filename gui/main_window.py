@@ -67,8 +67,11 @@ class MainWindow(tk.Frame):
         if dialog.result:
             file_names, tags = dialog.result
             print(dialog.result)
-            manager.add_files(file_names,tags)  # guardamos los archivos
-            messagebox.showinfo("Éxito", f"Archivo(s): '{', '.join(file_names)}' \n agregado con etiquetas: {', '.join(tags)}.")
+            res, file_name = manager.add_files(file_names,tags)  # guardamos los archivos
+            if res:
+                messagebox.showinfo("Éxito", f"Archivo(s): '{', '.join(file_names)}' \n agregado con etiquetas: {', '.join(tags)}.")
+            else:
+                messagebox.showinfo("Fracaso","Ya existe un archivo {mssg} en el sistema.")
         
         self.refresh_list() # mostramos todos los archivos
     
@@ -93,9 +96,12 @@ class MainWindow(tk.Frame):
             tag_query, tag_list = dialog.result
             print("las etiquetas a buscar son {tag_query}")
             print("las etiquetas a eliminar son {tag_list}")
-            manager.delete_tags(tag_query,tag_list)
-            messagebox.showinfo("Éxito","Las etiquetas se eliminaron correctamente sobre los archivos cuyas etiquetas se corresponden con su criterio de búsqueda.")
-        
+            res = manager.delete_tags(tag_query,tag_list)
+            if res:
+                messagebox.showinfo("Éxito","Las etiquetas se eliminaron correctamente sobre los archivos cuyas etiquetas se corresponden con su criterio de búsqueda.")
+            else:
+                messagebox.showinfo("Fracaso","No existe ningún archivo que coincida con su criterio de búsqueda.")
+
         self.refresh_list()
 
     def delete_files(self):
@@ -106,8 +112,12 @@ class MainWindow(tk.Frame):
         if dialog.result:
             tag_query = dialog.result
             print("las etiquetas a buscar son: {tags}")
-            manager.delete_files(tag_query)
-            messagebox.showinfo("Éxito","Los archivos cuyas etiquetas coinciden su criterio de búsqueda fueron eliminados.")
+            res = manager.delete_files(tag_query)
+            if res:
+                messagebox.showinfo("Éxito","Los archivos cuyas etiquetas coinciden su criterio de búsqueda fueron eliminados.")
+            else:
+                messagebox.showinfo("Fracaso","No existe ningún archivo que coincida con su criterio de búsqueda.")
+
 
         self.refresh_list()
         

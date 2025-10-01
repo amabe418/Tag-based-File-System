@@ -14,18 +14,8 @@ def add_files(file_list, tag_list, db_path="database/db.db"):
     for file_name in file_list:
         file_name = file_name.strip()
 
-        # Revisar si ya existe
-        cursor.execute("SELECT id FROM files WHERE name = ?", (file_name,))
-        file_id = cursor.fetchone()[0]
-        exists = cursor.fetchone()
-        if exists:
-            print(f"[ERROR] El fichero '{file_name}' ya existe en la base de datos. No se puede volver a agregar.")
-            return False, file_name # al primero que exista se para la insercion
-            
-
-        # Insertar fichero
-        cursor.execute("INSERT INTO files (name) VALUES (?)", (file_name,))
-        file_id = cursor.lastrowid
+        # Insertar fichero si no existe
+        cursor.execute("INSERT OR IGNORE INTO files (name) VALUES (?)", (file_name,))
 
         # Recuperar siempre el id correcto del archivo
         cursor.execute("SELECT id FROM files WHERE name = ?", (file_name,))
@@ -49,7 +39,6 @@ def add_files(file_list, tag_list, db_path="database/db.db"):
     conn.commit()
     close_connection(conn)
     print("[INFO] Archivos agregados correctamente.")
-    return True, ''
 
 def query_files(query_tags, db_path="database/db.db"):
     conn, cursor = get_connection(db_path)

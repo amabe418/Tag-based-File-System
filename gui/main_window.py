@@ -35,7 +35,6 @@ class MainWindow(tk.Frame):
         btn_add = tk.Button(frame_buttons, text="🔖❌ Eliminar etiqueta(s)", command=self.delete_tags)
         btn_add.pack(side=tk.LEFT, padx=5)
 
-        # TO DO
         btn_add = tk.Button(frame_buttons, text="🗑️ Eliminar archivo(s)", command=self.delete_files)
         btn_add.pack(side=tk.LEFT, padx=5)
 
@@ -83,9 +82,11 @@ class MainWindow(tk.Frame):
             query_tags, new_tags = dialog.result
             print(f"Las etiquetas a buscar son {query_tags}")
             print(f"Las etiquetas a annadir son {new_tags}")
-            manager.add_tags(query_tags, new_tags)
-            messagebox.showinfo("Éxito", "Las nuevas etiquetas se agregaron correctamente a los archivos cuyas etiquetas se corresponden con su criterio de búsqueda.")
-
+            res = manager.add_tags(query_tags, new_tags)
+            if res:
+                messagebox.showinfo("Éxito", "Las nuevas etiquetas se agregaron correctamente a los archivos cuyas etiquetas se corresponden con su criterio de búsqueda.")
+            else:
+                messagebox.showinfo("Fracaso", "No se encontraron archivos que coincidan con su criterio de búsqueda.")
         self.refresh_list()
     
     def delete_tags(self):

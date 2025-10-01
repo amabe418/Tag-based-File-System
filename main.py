@@ -40,7 +40,6 @@ def main():
     elif command == "add-tags":
         if len(sys.argv) < 4:
             print("[ERROR] Uso: python main.py add-tags <tags_consulta> <nuevas_etiquetas>")
-            exit()
 
         query_tags = sys.argv[2].split(",")
         new_tags = sys.argv[3].split(",")
@@ -75,6 +74,7 @@ def launch_gui():
 
 if __name__ == "__main__":
     database.init_db() # Inicializamos la bd antes de ejercer cualquier accion
+    # Si no se utilizo ningun comando, inicializamos la interfaz grafica
     if not sys.argv[1:]:
         launch_gui()
     else:

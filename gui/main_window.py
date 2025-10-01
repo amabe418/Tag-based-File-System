@@ -1,8 +1,12 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from core import manager  # nuestro backend centralizado
-from gui.add_file_dialog import AddFileDialog
+from gui.add_files_dialog import AddFileDialog
 from gui.list_files_dialog import ListFilesDialog
+from gui.add_tags_dialog import AddTagsDialog
+from gui.delete_tags_dialog import DeleteTagsDialog 
+from gui.delete_files_dialog import DeleteFilesDialog 
+
 
 class MainWindow(tk.Frame):
     def __init__(self, master=None):
@@ -25,12 +29,14 @@ class MainWindow(tk.Frame):
         btn_list = tk.Button(frame_buttons, text="📖 Listar archivos", command=self.list_files)
         btn_list.pack(side=tk.LEFT, padx=5)
 
-        # TO DO
-        btn_add = tk.Button(frame_buttons, text="🗑️ Eliminar fichero(s)")
+        btn_list = tk.Button(frame_buttons, text="🔖➕ Agregar etiqueta(s)",command=self.add_tags)
+        btn_list.pack(side=tk.LEFT, padx=5)
+
+        btn_add = tk.Button(frame_buttons, text="🔖❌ Eliminar etiqueta(s)", command=self.delete_tags)
         btn_add.pack(side=tk.LEFT, padx=5)
 
         # TO DO
-        btn_add = tk.Button(frame_buttons, text="🔖❌ Eliminar etiqueta(s)")
+        btn_add = tk.Button(frame_buttons, text="🗑️ Eliminar archivo(s)", command=self.delete_files)
         btn_add.pack(side=tk.LEFT, padx=5)
 
         tree_frame = tk.Frame(self)
@@ -66,6 +72,46 @@ class MainWindow(tk.Frame):
         
         self.refresh_list() # mostramos todos los archivos
     
+    def add_tags(self):
+        dialog = AddTagsDialog(self)
+        self.wait_window(dialog)
+        
+        if dialog.result:
+            query_tags, new_tags = dialog.result
+            print(f"Las etiquetas a buscar son {query_tags}")
+            print(f"Las etiquetas a annadir son {new_tags}")
+            manager.add_tags(query_tags, new_tags)
+            messagebox.showinfo("Éxito", "Las nuevas etiquetas se agregaron correctamente a los archivos cuyas etiquetas se corresponden con su criterio de búsqueda.")
+
+        self.refresh_list()
+    
+    def delete_tags(self):
+        dialog = DeleteTagsDialog(self)
+        self.wait_variable(dialog)
+
+        if dialog.result:
+            tag_query, tag_list = dialog.result
+            print("las etiquetas a buscar son {tag_query}")
+            print("las etiquetas a eliminar son {tag_list}")
+            manager.delete_tags(tag_query,tag_list)
+            messagebox.showinfo("Éxito","Las etiquetas se eliminaron correctamente sobre los archivos cuyas etiquetas se corresponden con su criterio de búsqueda.")
+        
+        self.refresh_list()
+
+    def delete_files(self):
+        dialog = DeleteFilesDialog(self)
+        self.wait_window(dialog)
+
+        print("Resultado de borrar {dialog.result}")
+        if dialog.result:
+            tag_query = dialog.result
+            print("las etiquetas a buscar son: {tags}")
+            manager.delete_files(tag_query)
+            messagebox.showinfo("Éxito","Los archivos cuyas etiquetas coinciden su criterio de búsqueda fueron eliminados.")
+
+        self.refresh_list()
+        
+    
     def refresh_list(self, files=None):
         """
         Refresca la tabla para mostrar todos los ficheros.
@@ -78,6 +124,7 @@ class MainWindow(tk.Frame):
         if not files: 
             # Obtiene archivos del manager
             files = manager.list_files("")
+            print(files)
             for _, name, tags in files:
                 self.tree.insert("","end",values=([name],",".join([tags])))
         else:
@@ -105,5 +152,8 @@ class MainWindow(tk.Frame):
             if len(files):
                 messagebox.showinfo("Mostrando Archivos",message=head_message + body + tail_message)
                 self.refresh_list(files)
-            else:
+            elif not len(files) and not tags:
+                messagebox.showinfo(":(","No hay archivos en el sistema.")
+            elif not len(files):
                 messagebox.showinfo(":(", "No se encontraron archivos con las etiquetas especificadas.")
+            

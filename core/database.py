@@ -63,6 +63,7 @@ def reset_db():
     conn, cursor = get_connection()
     cursor.execute("DROP TABLE IF EXISTS tags")
     cursor.execute("DROP TABLE IF EXISTS files")
+    cursor.execute("DROP TABLE IF EXISTS file_tags")
     conn.commit()
     conn.close()
     init_db()

@@ -17,7 +17,7 @@ class AddFileDialog(tk.Toplevel):
         self.files_entry.grid(row=1, column=1, columnspan=2, padx=5, pady=5)
 
         # Etiquetas
-        tk.Label(self, text="Etiqueta(s) (separadas por coma)\nEj: etiqueta1, etiqueta2, ...").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        tk.Label(self, text="Etiqueta(s) (separadas por coma)\n                     Ej: etiqueta1, etiqueta2, ...").grid(row=2, column=0, sticky="w", padx=5, pady=5)
         self.tags_entry = tk.Entry(self, width=40)
         self.tags_entry.grid(row=2, column=1, columnspan=2, padx=5, pady=5)
 

@@ -28,7 +28,9 @@ def main():
                 if " " in t:
                     print(f"[ERROR] La etiqueta '{t}' contiene espacios. Usa guion bajo '_' en lugar de espacios.")
                     exit()
-
+            print("esto es en main")
+            print(files)
+            print(etiquetas)
             manager.add_files(files, etiquetas)
 
     elif command == "list":

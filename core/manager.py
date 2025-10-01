@@ -14,8 +14,18 @@ def add_files(file_list, tag_list, db_path="database/db.db"):
     for file_name in file_list:
         file_name = file_name.strip()
 
-        # Insertar fichero si no existe
-        cursor.execute("INSERT OR IGNORE INTO files (name) VALUES (?)", (file_name,))
+        # Revisar si ya existe
+        cursor.execute("SELECT id FROM files WHERE name = ?", (file_name,))
+        file_id = cursor.fetchone()[0]
+        exists = cursor.fetchone()
+        if exists:
+            print(f"[ERROR] El fichero '{file_name}' ya existe en la base de datos. No se puede volver a agregar.")
+            return False, file_name # al primero que exista se para la insercion
+            
+
+        # Insertar fichero
+        cursor.execute("INSERT INTO files (name) VALUES (?)", (file_name,))
+        file_id = cursor.lastrowid
 
         # Recuperar siempre el id correcto del archivo
         cursor.execute("SELECT id FROM files WHERE name = ?", (file_name,))
@@ -39,6 +49,7 @@ def add_files(file_list, tag_list, db_path="database/db.db"):
     conn.commit()
     close_connection(conn)
     print("[INFO] Archivos agregados correctamente.")
+    return True, ''
 
 def query_files(query_tags, db_path="database/db.db"):
     conn, cursor = get_connection(db_path)
@@ -83,6 +94,9 @@ def list_files(query_tags):
 def delete_files(query_tags, db_path="database/db.db"):
     conn, cursor = get_connection(db_path)
     files = query_files(query_tags, db_path)
+    if not file_ids:
+        conn.close()
+        return False  # No se encontró nada que borrar
 
     # Evitar IDs repetidos
     file_ids = set(file_id for file_id, _, _ in files)
@@ -96,7 +110,7 @@ def delete_files(query_tags, db_path="database/db.db"):
     conn.commit()
     close_connection(conn)
     print(f"[INFO] {len(file_ids)} archivos eliminados.")
-
+    return True
 
 def add_tags(query_tags, new_tags, db_path="database/db.db"):
     """
@@ -104,6 +118,9 @@ def add_tags(query_tags, new_tags, db_path="database/db.db"):
     """
     conn, cursor = get_connection(db_path)
     files = query_files(query_tags, db_path)
+    if not files:
+        conn.close()
+        return False  # No se encontraron archivos con las etiquetas requeridas
 
     for file_id, name, _ in files:
         for tag in new_tags:
@@ -125,6 +142,7 @@ def add_tags(query_tags, new_tags, db_path="database/db.db"):
 
     conn.commit()
     close_connection(conn)
+    return True
 
 def delete_tags(query_tags, del_tags, db_path="database/db.db" ):
     """
@@ -132,6 +150,9 @@ def delete_tags(query_tags, del_tags, db_path="database/db.db" ):
     """
     conn, cursor = get_connection(db_path)
     files = query_files(query_tags)
+    if not files:
+        conn.close()
+        return False  # No se encontraron las etiquetas dadas en los archivos con las etiquetas requeridas
 
     for file_id, name, _ in files:
         for tag in del_tags:
@@ -149,3 +170,4 @@ def delete_tags(query_tags, del_tags, db_path="database/db.db" ):
 
     conn.commit()
     close_connection(conn)
+    return True

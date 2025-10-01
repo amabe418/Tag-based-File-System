@@ -34,6 +34,33 @@ def main():
     elif command == "list":
         tag_query = sys.argv[2:]
         manager.list_files(tag_query)
+    elif command == "delete":
+        tag_query = sys.argv[2:]
+        manager.delete_files(tag_query)
+    elif command == "add-tags":
+        if len(sys.argv) < 4:
+            print("[ERROR] Uso: python main.py add-tags <tags_consulta> <nuevas_etiquetas>")
+            exit()
+
+        query_tags = sys.argv[2].split(",")
+        new_tags = sys.argv[3].split(",")
+
+        manager.add_tags(query_tags, new_tags)
+    elif command == "delete-tags":
+        if len(sys.argv) < 4:
+            print("[ERROR] Debes indicar etiquetas para eliminar.")
+        else:
+            query_tags = sys.argv[2].split(",")
+            del_tags_str = " ".join(sys.argv[3:]).strip()
+            del_tags = [t.strip() for t in del_tags_str.split(",")]
+
+            # Validación de etiquetas
+            for t in del_tags:
+                if " " in t:
+                    print(f"[ERROR] La etiqueta '{t}' contiene espacios. Usa guion bajo '_' en lugar de espacios.")
+                    exit()
+
+            manager.delete_tags(query_tags, del_tags)
 
     elif command == "reset":
         print("Base de datos reseteada.")

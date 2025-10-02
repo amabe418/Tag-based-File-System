@@ -11,6 +11,9 @@ class AddFileDialog(tk.Toplevel):
         self.title("Agregar archivo(s)")
         self.result = None
 
+        # Botón para explorar archivos
+        tk.Button(self, text="📁 Explorar...", command=self.browse_files).grid(row=0, column=1, padx=5, pady=5)
+
         # Cuadro de entrada del conjunto de archivos
         tk.Label(self, text="Nombre(s) de archivo(s) (separados por coma)\nEj: archivo1, archivo2, ...").grid(row=1, column=0, sticky="nw", padx=5, pady=5)
         self.files_entry = tk.Entry(self, width=40)
@@ -26,6 +29,19 @@ class AddFileDialog(tk.Toplevel):
         tk.Button(self, text="Cancelar", command=self.destroy).grid(row=3, column=2, pady=10)
 
         self.grab_set()  # modal
+
+    
+    def browse_files(self):
+        # Cuadro de diálogo para seleccionar varios archivos
+        filenames = filedialog.askopenfilenames(
+            parent=self,
+            title="Seleccionar archivos",
+            filetypes=(("Todos los archivos", "*.*"),)
+        )
+        if filenames:
+            # Insertar los nombres en el entry (separados por coma)
+            self.files_entry.delete(0, tk.END)
+            self.files_entry.insert(0, ", ".join(filenames))
 
     def on_ok(self):
         if not self.files_entry.get().strip():

@@ -50,8 +50,85 @@ class MainWindow(tk.Frame):
         self.tree.heading("path", text="Nombre")
         self.tree.heading("tags", text="Etiquetas")
         self.tree.pack(fill="both", expand=True, padx=10, pady=10)
-        self.refresh_list()
 
+        # Menú contextual (click derecho)
+        self.menu = tk.Menu(self, tearoff=0)
+        self.menu.add_command(label="⬇️ Descargar archivo", command=self.download_selected_file)
+
+        # Asociamos click derecho al treeview
+        self.tree.bind("<Button-3>", self.show_context_menu)
+
+        # Asociamos click izquierdo global para cerrar el menú si está abierto
+        self.bind_all("<Button-1>", self.hide_context_menu)
+
+        # Mostramos todos los archivos
+        self.refresh_list()
+    
+    # region Utility
+
+    # Mostrar la opcion para descargar el archivo al hacer click derecho
+    def show_context_menu(self, event):
+        # Selecciona la fila donde se hizo click derecho
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)  # selecciona la fila
+            self.menu.post(event.x_root, event.y_root)
+    
+    # Esconder la opcion para descargar un archivo al hacer click izquierdo
+    def hide_context_menu(self, event):
+        """Cierra el menú contextual solo si el click no fue dentro del menú."""
+        if event.widget != self.menu:
+            try:
+                self.menu.unpost()
+            except:
+                pass
+
+    def download_selected_file(self):
+        """
+        Lógica para descargar el archivo seleccionado en el treeview.
+        """
+        selected = self.tree.selection()
+        if not selected:
+            return
+
+        # Obtén los valores de la fila seleccionada
+        values = self.tree.item(selected[0], "values")
+        file_name = values[0]   # columna "path"
+        tags = values[1]        # columna "tags"
+
+        # Abrir cuadro para seleccionar directorio de destino
+        dest_dir = filedialog.askdirectory(title="Seleccionar carpeta de destino", parent=self)
+        if not dest_dir:
+            return  # usuario canceló
+
+        # Lógica de descarga (ejemplo: copiar archivo desde el manager)
+        res = manager.download_file(file_name, dest_dir)  # este método deberías implementarlo en tu backend
+        if res:
+            messagebox.showinfo("Éxito", f"Archivo '{file_name}' descargado en:\n{dest_dir}")
+        else:
+            messagebox.showerror("Error", f"No se pudo descargar el archivo '{file_name}'")
+
+
+    def refresh_list(self, files=None):
+        """
+        Refresca la tabla para mostrar todos los ficheros.
+        """
+        # Limpia la tabla
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+
+        # No se paso una lista de datos. Por tanto mostramos todos los resultados
+        if not files: 
+            # Obtiene archivos del manager
+            files = manager.list_files("")
+            print(files)
+            for _, name, tags in files:
+                self.tree.insert("","end",values=([name],",".join([tags])))
+        else:
+            for _, name, tags in files:
+                self.tree.insert("","end",values=([name],",".join([tags])))
+
+    # region Main Functions
     def add_files(self):
         """
         Agrega el conjunto de archivos a la base de datos.
@@ -123,26 +200,6 @@ class MainWindow(tk.Frame):
 
         self.refresh_list()
         
-    
-    def refresh_list(self, files=None):
-        """
-        Refresca la tabla para mostrar todos los ficheros.
-        """
-        # Limpia la tabla
-        for row in self.tree.get_children():
-            self.tree.delete(row)
-
-        # No se paso una lista de datos. Por tanto mostramos todos los resultados
-        if not files: 
-            # Obtiene archivos del manager
-            files = manager.list_files("")
-            print(files)
-            for _, name, tags in files:
-                self.tree.insert("","end",values=([name],",".join([tags])))
-        else:
-            for _, name, tags in files:
-                self.tree.insert("","end",values=([name],",".join([tags])))
-
     def list_files(self):
         dialog = ListFilesDialog(self)
         self.wait_window(dialog)

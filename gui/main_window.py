@@ -65,12 +65,13 @@ class MainWindow(tk.Frame):
 
         if dialog.result:
             file_names, tags = dialog.result
-            print(dialog.result)
-            res, file_name = manager.add_files(file_names,tags)  # guardamos los archivos
-            if res:
-                messagebox.showinfo("Éxito", f"Archivo(s): '{', '.join(file_names)}' \n agregado con etiquetas: {', '.join(tags)}.")
-            else:
-                messagebox.showinfo("Fracaso","Ya existe un archivo {mssg} en el sistema.")
+            print(f"Resultado: {dialog.result}")
+            # res, file_name = 
+            manager.add_files(file_names,tags)  # guardamos los archivos
+            # if res:
+            messagebox.showinfo("Éxito", f"Archivo(s): '{', '.join(file_names)}' \n agregado con etiquetas: {', '.join(tags)}.")
+            # else:
+            #     messagebox.showinfo("Fracaso","Ya existe un archivo {mssg} en el sistema.")
         
         self.refresh_list() # mostramos todos los archivos
     
@@ -91,7 +92,7 @@ class MainWindow(tk.Frame):
     
     def delete_tags(self):
         dialog = DeleteTagsDialog(self)
-        self.wait_variable(dialog)
+        self.wait_window(dialog)
 
         if dialog.result:
             tag_query, tag_list = dialog.result

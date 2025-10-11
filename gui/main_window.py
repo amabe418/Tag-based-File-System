@@ -122,10 +122,11 @@ class MainWindow(tk.Frame):
             # Obtiene archivos del manager
             files = manager.list_files("")
             print(files)
-            for _, name, tags in files:
+            # exit()
+            for _, name, tags, _ in files:
                 self.tree.insert("","end",values=([name],",".join([tags])))
         else:
-            for _, name, tags in files:
+            for _, name, tags, _ in files:
                 self.tree.insert("","end",values=([name],",".join([tags])))
 
     # region Main Functions

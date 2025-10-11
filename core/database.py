@@ -18,11 +18,11 @@ def init_db(db_path="database/db.db"):
     """
     conn, cursor = get_connection(db_path)
 
-    # tabla de archivos
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE NOT NULL
+        name TEXT UNIQUE NOT NULL,
+        path TEXT NOT NULL
     )
     """)
     

@@ -1,5 +1,6 @@
 import os
 import shutil
+from typing import List, Optional, Tuple
 from core.database import get_connection, close_connection
 
 STORAGE_DIR = os.path.join(os.path.dirname(__file__), "..", "storage")
@@ -7,7 +8,7 @@ STORAGE_DIR = os.path.join(os.path.dirname(__file__), "..", "storage")
 # Crear carpeta storage si no existe
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
-def add_files(file_list, tag_list, db_path="database/db.db"):
+def add_files(file_list: List[str], tag_list: List[str], db_path: str="database/db.db")-> bool:
     """
     Agrega ficheros y sus etiquetas al sistema.
     - file_list: lista de rutas a ficheros (locales). Cada fichero se copia a storage/.
@@ -84,7 +85,7 @@ def add_files(file_list, tag_list, db_path="database/db.db"):
     return added_any
 
 
-def query_files(query_tags=None, db_path="database/db.db"):
+def query_files(query_tags: Optional[List[str]]= None, db_path: str="database/db.db")-> List[Tuple[int, str, str, str]]:
     """
     Devuelve lista de tuplas (id, name, tags_concat, path) que cumplen la consulta.
     - query_tags: lista de etiquetas (AND). Si None o vacía -> devuelve todo.
@@ -123,7 +124,7 @@ def query_files(query_tags=None, db_path="database/db.db"):
     return results  # lista de (id, name, tags_concat, path)
 
 
-def list_files(query_tags=None, db_path="database/db.db"):
+def list_files(query_tags: Optional[List[str]] = None, db_path: str = "database/db.db") -> List[Tuple[int, str, str, str]]:
     files = query_files(query_tags, db_path)
     if not files:
         print("[INFO] No se encontraron archivos.")
@@ -134,7 +135,7 @@ def list_files(query_tags=None, db_path="database/db.db"):
     return files
 
 
-def delete_files(query_tags, db_path="database/db.db"):
+def delete_files(query_tags: List[str], db_path: str = "database/db.db") -> bool:
     """
     Elimina ficheros que cumplen la query (por etiquetas).
     Borra registros en DB y archivos en storage.
@@ -175,7 +176,7 @@ def delete_files(query_tags, db_path="database/db.db"):
     close_connection(conn)
     return True
 
-def add_tags(query_tags, new_tags, db_path="database/db.db"):
+def add_tags(query_tags: List[str], new_tags: List[str], db_path: str = "database/db.db") -> bool:
     """
     Añade etiquetas new_tags a todos los ficheros que cumplen query_tags.
     Devuelve True si se agregó al menos a un archivo, False si no hubo coincidencias.
@@ -203,7 +204,7 @@ def add_tags(query_tags, new_tags, db_path="database/db.db"):
     close_connection(conn)
     return affected > 0
 
-def delete_tags(query_tags, del_tags, db_path="database/db.db"):
+def delete_tags(query_tags: List[str], del_tags: List[str], db_path: str = "database/db.db") -> bool:
     """
     Elimina las etiquetas del_tags de los ficheros que cumplen query_tags.
     Devuelve True si al menos una relación fue eliminada, False si no hubo coincidencias.
@@ -233,7 +234,7 @@ def delete_tags(query_tags, del_tags, db_path="database/db.db"):
     return total_deleted > 0
 
 
-def download_file(file_name, destination_folder, db_path="database/db.db"):
+def download_file(file_name: str, destination_folder: str, db_path: str = "database/db.db") -> bool:
     """
     Copia un archivo del sistema (desde storage/) hacia una carpeta destino existente.
     Si el usuario pasa 'Downloads', automáticamente apunta al directorio de descargas del usuario.

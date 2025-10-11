@@ -8,10 +8,12 @@ STORAGE_DIR = os.path.join(os.path.dirname(__file__), "..", "storage")
 # Crear carpeta storage si no existe
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
-def add_files(file_list: List[str], tag_list: List[str], db_path: str="database/db.db")-> bool:
+def add_files(file_list: List[str], tag_list: List[str], db_path: str = "database/db.db") -> bool:
     """
     Agrega ficheros y sus etiquetas al sistema.
-    - file_list: lista de rutas a ficheros (locales). Cada fichero se copia a storage/.
+
+    - file_list: lista de nombres o rutas de ficheros locales. 
+      Si se proporciona solo el nombre, se buscará en el directorio actual.
     - tag_list: lista de etiquetas (strings, sin espacios).
     Devuelve True si al menos un archivo fue agregado, False si no se agregó ninguno.
     """
@@ -19,21 +21,24 @@ def add_files(file_list: List[str], tag_list: List[str], db_path: str="database/
         print("[ERROR] No se pueden agregar ficheros sin etiquetas.")
         return False
 
-    # Asegurar storage
+    # Asegurar directorio de almacenamiento
     storage_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "storage"))
     os.makedirs(storage_dir, exist_ok=True)
 
     conn, cursor = get_connection(db_path)
     added_any = False
 
-    for file_path in file_list:
-        file_path = file_path.strip()
-        if not file_path:
+    for file_input in file_list:
+        file_input = file_input.strip()
+        if not file_input:
             continue
 
-        # Comprobar existencia del fichero en el FS local
+        # Si no es ruta absoluta, buscar en el directorio actual
+        file_path = file_input if os.path.isabs(file_input) else os.path.join(os.getcwd(), file_input)
+
+        # Verificar existencia física del archivo
         if not os.path.exists(file_path):
-            print(f"[WARNING] El fichero '{file_path}' no existe en el sistema de archivos. Se omite.")
+            print(f"[ERROR] No se encontró el archivo '{file_input}'. Ruta interpretada: '{file_path}'")
             continue
 
         file_name = os.path.basename(file_path)
@@ -42,29 +47,27 @@ def add_files(file_list: List[str], tag_list: List[str], db_path: str="database/
         cursor.execute("SELECT id FROM files WHERE name = ?", (file_name,))
         row = cursor.fetchone()
         if row:
-            print(f"[ERROR] El fichero '{file_name}' ya existe en la base de datos. Se omite.")
+            print(f"[WARNING] El fichero '{file_name}' ya existe en la base de datos. Se omite.")
             continue
 
-        # Insertar fichero (con path temporal vacío) y recuperar id con SELECT
+        # Insertar fichero con path temporal vacío
         cursor.execute("INSERT INTO files (name, path) VALUES (?, ?)", (file_name, ""))
-        # Recuperar id (no usar lastrowid tras INSERT OR IGNORE)
         cursor.execute("SELECT id FROM files WHERE name = ?", (file_name,))
         file_id = cursor.fetchone()[0]
 
-        # Construir nombre/ubicación en storage
+        # Construir la nueva ruta en storage
         new_file_name = f"{file_id}_{file_name}"
         storage_path = os.path.join(storage_dir, new_file_name)
 
-        # Copiar fichero físico a storage (preservando metadatos)
+        # Copiar el fichero al almacenamiento interno
         try:
             shutil.copy2(file_path, storage_path)
         except Exception as e:
-            # Si falla copia, eliminar el registro insertado para mantener consistencia
             cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
             print(f"[ERROR] No se pudo copiar '{file_path}' a storage: {e}. Registro eliminado.")
             continue
 
-        # Actualizar la ruta en la BD
+        # Actualizar la ruta definitiva en la BD
         cursor.execute("UPDATE files SET path = ? WHERE id = ?", (storage_path, file_id))
 
         # Insertar etiquetas y relaciones
@@ -77,13 +80,12 @@ def add_files(file_list: List[str], tag_list: List[str], db_path: str="database/
             tag_id = cursor.fetchone()[0]
             cursor.execute("INSERT OR IGNORE INTO file_tags (file_id, tag_id) VALUES (?, ?)", (file_id, tag_id))
 
-        print(f"[INFO] Fichero '{file_name}' agregado con etiquetas: {', '.join(tag_list)}")
+        print(f"[INFO] Fichero '{file_name}' agregado correctamente con etiquetas: {', '.join(tag_list)}")
         added_any = True
 
     conn.commit()
     close_connection(conn)
     return added_any
-
 
 def query_files(query_tags: Optional[List[str]]= None, db_path: str="database/db.db")-> List[Tuple[int, str, str, str]]:
     """

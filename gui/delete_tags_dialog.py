@@ -36,16 +36,16 @@ class DeleteTagsDialog(tk.Toplevel):
             return
         
         
-        # print(f"Las etiquetas a buscar son: {self.tag_query.get()}")
-        # print(f"Las etiquetas a eliminar son: {self.tag_list.get()}")
+        # print(f"Las etiquetas a buscar son: {self.tag_query.get()}") #debug
+        # print(f"Las etiquetas a eliminar son: {self.tag_list.get()}") #debug
         # exit()
         tag_query = [tag.strip() for tag in self.tag_query.get().split(",")]
-        # print(f"Las etiquetas a buscar son: {tag_query}")
+        # print(f"Las etiquetas a buscar son: {tag_query}") #debug
 
 
         tag_list = [tag.strip() for tag in self.tag_list.get().split(",")]
-        # print(f"Las etiquetas a eliminar son: {tag_list}")
+        # print(f"Las etiquetas a eliminar son: {tag_list}") #debug
         
         self.result = [tag_query, tag_list]
-        # print(f"Result: {self.result}")
+        # print(f"Result: {self.result}") #debug
         self.destroy()

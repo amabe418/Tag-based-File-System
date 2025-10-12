@@ -56,9 +56,9 @@ class AddFileDialog(tk.Toplevel):
             return
         
         file_names = [fn.strip() for fn in self.files_entry.get().split(",")]
-        print(f"Nombres de los archivos: {file_names}")
+        # print(f"Nombres de los archivos: {file_names}") #debug
         tags = self.tags_entry.get().strip().split(",")
-        print(f"Tags: {tags}")
+        # print(f"Tags: {tags}") #debug
         
         # # Guardar resultado: lista de tuplas (nombre del archivo completo, tags)
         self.result = [file_names, tags]

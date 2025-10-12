@@ -6,7 +6,9 @@ from gui.list_files_dialog import ListFilesDialog
 from gui.add_tags_dialog import AddTagsDialog
 from gui.delete_tags_dialog import DeleteTagsDialog 
 from gui.delete_files_dialog import DeleteFilesDialog 
+import requests
 
+API_URL = "http://127.0.0.1:8000"
 
 class MainWindow(tk.Frame):
     def __init__(self, master=None):
@@ -108,50 +110,61 @@ class MainWindow(tk.Frame):
         else:
             messagebox.showerror("Error", f"No se pudo descargar el archivo '{file_name}'")
 
-
     def refresh_list(self, files=None):
         """
-        Refresca la tabla para mostrar todos los ficheros.
+        Refresca la tabla para mostrar todos los ficheros desde la API.
         """
         # Limpia la tabla
         for row in self.tree.get_children():
             self.tree.delete(row)
 
-        # No se paso una lista de datos. Por tanto mostramos todos los resultados
-        if not files: 
-            # Obtiene archivos del manager
-            files = manager.list_files("")
-            print(files)
-            # exit()
-            for _, name, tags, _ in files:
-                self.tree.insert("","end",values=([name],",".join([tags])))
-        else:
-            for _, name, tags, _ in files:
-                self.tree.insert("","end",values=([name],",".join([tags])))
+        try:
+            if not files:
+                # Consultar todos los archivos al backend
+                response = requests.get(f"{API_URL}/list")
+                response.raise_for_status()
+                data = response.json()
+                files = data.get("files", [])
+            
+            # Insertar cada archivo en la tabla
+            for f in files:
+                name = f.get("name", "Desconocido")
+                tags = f.get("tags")
+                self.tree.insert("", "end", values=(name, tags))
+
+        except requests.RequestException as e:
+            messagebox.showerror("Error", f"No se pudo obtener la lista de archivos:\n{e}")
 
     # region Main Functions
     def add_files(self):
         """
-        Agrega el conjunto de archivos a la base de datos.
+        Envía los archivos seleccionados y sus etiquetas al backend (API FastAPI).
         """
         dialog = AddFileDialog(self)
-        self.wait_window(dialog)  # espera hasta que se cierre el diálogo
-
-        ## Debugging
-        # l = dialog.result
-        # print(l)
+        self.wait_window(dialog)
 
         if dialog.result:
             file_names, tags = dialog.result
-            print(f"Resultado: {dialog.result}")
-            # res, file_name = 
-            manager.add_files(file_names,tags)  # guardamos los archivos
-            # if res:
-            messagebox.showinfo("Éxito", f"Archivo(s): '{', '.join(file_names)}' \n agregado con etiquetas: {', '.join(tags)}.")
-            # else:
-            #     messagebox.showinfo("Fracaso","Ya existe un archivo {mssg} en el sistema.")
-        
-        self.refresh_list() # mostramos todos los archivos
+
+            for file_path in file_names:
+                try:
+                    with open(file_path, "rb") as f:
+                        files = {"file": (file_path.split("/")[-1], f, "application/octet-stream")}
+                        # print(files)
+                        data = {"tags": ",".join(tags)}
+                        # print(data)
+
+                        response = requests.post(f"{API_URL}/add", files=files, data=data)
+                        response.raise_for_status()
+
+                        messagebox.showinfo("Éxito", f"Archivo '{file_path}' agregado con etiquetas: {', '.join(tags)}.")
+                except requests.RequestException as e:
+                    messagebox.showerror("Error", f"No se pudo subir '{file_path}': {e}")
+                except Exception as e:
+                    messagebox.showerror("Error", f"Ocurrió un error: {e}")
+
+        self.refresh_list()
+
     
     def add_tags(self):
         dialog = AddTagsDialog(self)
@@ -159,13 +172,22 @@ class MainWindow(tk.Frame):
         
         if dialog.result:
             query_tags, new_tags = dialog.result
+            params = {"query":",".join(query_tags), "new_tags":",".join(new_tags)}
+            print(params)
             print(f"Las etiquetas a buscar son {query_tags}")
             print(f"Las etiquetas a annadir son {new_tags}")
-            res = manager.add_tags(query_tags, new_tags)
-            if res:
-                messagebox.showinfo("Éxito", "Las nuevas etiquetas se agregaron correctamente a los archivos cuyas etiquetas se corresponden con su criterio de búsqueda.")
-            else:
-                messagebox.showinfo("Fracaso", "No se encontraron archivos que coincidan con su criterio de búsqueda.")
+            # res = manager.add_tags(query_tags, new_tags)
+            try:
+                response = requests.post(f"{API_URL}/add-tags",params=params)
+                response.raise_for_status()
+                data = response.json()
+                if data.get("success"):
+                    messagebox.showinfo("Éxito", "Las nuevas etiquetas se agregaron correctamente a los archivos cuyas etiquetas se corresponden con su criterio de búsqueda.")
+                else:
+                    messagebox.showinfo("Fracaso", "No se encontraron archivos que coincidan con su criterio de búsqueda.")
+            except requests.RequestException as e:
+                messagebox.showerror("Error", f"Ocurrió un error al comunicarse con el servidor:\n{e}.")
+
         self.refresh_list()
     
     def delete_tags(self):
@@ -174,13 +196,20 @@ class MainWindow(tk.Frame):
 
         if dialog.result:
             tag_query, tag_list = dialog.result
-            print("las etiquetas a buscar son {tag_query}")
-            print("las etiquetas a eliminar son {tag_list}")
-            res = manager.delete_tags(tag_query,tag_list)
-            if res:
-                messagebox.showinfo("Éxito","Las etiquetas se eliminaron correctamente sobre los archivos cuyas etiquetas se corresponden con su criterio de búsqueda.")
-            else:
-                messagebox.showinfo("Fracaso","No existe ningún archivo que coincida con su criterio de búsqueda.")
+            params = {"query": ','.join(tag_query), "del_tags": ','.join(tag_list)}
+            print(f"las etiquetas a buscar son {tag_query}")
+            print(f"las etiquetas a eliminar son {tag_list}")
+            # res = manager.delete_tags(tag_query,tag_list)
+            try:
+                response = requests.post(f"{API_URL}/delete-tags",params=params)
+                response.raise_for_status()
+                data = response.json()
+                if data.get("success"):
+                    messagebox.showinfo("Éxito","Las etiquetas se eliminaron correctamente sobre los archivos cuyas etiquetas se corresponden con su criterio de búsqueda.")
+                else:
+                    messagebox.showinfo("Fracaso","No existe ningún archivo que coincida con su criterio de búsqueda.")
+            except requests.RequestException as e:
+                messagebox.showerror("Error", f"Ocurrió un error al comunicarse con el servidor:\n{e}.")
 
         self.refresh_list()
 
@@ -188,15 +217,22 @@ class MainWindow(tk.Frame):
         dialog = DeleteFilesDialog(self)
         self.wait_window(dialog)
 
-        print("Resultado de borrar {dialog.result}")
         if dialog.result:
+            print(f"Resultado de borrar {dialog.result}")
             tag_query = dialog.result
-            print("las etiquetas a buscar son: {tags}")
-            res = manager.delete_files(tag_query)
-            if res:
-                messagebox.showinfo("Éxito","Los archivos cuyas etiquetas coinciden su criterio de búsqueda fueron eliminados.")
-            else:
-                messagebox.showinfo("Fracaso","No existe ningún archivo que coincida con su criterio de búsqueda.")
+            params = {"tags": ','.join(tag_query)}
+            try:
+                # res = manager.delete_files(tag_query)
+                response = requests.delete(f"{API_URL}/delete",params=params)
+                response.raise_for_status()
+                data = response.json()
+                if data.get("success"):
+                    messagebox.showinfo("Éxito","Los archivos cuyas etiquetas coinciden su criterio de búsqueda fueron eliminados.")
+                else:
+                    messagebox.showinfo("Fracaso","No existe ningún archivo que coincida con su criterio de búsqueda.")
+            except requests.RequestException as e:
+                messagebox.showerror("Error", f"Ocurrió un error al comunicarse con el servidor:\n{e}.")
+                print(e)
 
 
         self.refresh_list()
@@ -204,26 +240,37 @@ class MainWindow(tk.Frame):
     def list_files(self):
         dialog = ListFilesDialog(self)
         self.wait_window(dialog)
-
+        params = {}
+        
         if dialog.result is not None:  # el usuario no canceló
             tags = dialog.result
-            files = manager.list_files(tags)
+            params["tags"] = tags
+
+            try:
+                response = requests.get(f"{API_URL}/list", params)
+                response.raise_for_status()
+                data = response.json()
+                print(data)
+                print(len(data['files']))
+                
+            except requests.exceptions.RequestException as e:
+                print(f"[ERROR] No se pudo obtener los archivos {e}")
 
             if tags: # Se hizo una busqueda por etiquetas
                 head_message = "Archivos filtrados:"
-                body = f" se encontrarion {len(files)}"
+                body = f"se encontrarion {len(data['files'])}"
                 tail_message = " con esas etiquetas."
             else: # No se especificaron etiquetas para hacer la busqueda
                 head_message = "Mostrando todos los archivos:"
-                body = f" hay un total de {len(files)}"
+                body = f" hay un total de {len(data['files'])}"
                 tail_message = "."
 
             # Mostramos el mensaje de exito o fracaso y refrescamos lista en la ventana principal para mostrar resultados 
-            if len(files):
+            if len(data['files']):
                 messagebox.showinfo("Mostrando Archivos",message=head_message + body + tail_message)
-                self.refresh_list(files)
-            elif not len(files) and not tags:
+                self.refresh_list(data['files'])
+            elif not len(data['files']) and not tags:
                 messagebox.showinfo(":(","No hay archivos en el sistema.")
-            elif not len(files):
+            elif not len(data['files']):
                 messagebox.showinfo(":(", "No se encontraron archivos con las etiquetas especificadas.")
             

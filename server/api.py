@@ -1,9 +1,11 @@
 # server/api.py
-from fastapi import FastAPI, UploadFile, Form, HTTPException
+from fastapi import FastAPI, UploadFile, Form, HTTPException, Query
 from fastapi.responses import FileResponse
 from core import manager
 import os
 import shutil
+from typing import List, Optional
+
 
 app = FastAPI(title="Tag-Based File System API")
 
@@ -36,11 +38,11 @@ async def add_file(file: UploadFile, tags: str = Form(...)):
     return {"success": True, "message": f"Archivo '{file.filename}' agregado correctamente"}
 
 @app.get("/list")
-def list_files():
+def list_files(tags: Optional[List[str]] = Query(None)):
     """
     Lista todos los archivos y sus etiquetas.
     """
-    files = manager.query_files()
+    files = manager.query_files(query_tags=tags)
     formatted = [
         {"id": fid, "name": name, "tags": tags, "path": path}
         for fid, name, tags, path in files

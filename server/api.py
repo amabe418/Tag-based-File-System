@@ -2,10 +2,12 @@
 from fastapi import FastAPI, UploadFile, Form, HTTPException, Query
 from fastapi.responses import FileResponse
 from core import manager
+from core import database
 import os
 import shutil
 from typing import List, Optional
 
+database.init_db()
 
 app = FastAPI(title="Tag-Based File System API")
 

@@ -1,0 +1,14 @@
+# gui/dockerfile.yml
+FROM python:3.12-slim
+
+WORKDIR /front
+
+COPY gui /front/gui
+COPY main.py /front/
+
+RUN pip install --no-cache-dir requests streamlit
+
+# Variable de entorno para que la GUI sepa dónde está el backend
+ENV API_URL=http://backend:8000
+
+CMD ["streamlit", "run", "web.py"]

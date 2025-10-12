@@ -7,8 +7,10 @@ from gui.add_tags_dialog import AddTagsDialog
 from gui.delete_tags_dialog import DeleteTagsDialog 
 from gui.delete_files_dialog import DeleteFilesDialog 
 import requests
+import os
 
-API_URL = "http://127.0.0.1:8000"
+
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 
 class MainWindow(tk.Frame):
     def __init__(self, master=None):

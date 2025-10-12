@@ -9,6 +9,8 @@ def get_connection(db_path="database/db.db"):
     """
     Abre una conexión a la base de datos y devuelve (conn, cursor).
     """
+    # asegurarse de que existe la carpeta de la base de datos.
+    os.makedirs(os.path.dirname(db_path), exist_ok= True)
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     return conn, cursor

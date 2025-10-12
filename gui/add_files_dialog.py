@@ -34,9 +34,10 @@ class AddFileDialog(tk.Toplevel):
     def browse_files(self):
         # Cuadro de diálogo para seleccionar varios archivos
         filenames = filedialog.askopenfilenames(
-            parent=self,
-            title="Seleccionar archivos",
-            filetypes=(("Todos los archivos", "*.*"),)
+        parent=self,
+        title="Seleccionar archivos",
+        initialdir=os.getcwd(),  # carpeta inicial del programa
+        filetypes=(("Todos los archivos", "*.*"),)
         )
         if filenames:
             # Insertar los nombres en el entry (separados por coma)

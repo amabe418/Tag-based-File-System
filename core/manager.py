@@ -274,3 +274,11 @@ def download_file(file_name: str, destination_folder: str, db_path: str = "datab
     except Exception as e:
         print(f"[ERROR] No se pudo copiar el archivo: {e}")
         return False
+
+def get_file_path(file_name: str, db_path: str = "database/db.db") -> Optional[str]:
+    """Devuelve la ruta real del archivo almacenado o None si no existe."""
+    conn, cursor = get_connection(db_path)
+    cursor.execute("SELECT path FROM files WHERE name = ?", (file_name,))
+    row = cursor.fetchone()
+    close_connection(conn)
+    return row[0] if row else None

@@ -3,6 +3,7 @@ import requests
 import streamlit as st
 
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
+print(f"Usando: {API_URL}")
 
 st.set_page_config(page_title="Tag-based File System", layout="wide")
 

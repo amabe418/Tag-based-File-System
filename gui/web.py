@@ -188,7 +188,7 @@ if st.session_state.modal == "add_file":
                             response = requests.post(f"{API_URL}/add", files=files, data=data)
                             response.raise_for_status()
                             st.success(f"Archivo '{file.name}' subido correctamente.")
-                            st.rerun()
+                            # st.rerun()
                         except requests.RequestException as e:
                             st.error(f"Error al subir '{file.name}': {e}")
                     st.session_state.modal = None

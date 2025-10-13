@@ -1,8 +1,13 @@
 import os
 import requests
 import streamlit as st
+import pandas as pd
+import math
 
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", os.path.join(os.path.dirname(__file__),"downloads/"))
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
 print(f"Usando: {API_URL}")
 
 st.set_page_config(page_title="Tag-based File System", layout="wide")
@@ -38,12 +43,113 @@ if st.session_state.refresh_needed:
     st.session_state.refresh_needed = False
     st.rerun()
 
+# --- CSS para reducir el espacio entre columnas ---
+st.markdown("""
+    <style>
+        /* General: menos espacio entre todas las columnas */
+        [data-testid="column"] {
+            padding-right: 0.15rem !important;
+            padding-left: 0.15rem !important;
+        }
+
+        /* Reduce aún más el espacio antes de la última columna (botón Descargar) */
+        [data-testid="column"]:last-child {
+            padding-left: 0rem !important;
+            margin-left: -0.3rem !important;
+        }
+
+        /* Reduce el espacio vertical entre filas */
+        [data-testid="stVerticalBlock"] {
+            gap: 0.25rem !important;
+        }
+
+        /* Opcional: reduce padding general del contenedor */
+        .block-container {
+            padding-top: 1rem;
+            padding-bottom: 1rem;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
 files = refresh_list(tags_filter)
+
+# --- Parámetros de paginación ---
+ITEMS_PER_PAGE = 5
+if "current_page" not in st.session_state:
+    st.session_state.current_page = 1
+
 if files:
-    simplified_files = [{"Nombre": f.get("name"), "Etiquetas": f.get("tags")} for f in files]
-    st.dataframe(simplified_files, use_container_width=True)
+    total_items = len(files)
+    total_pages = math.ceil(total_items / ITEMS_PER_PAGE)
+
+    # Aseguramos que la página actual esté dentro del rango
+    st.session_state.current_page = max(1, min(st.session_state.current_page, total_pages))
+
+    # Calculamos los índices de los archivos visibles en esta página
+    start_idx = (st.session_state.current_page - 1) * ITEMS_PER_PAGE
+    end_idx = start_idx + ITEMS_PER_PAGE
+    visible_files = files[start_idx:end_idx]
+
+    df = pd.DataFrame([
+        {"Nombre": f.get("name"), "Etiquetas": f.get("tags")}
+        for f in visible_files
+    ])
+
+    # --- Encabezados ---
+    col_widths = [7,5,3] 
+    header_cols = st.columns(col_widths, gap="small")
+    for i, col_name in enumerate(df.columns):
+        header_cols[i].markdown(
+            f"<div style='font-weight:bold; font-size:1.2rem; text-align:left;'>{col_name}</div>",
+            unsafe_allow_html=True
+        )
+    header_cols[-1].markdown("")
+    st.markdown("---")
+
+    # --- Filas ---
+    for idx, row in df.iterrows():
+        row_cols = st.columns(col_widths)
+        row_cols[0].markdown(row["Nombre"])
+        row_cols[1].markdown(row["Etiquetas"])
+
+        if row_cols[2].button("Descargar", key=f"dl_{row['Nombre']}"):
+            try:
+                r = requests.get(f"{API_URL}/download/{row['Nombre']}", stream=True)
+                r.raise_for_status()
+                download_path = os.path.join(DOWNLOAD_DIR, f"{row['Nombre']}")
+                with open(download_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                st.success(f"Archivo descargado en {download_path}")
+            except requests.RequestException as e:
+                st.error(f"No se pudo descargar {row['Nombre']}: {e}")
+        st.markdown("---")
+
+    # --- Controles de paginación ---
+    st.markdown("<br>", unsafe_allow_html=True)
+    col_empty, col_prev, col_page, col_next = st.columns([1, 0.3, 2, 1])
+    st.markdown("<br>", unsafe_allow_html=True)
+
+
+    with col_prev:
+        if st.button("⬅️ Anterior", disabled=(st.session_state.current_page == 1)):
+            st.session_state.current_page -= 1
+            st.rerun()
+
+    with col_page:
+        st.markdown(
+            f"<div style='text-align:center; font-weight:bold;'>Página {st.session_state.current_page} de {total_pages}</div>",
+            unsafe_allow_html=True
+        )
+
+    with col_next:
+        if st.button("Siguiente ➡️", disabled=(st.session_state.current_page == total_pages)):
+            st.session_state.current_page += 1
+            st.rerun()
+
 else:
     st.warning("No se encontraron archivos.")
+
 
 # --- Botones principales centrados en la parte superior ---
 col_empty_left, col1, col2, col3, col4, col_empty_right = st.columns([1, 2, 2, 2, 2, 1])

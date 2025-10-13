@@ -5,7 +5,6 @@ WORKDIR /back
 
 COPY core /back/core
 COPY server /back/server
-# COPY ./database /back/database
 
 RUN pip install --no-cache-dir fastapi uvicorn requests python-multipart
 

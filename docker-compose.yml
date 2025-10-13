@@ -21,6 +21,8 @@ services:
       context: .
       dockerfile: gui/dockerfile.yml
     image: tbfs-frontend
+    ports:
+      - "8501:8501"
     environment:
       - API_URL=http://backend:8000
     networks:

@@ -11,7 +11,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 print(f"Usando: {API_URL}")
 
 st.set_page_config(page_title="Tag-based File System", layout="wide")
-
+st.markdown("---")
 st.title("📂 Tag-based File System")
 
 # --- Estado inicial ---
@@ -121,7 +121,7 @@ if files:
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
                 st.success(f"Archivo descargado en {download_path}")
-                st.re
+                # st.re
             except requests.RequestException as e:
                 st.error(f"No se pudo descargar {row['Nombre']}: {e}")
         st.markdown("---")
@@ -188,7 +188,7 @@ if st.session_state.modal == "add_file":
                             response = requests.post(f"{API_URL}/add", files=files, data=data)
                             response.raise_for_status()
                             st.success(f"Archivo '{file.name}' subido correctamente.")
-                            st.rerun()
+                            # st.rerun()
                         except requests.RequestException as e:
                             st.error(f"Error al subir '{file.name}': {e}")
                     st.session_state.modal = None

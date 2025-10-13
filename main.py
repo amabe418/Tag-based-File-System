@@ -1,101 +1,122 @@
-# main.py 
 import sys
-# from core import manager
-# from core import database 
-import tkinter as tk
-from gui.main_window import MainWindow
+import requests
+import os
+
+API_URL = os.getenv("API_URL","http://127.0.0.1:8000")
 
 def main():
-    # if len(sys.argv) < 2:
-    #     print("[ERROR] Debes indicar un comando: add, delete, list, add-tags, delete-tags, reset")
-    #     return
+    if len(sys.argv) < 2:
+        print("[ERROR] Debes indicar un comando: add, delete, list, add-tags, delete-tags, reset")
+        return
 
-    # command = sys.argv[1].strip().lower()
-    # print(command)
+    command = sys.argv[1].strip().lower()
+    print(command)
 
-    # # --- ADD ---
-    # if command == "add":
-    #     if len(sys.argv) < 4:
-    #         print("[ERROR] Uso: python main.py add <archivo1,archivo2,...> <etiqueta1,etiqueta2,...>")
-    #         return
+    # --- ADD ---
+    if command == "add":
+        if len(sys.argv) < 4:
+            print("[ERROR] Uso: python main.py add <archivo1,archivo2,...> <etiqueta1,etiqueta2,...>")
+            return
 
-    #     files = sys.argv[2].split(",")
-    #     tags_str = " ".join(sys.argv[3:]).strip()
-    #     etiquetas = [t.strip() for t in tags_str.split(",") if t.strip()]
+        files = sys.argv[2].split(",")
+        tags_str = " ".join(sys.argv[3:]).strip()
+        print(tags_str)
+        tags = tags_str.split(',')
 
-    #     # Validaciones
-    #     if not etiquetas:
-    #         print("[ERROR] Debes indicar al menos una etiqueta válida.")
-    #         return
-    #     for t in etiquetas:
-    #         if " " in t:
-    #             print(f"[ERROR] La etiqueta '{t}' contiene espacios. Usa '_' en su lugar.")
-    #             return
+        if not tags:
+            print("[ERROR] Debes indicar al menos una etiqueta válida.")
+            return
+        for t in tags:
+            if " " in t:
+                print(f"[ERROR] La etiqueta '{t}' contiene espacios. Usa '_' en su lugar.")
+                return
 
-    #     print(f"[DEBUG] Archivos: {files}")
-    #     print(f"[DEBUG] Etiquetas: {etiquetas}")
+        for file_path in files:
+            if not os.path.exists(file_path):
+                print(f"[ERROR] El archivo '{file_path}' no existe.")
+                continue
 
-    #     success = manager.add_files(files, etiquetas)
-    #     if success:
-    #         print("[OK] Archivos agregados correctamente.")
-    #     else:
-    #         print("[INFO] No se agregaron archivos (ver mensajes anteriores).")
+            with open(file_path, "rb") as f:
+                try:
+                    print(tags)
+                    response = requests.post(
+                        f"{API_URL}/add",
+                        files={"file": (os.path.basename(file_path), f)},
+                        data={"tags": ",".join(tags)},
+                    )
+                    response.raise_for_status()
+                    print(f"[OK] Archivo '{file_path}' agregado correctamente.")
+                except requests.RequestException as e:
+                    print(f"[ERROR] No se pudo subir '{file_path}': {e}")
+    # --- LIST ---
+    elif command == "list":
+        tag_query = sys.argv[2:] if len(sys.argv) > 2 else []
+        try:
+            response = requests.get(f"{API_URL}/list", params=[("tags", t) for t in tag_query])
+            response.raise_for_status()
+            data = response.json().get("files", [])
+            if not data:
+                print("[INFO] No se encontraron archivos.")
+            else:
+                for f in data:
+                    print(f"Nombre: {f['name']} | Etiquetas: {f['tags']}")
+        except requests.RequestException as e:
+            print(f"[ERROR] No se pudo listar archivos: {e}")
 
-    # # --- LIST ---
-    # elif command == "list":
-    #     tag_query = sys.argv[2:] if len(sys.argv) > 2 else []
-    #     manager.list_files(tag_query)
+    # --- DELETE FILES ---
+    elif command == "delete":
+        if len(sys.argv) < 3:
+            print("[ERROR] Uso: python main.py delete <etiqueta1,etiqueta2,...>")
+            return
 
-    # # --- DELETE FILES ---
-    # elif command == "delete":
-    #     if len(sys.argv) < 3:
-    #         print("[ERROR] Uso: python main.py delete <etiqueta1,etiqueta2,...>")
-    #         return
+        tag_query = sys.argv[2]
+        try:
+            response = requests.delete(f"{API_URL}/delete", params={"tags": tag_query})
+            response.raise_for_status()
+            msg = response.json().get("message", "")
+            print(f"[INFO] {msg}")
+        except requests.RequestException as e:
+            print(f"[ERROR] No se pudo eliminar archivos: {e}")
 
-    #     tag_query = sys.argv[2].split(",")
-    #     success = manager.delete_files(tag_query)
-    #     if success:
-    #         print("[OK] Archivos eliminados correctamente.")
-    #     else:
-    #         print("[INFO] No se encontraron archivos con esas etiquetas.")
+    # --- ADD TAGS ---
+    elif command == "add-tags":
+        if len(sys.argv) < 4:
+            print("[ERROR] Uso: python main.py add-tags <tags_consulta> <nuevas_etiquetas>")
+            return
 
-    # # --- ADD TAGS ---
-    # elif command == "add-tags":
-    #     if len(sys.argv) < 4:
-    #         print("[ERROR] Uso: python main.py add-tags <tags_consulta> <nuevas_etiquetas>")
-    #         return
+        query_tags = sys.argv[2]
+        new_tags = sys.argv[3]
 
-    #     query_tags = sys.argv[2].split(",")
-    #     new_tags = sys.argv[3].split(",")
+        try:
+            response = requests.post(f"{API_URL}/add-tags", params={"query": query_tags, "new_tags": new_tags})
+            response.raise_for_status()
+            if response.json().get("success"):
+                print("[OK] Etiquetas agregadas correctamente.")
+            else:
+                print("[INFO] No se encontraron archivos con esas etiquetas.")
+        except requests.RequestException as e:
+            print(f"[ERROR] No se pudieron agregar etiquetas: {e}")
 
-    #     success = manager.add_tags(query_tags, new_tags)
-    #     if success:
-    #         print("[OK] Etiquetas agregadas correctamente.")
-    #     else:
-    #         print("[INFO] No se encontraron archivos con esas etiquetas.")
+    # --- DELETE TAGS ---
+    elif command == "delete-tags":
+        if len(sys.argv) < 4:
+            print("[ERROR] Uso: python main.py delete-tags <tags_consulta> <etiquetas_a_eliminar>")
+            return
 
-    # # --- DELETE TAGS ---
-    # elif command == "delete-tags":
-    #     if len(sys.argv) < 4:
-    #         print("[ERROR] Uso: python main.py delete-tags <tags_consulta> <etiquetas_a_eliminar>")
-    #         return
+        query_tags = sys.argv[2]
+        del_tags = sys.argv[3]
 
-    #     query_tags = sys.argv[2].split(",")
-    #     del_tags_str = " ".join(sys.argv[3:]).strip()
-    #     del_tags = [t.strip() for t in del_tags_str.split(",") if t.strip()]
+        try:
+            response = requests.post(f"{API_URL}/delete-tags", params={"query": query_tags, "del_tags": del_tags})
+            response.raise_for_status()
+            if response.json().get("success"):
+                print("[OK] Etiquetas eliminadas correctamente.")
+            else:
+                print("[INFO] No se encontraron coincidencias para eliminar etiquetas.")
+        except requests.RequestException as e:
+            print(f"[ERROR] No se pudieron eliminar etiquetas: {e}")
 
-    #     for t in del_tags:
-    #         if " " in t:
-    #             print(f"[ERROR] La etiqueta '{t}' contiene espacios. Usa '_' en su lugar.")
-    #             return
-
-    #     success = manager.delete_tags(query_tags, del_tags)
-    #     if success:
-    #         print("[OK] Etiquetas eliminadas correctamente.")
-    #     else:
-    #         print("[INFO] No se encontraron coincidencias para eliminar etiquetas.")
-
-    # # --- RESET ---
+    # --- RESET ---
     # elif command == "reset":
     #     confirm = input("⚠️ Esto eliminará toda la base de datos y archivos. ¿Continuar? (y/N): ").lower()
     #     if confirm == "y":
@@ -104,32 +125,28 @@ def main():
     #     else:
     #         print("[CANCELADO] Operación abortada.")
     
-    # elif command == "download":
-    #     if len(sys.argv) < 4:
-    #         print("[ERROR] Uso: python main.py download <nombre_archivo> <carpeta_destino>")
-    #         return
-    #     file_name = sys.argv[2]
-    #     destination_folder = sys.argv[3]
-    #     success = manager.download_file(file_name, destination_folder)
-    #     if not success:
-    #         print("[INFO] No se pudo completar la descarga.")
+    elif command == "download":
+        if len(sys.argv) < 4:
+            print("[ERROR] Uso: python main.py download <nombre_archivo> <carpeta_destino>")
+            return
 
+        file_name = sys.argv[2]
+        dest_folder = sys.argv[3]
+        os.makedirs(dest_folder, exist_ok=True)
+        try:
+            response = requests.get(f"{API_URL}/download/{file_name}", stream=True)
+            response.raise_for_status()
+            path = os.path.join(dest_folder, file_name)
+            with open(path, "wb") as f:
+                for chunk in response.iter_content(1024):
+                    f.write(chunk)
+            print(f"[OK] Archivo '{file_name}' descargado en '{dest_folder}'")
+        except requests.RequestException as e:
+            print(f"[ERROR] No se pudo descargar '{file_name}': {e}")
 
-    # else:
-    #     print(f"[ERROR] Comando desconocido: {command}")
-    #     print("Comandos válidos: add, delete, list, add-tags, delete-tags, reset")
-    print("Para correr comandos")
-    pass
+    else:
+        print(f"[ERROR] Comando desconocido: {command}")
+        print("Comandos válidos: add, delete, list, add-tags, delete-tags, reset")
 
-
-
-    
 if __name__ == "__main__":
-    # database.init_db() # Inicializamos la bd antes de ejercer cualquier accion
-    # if not sys.argv[1:]:
-        # root = tk.Tk()
-        # root.title("Tag-Based File System")
-        # app = MainWindow(root)
-        # root.mainloop()
-    # else:
-        main()
+    main()

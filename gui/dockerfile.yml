@@ -4,7 +4,7 @@ FROM python:3.12-slim
 WORKDIR /front
 
 COPY gui/ /front/
-COPY gui/downloads/ /front/
+# COPY gui/downloads/ /front/
 COPY main.py /front/
 RUN pip install --no-cache-dir requests streamlit
 

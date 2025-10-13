@@ -126,10 +126,10 @@ def main():
     
 if __name__ == "__main__":
     # database.init_db() # Inicializamos la bd antes de ejercer cualquier accion
-    if not sys.argv[1:]:
-        root = tk.Tk()
-        root.title("Tag-Based File System")
-        app = MainWindow(root)
-        root.mainloop()
-    else:
+    # if not sys.argv[1:]:
+        # root = tk.Tk()
+        # root.title("Tag-Based File System")
+        # app = MainWindow(root)
+        # root.mainloop()
+    # else:
         main()

@@ -210,6 +210,7 @@ def add_tags(query_tags: List[str], new_tags: List[str], db_path: str = "databas
 def delete_tags(query_tags: List[str], del_tags: List[str], db_path: str = "database/db.db") -> bool:
     """
     Elimina las etiquetas del_tags de los ficheros que cumplen query_tags.
+    No elimina etiquetas si el fichero quedaría sin ninguna.
     Devuelve True si al menos una relación fue eliminada, False si no hubo coincidencias.
     """
     conn, cursor = get_connection(db_path)
@@ -219,18 +220,36 @@ def delete_tags(query_tags: List[str], del_tags: List[str], db_path: str = "data
         return False
 
     total_deleted = 0
+
     for file_id, name, _, _ in files:
+        # Contar cuántas etiquetas tiene actualmente el archivo
+        cursor.execute("""
+            SELECT COUNT(*) FROM file_tags WHERE file_id = ?
+        """, (file_id,))
+        tag_count = cursor.fetchone()[0]
+
         for tag in del_tags:
             tag = tag.strip()
             if not tag:
                 continue
+
+            # Si solo queda una etiqueta, no eliminar más
+            if tag_count <= 1:
+                print(f"[WARN] No se puede eliminar la última etiqueta de '{name}'.")
+                break
+
             cursor.execute("SELECT id FROM tags WHERE tag = ?", (tag,))
             row = cursor.fetchone()
-            if row:
-                tag_id = row[0]
-                cursor.execute("DELETE FROM file_tags WHERE file_id = ? AND tag_id = ?", (file_id, tag_id))
+            if not row:
+                continue
+
+            tag_id = row[0]
+            cursor.execute("DELETE FROM file_tags WHERE file_id = ? AND tag_id = ?", (file_id, tag_id))
+            if cursor.rowcount > 0:
                 total_deleted += cursor.rowcount
-        print(f"[INFO] Etiquetas eliminadas de {name}")
+                tag_count -= 1  # actualizamos el contador local
+
+        print(f"[INFO] Etiquetas eliminadas de {name} (quedan {tag_count})")
 
     conn.commit()
     close_connection(conn)

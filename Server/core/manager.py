@@ -1,14 +1,15 @@
 import os
 import shutil
 from typing import List, Optional, Tuple
-from core.database import get_connection, close_connection
+from Server.core.database import get_connection, close_connection
 
 STORAGE_DIR = os.path.join(os.path.dirname(__file__), "..", "storage")
+DB_PATH = os.path.join(os.path.dirname(__file__).removesuffix("/core"),'database','db.db')
 
 # Crear carpeta storage si no existe
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
-def add_files(file_list: List[str], tag_list: List[str], db_path: str = "database/db.db") -> bool:
+def add_files(file_list: List[str], tag_list: List[str], db_path: str = DB_PATH) -> bool:
     """
     Agrega ficheros y sus etiquetas al sistema.
 
@@ -87,7 +88,7 @@ def add_files(file_list: List[str], tag_list: List[str], db_path: str = "databas
     close_connection(conn)
     return added_any
 
-def query_files(query_tags: Optional[List[str]]= None, db_path: str="database/db.db")-> List[Tuple[int, str, str, str]]:
+def query_files(query_tags: Optional[List[str]]= None, db_path: str=DB_PATH)-> List[Tuple[int, str, str, str]]:
     """
     Devuelve lista de tuplas (id, name, tags_concat, path) que cumplen la consulta.
     - query_tags: lista de etiquetas (AND). Si None o vacía -> devuelve todo.
@@ -126,7 +127,7 @@ def query_files(query_tags: Optional[List[str]]= None, db_path: str="database/db
     return results  # lista de (id, name, tags_concat, path)
 
 
-def list_files(query_tags: Optional[List[str]] = None, db_path: str = "database/db.db") -> List[Tuple[int, str, str, str]]:
+def list_files(query_tags: Optional[List[str]] = None, db_path: str = DB_PATH) -> List[Tuple[int, str, str, str]]:
     files = query_files(query_tags, db_path)
     if not files:
         print("[INFO] No se encontraron archivos.")
@@ -138,7 +139,7 @@ def list_files(query_tags: Optional[List[str]] = None, db_path: str = "database/
     return files
 
 
-def delete_files(query_tags: List[str], db_path: str = "database/db.db") -> bool:
+def delete_files(query_tags: List[str], db_path: str = DB_PATH) -> bool:
     """
     Elimina ficheros que cumplen la query (por etiquetas).
     Borra registros en DB y archivos en storage.
@@ -179,7 +180,7 @@ def delete_files(query_tags: List[str], db_path: str = "database/db.db") -> bool
     close_connection(conn)
     return True
 
-def add_tags(query_tags: List[str], new_tags: List[str], db_path: str = "database/db.db") -> bool:
+def add_tags(query_tags: List[str], new_tags: List[str], db_path: str = DB_PATH) -> bool:
     """
     Añade etiquetas new_tags a todos los ficheros que cumplen query_tags.
     Devuelve True si se agregó al menos a un archivo, False si no hubo coincidencias.
@@ -207,7 +208,7 @@ def add_tags(query_tags: List[str], new_tags: List[str], db_path: str = "databas
     close_connection(conn)
     return affected > 0
 
-def delete_tags(query_tags: List[str], del_tags: List[str], db_path: str = "database/db.db") -> bool:
+def delete_tags(query_tags: List[str], del_tags: List[str], db_path: str = DB_PATH) -> bool:
     """
     Elimina las etiquetas del_tags de los ficheros que cumplen query_tags.
     No elimina etiquetas si el fichero quedaría sin ninguna.
@@ -256,7 +257,7 @@ def delete_tags(query_tags: List[str], del_tags: List[str], db_path: str = "data
     return total_deleted > 0
 
 
-def download_file(file_name: str, destination_folder: str, db_path: str = "database/db.db") -> bool:
+def download_file(file_name: str, destination_folder: str, db_path: str = DB_PATH) -> bool:
     """
     Copia un archivo del sistema (desde storage/) hacia una carpeta destino existente.
     Si el usuario pasa 'Downloads', automáticamente apunta al directorio de descargas del usuario.
@@ -295,7 +296,7 @@ def download_file(file_name: str, destination_folder: str, db_path: str = "datab
         print(f"[ERROR] No se pudo copiar el archivo: {e}")
         return False
 
-def get_file_path(file_name: str, db_path: str = "database/db.db") -> Optional[str]:
+def get_file_path(file_name: str, db_path: str = DB_PATH) -> Optional[str]:
     """Devuelve la ruta real del archivo almacenado o None si no existe."""
     conn, cursor = get_connection(db_path)
     cursor.execute("SELECT path FROM files WHERE name = ?", (file_name,))

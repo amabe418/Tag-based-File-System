@@ -1,0 +1,16 @@
+# gui/dockerfile.yml
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY Client/main.py /app
+COPY Client/web.py /app
+RUN pip install --no-cache-dir requests streamlit
+
+EXPOSE 8501
+
+# Variable de entorno para que la GUI sepa dónde está el backend
+ENV API_URL=http://backend:8000
+ENV DOWNLOAD_DIR="downloads"
+
+CMD ["streamlit", "run", "web.py", "--server.port=8501", "--server.address=0.0.0.0"]

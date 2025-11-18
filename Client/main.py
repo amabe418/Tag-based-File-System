@@ -1,8 +1,20 @@
 import sys
 import requests
 import os
+from registry_client import registry_client
 
+# URL de fallback si el registry no está disponible
 API_URL = os.getenv("API_URL","http://127.0.0.1:8000")
+
+def get_server_url():
+    """Obtiene la URL de un servidor desde el registry o usa fallback"""
+    try:
+        server_url = registry_client.get_server_url(strategy="random")
+        if server_url:
+            return server_url
+    except Exception as e:
+        print(f"[INFO] No se pudo obtener servidor del registry: {e}")
+    return API_URL
 
 def main():
     if len(sys.argv) < 2:
@@ -39,8 +51,9 @@ def main():
             with open(file_path, "rb") as f:
                 try:
                     print(tags)
+                    server_url = get_server_url()
                     response = requests.post(
-                        f"{API_URL}/add",
+                        f"{server_url}/add",
                         files={"file": (os.path.basename(file_path), f)},
                         data={"tags": ",".join(tags)},
                     )
@@ -52,7 +65,8 @@ def main():
     elif command == "list":
         tag_query = sys.argv[2:] if len(sys.argv) > 2 else []
         try:
-            response = requests.get(f"{API_URL}/list", params=[("tags", t) for t in tag_query])
+            server_url = get_server_url()
+            response = requests.get(f"{server_url}/list", params=[("tags", t) for t in tag_query])
             response.raise_for_status()
             data = response.json().get("files", [])
             if not data:
@@ -71,7 +85,8 @@ def main():
 
         tag_query = sys.argv[2]
         try:
-            response = requests.delete(f"{API_URL}/delete", params={"tags": tag_query})
+            server_url = get_server_url()
+            response = requests.delete(f"{server_url}/delete", params={"tags": tag_query})
             response.raise_for_status()
             msg = response.json().get("message", "")
             print(f"[INFO] {msg}")
@@ -88,7 +103,8 @@ def main():
         new_tags = sys.argv[3]
 
         try:
-            response = requests.post(f"{API_URL}/add-tags", params={"query": query_tags, "new_tags": new_tags})
+            server_url = get_server_url()
+            response = requests.post(f"{server_url}/add-tags", params={"query": query_tags, "new_tags": new_tags})
             response.raise_for_status()
             if response.json().get("success"):
                 print("[OK] Etiquetas agregadas correctamente.")
@@ -107,7 +123,8 @@ def main():
         del_tags = sys.argv[3]
 
         try:
-            response = requests.post(f"{API_URL}/delete-tags", params={"query": query_tags, "del_tags": del_tags})
+            server_url = get_server_url()
+            response = requests.post(f"{server_url}/delete-tags", params={"query": query_tags, "del_tags": del_tags})
             response.raise_for_status()
             if response.json().get("success"):
                 print("[OK] Etiquetas eliminadas correctamente.")
@@ -134,7 +151,8 @@ def main():
         dest_folder = sys.argv[3]
         os.makedirs(dest_folder, exist_ok=True)
         try:
-            response = requests.get(f"{API_URL}/download/{file_name}", stream=True)
+            server_url = get_server_url()
+            response = requests.get(f"{server_url}/download/{file_name}", stream=True)
             response.raise_for_status()
             path = os.path.join(dest_folder, file_name)
             with open(path, "wb") as f:

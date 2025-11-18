@@ -5,11 +5,13 @@ WORKDIR /app
 
 COPY Client/main.py /app
 COPY Client/web.py /app
+COPY Client/registry_client.py /app
 RUN pip install --no-cache-dir requests streamlit
 
 EXPOSE 8501
 
-# Variable de entorno para que la GUI sepa dónde está el backend
+# Variables de entorno
+ENV REGISTRY_URL=http://registry:9000
 ENV API_URL=http://backend:8000
 ENV DOWNLOAD_DIR="downloads"
 

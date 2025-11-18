@@ -3,13 +3,24 @@ from fastapi import FastAPI, UploadFile, Form, HTTPException, Query
 from fastapi.responses import FileResponse
 from Server.core import manager
 from Server.core import database
+from Server.core import registry_client
 import os
 import shutil
 from typing import List, Optional
+from contextlib import asynccontextmanager
 
 database.init_db()
 
-app = FastAPI(title="Tag-Based File System API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Maneja el ciclo de vida de la aplicación"""
+    # Startup
+    registry_client.registry_client.start()
+    yield
+    # Shutdown
+    registry_client.registry_client.stop()
+
+app = FastAPI(title="Tag-Based File System API", lifespan=lifespan)
 
 @app.get("/")
 def root():

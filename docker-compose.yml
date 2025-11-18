@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  registry:
+    build:
+      context: .
+      dockerfile: Registry/dockerfile.yml
+    image: tbfs-registry
+    container_name: tbfs-registry
+    ports:
+      - "9000:9000"
+    networks:
+      - tbfs_net
+    environment:
+      - HEARTBEAT_TIMEOUT=30
+      - CLEANUP_INTERVAL=10
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: Server/dockerfile.yml
+    image: tbfs-backend
+    container_name: tbfs-backend
+    ports:
+      - "8000:8000"
+    networks:
+      - tbfs_net
+    environment:
+      - REGISTRY_URL=http://registry:9000
+      - SERVER_PORT=8000
+      - HEARTBEAT_INTERVAL=10
+    depends_on:
+      - registry
+    restart: unless-stopped
+    deploy:
+      replicas: 2  # Ejemplo: múltiples instancias del backend
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Client/dockerfile.yml
+    image: tbfs-frontend
+    container_name: tbfs-frontend
+    ports:
+      - "8501:8501"
+    networks:
+      - tbfs_net
+    environment:
+      - REGISTRY_URL=http://registry:9000
+      - API_URL=http://backend:8000
+      - DOWNLOAD_DIR=downloads
+    depends_on:
+      - registry
+    restart: unless-stopped
+
+networks:
+  tbfs_net:
+    driver: bridge
+

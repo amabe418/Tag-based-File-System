@@ -9,4 +9,9 @@ RUN pip install --no-cache-dir fastapi uvicorn requests python-multipart
 
 EXPOSE 8000
 
+# Variables de entorno para el registry
+ENV REGISTRY_URL=http://registry:9000
+ENV SERVER_PORT=8000
+ENV HEARTBEAT_INTERVAL=10
+
 CMD ["uvicorn", "Server.api:app", "--host", "0.0.0.0", "--port", "8000"]

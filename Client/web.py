@@ -3,12 +3,27 @@ import requests
 import streamlit as st
 import pandas as pd
 import math
+from registry_client import registry_client
 
+# URL de fallback si el registry no está disponible
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", os.path.join(os.path.dirname(__file__),"downloads/"))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-print(f"Usando: {API_URL}")
+def get_server_url():
+    """Obtiene la URL de un servidor desde el registry o usa fallback"""
+    try:
+        server_url = registry_client.get_server_url(strategy="random")
+        if server_url:
+            return server_url
+    except Exception as e:
+        st.warning(f"No se pudo obtener servidor del registry: {e}")
+    return API_URL
+
+# Inicializar URL del servidor en session state
+if "server_url" not in st.session_state:
+    st.session_state.server_url = get_server_url()
+    print(f"Usando servidor: {st.session_state.server_url}")
 
 st.set_page_config(page_title="Tag-based File System", layout="wide")
 st.markdown("---")
@@ -27,10 +42,12 @@ if "table_version" not in st.session_state:
 # --- Función para refrescar lista ---
 def refresh_list(tags=None):
     try:
+        # Actualizar URL del servidor si es necesario
+        st.session_state.server_url = get_server_url()
         params = {}
         if tags:
             params["tags"] = tags
-        response = requests.get(f"{API_URL}/list", params=params)
+        response = requests.get(f"{st.session_state.server_url}/list", params=params)
         response.raise_for_status()
         data = response.json()
         return data.get("files", [])
@@ -42,7 +59,8 @@ def refresh_list(tags=None):
 def download_file(file_name):
     """Descarga un archivo individual"""
     try:
-        r = requests.get(f"{API_URL}/download/{file_name}", stream=True)
+        server_url = get_server_url()
+        r = requests.get(f"{server_url}/download/{file_name}", stream=True)
         r.raise_for_status()
         download_path = os.path.join(DOWNLOAD_DIR, file_name)
         with open(download_path, "wb") as f:
@@ -304,7 +322,8 @@ if st.session_state.modal == "add_file":
                         files = {"file": (file.name, file.getvalue())}
                         data = {"tags": tags}
                         try:
-                            response = requests.post(f"{API_URL}/add", files=files, data=data)
+                            server_url = get_server_url()
+                            response = requests.post(f"{server_url}/add", files=files, data=data)
                             response.raise_for_status()
                             st.success(f"Archivo '{file.name}' subido correctamente.")
                             # st.rerun()
@@ -330,7 +349,8 @@ elif st.session_state.modal == "add_tags":
                 else:
                     params = {"query": query_tags, "new_tags": new_tags}
                     try:
-                        response = requests.post(f"{API_URL}/add-tags", params=params)
+                        server_url = get_server_url()
+                        response = requests.post(f"{server_url}/add-tags", params=params)
                         response.raise_for_status()
                         data = response.json()
                         if data.get("success"):
@@ -359,7 +379,8 @@ elif st.session_state.modal == "del_tags":
                 else:
                     params = {"query": query_tags, "del_tags": del_tags}
                     try:
-                        response = requests.post(f"{API_URL}/delete-tags", params=params)
+                        server_url = get_server_url()
+                        response = requests.post(f"{server_url}/delete-tags", params=params)
                         response.raise_for_status()
                         data = response.json()
                         if data.get("success"):
@@ -385,7 +406,8 @@ elif st.session_state.modal == "del_files":
                 else:
                     params = {"tags": tags}
                     try:
-                        response = requests.delete(f"{API_URL}/delete", params=params)
+                        server_url = get_server_url()
+                        response = requests.delete(f"{server_url}/delete", params=params)
                         response.raise_for_status()
                         data = response.json()
                         if data.get("success"):

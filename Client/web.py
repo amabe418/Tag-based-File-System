@@ -10,31 +10,45 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", os.path.join(os.path.dirname(__file__),
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def get_server_url():
-    """Obtiene la URL de un servidor desde el registry"""
+    """Obtiene la URL de un servidor desde el registry. Retorna (url, error_message)"""
     try:
         # Intentar obtener servidor del registry
         server_url = registry_client.get_server_url(strategy="random")
         if server_url:
-            return server_url
+            return server_url, None
         
         # Si no hay servidor, intentar obtener lista directamente
         servers = registry_client.get_active_servers(use_cache=False)
         if servers and len(servers) > 0:
             server = random.choice(servers)
-            return server.get("url")
+            return server.get("url"), None
         
-        # Si no hay servidores disponibles, mostrar error
-        st.error("⚠️ No hay servidores de datos disponibles en el registry. Por favor, verifica que el registry y los servidores backend estén funcionando.")
-        return None
+        # Si no hay servidores disponibles, retornar error
+        return None, "No hay servidores de datos disponibles en el registry. Por favor, verifica que el registry y los servidores backend estén funcionando."
         
     except Exception as e:
-        st.error(f"❌ Error al consultar el registry: {e}")
-        st.info("💡 Asegúrate de que el Registry Service esté funcionando y accesible.")
-        return None
+        return None, f"Error al consultar el registry: {e}"
+
+def check_server_connection():
+    """Verifica si hay conexión con el servidor. Retorna (connected, error_message)"""
+    server_url, error = get_server_url()
+    if not server_url:
+        return False, error
+    
+    try:
+        # Intentar hacer una petición simple al servidor para verificar conexión
+        response = requests.get(f"{server_url}/", timeout=3)
+        if response.status_code == 200:
+            return True, None
+        else:
+            return False, f"El servidor respondió con código {response.status_code}"
+    except requests.RequestException as e:
+        return False, f"No se pudo conectar con el servidor: {e}"
 
 # Inicializar URL del servidor en session state
 if "server_url" not in st.session_state:
-    st.session_state.server_url = get_server_url()
+    server_url, _ = get_server_url()
+    st.session_state.server_url = server_url
     if st.session_state.server_url:
         print(f"Usando servidor: {st.session_state.server_url}")
     else:
@@ -43,6 +57,23 @@ if "server_url" not in st.session_state:
 st.set_page_config(page_title="Tag-based File System", layout="wide")
 st.markdown("---")
 st.title("📂 Tag-based File System")
+
+# Verificar conexión con el servidor y mostrar errores en un expander
+is_connected, connection_error = check_server_connection()
+errors = []
+
+if not is_connected:
+    if connection_error:
+        errors.append(connection_error)
+    
+    # Mostrar errores en un expander colapsable
+    with st.expander("⚠️ Problemas de conexión (click para ver detalles)", expanded=True):
+        if errors:
+            for error in errors:
+                st.error(f"❌ {error}")
+        else:
+            st.error("⚠️ No hay conexión con el servidor.")
+        st.info("💡 Los botones estarán deshabilitados hasta que se restablezca la conexión. Asegúrate de que el Registry Service y los servidores backend estén funcionando.")
 
 # --- Estado inicial ---
 if "modal" not in st.session_state:
@@ -56,7 +87,7 @@ if "table_version" not in st.session_state:
 
 # --- Función para refrescar lista ---
 def refresh_list(tags=None):
-    server_url = get_server_url()
+    server_url, _ = get_server_url()
     if not server_url:
         return []
     
@@ -69,13 +100,13 @@ def refresh_list(tags=None):
         data = response.json()
         return data.get("files", [])
     except requests.RequestException as e:
-        st.error(f"No se pudo obtener la lista de archivos: {e}")
+        # No mostrar error aquí, ya se muestra en el expander de conexión
         return []
 
 # --- Función para descargar archivo ---
 def download_file(file_name):
     """Descarga un archivo individual"""
-    server_url = get_server_url()
+    server_url, _ = get_server_url()
     if not server_url:
         return False, "No hay servidor disponible"
     
@@ -224,9 +255,9 @@ if files:
         )
 
         col_select_all, col_deselect_all, col_download_selected = st.columns([1.5, 1.5, 2])
-        select_all = col_select_all.form_submit_button("✅ Seleccionar todos", use_container_width=True)
-        deselect_all = col_deselect_all.form_submit_button("❌ Deseleccionar todos", use_container_width=True)
-        download_clicked = col_download_selected.form_submit_button("📥 Descargar seleccionados", use_container_width=True, type="primary")
+        select_all = col_select_all.form_submit_button("✅ Seleccionar todos", use_container_width=True, disabled=not is_connected)
+        deselect_all = col_deselect_all.form_submit_button("❌ Deseleccionar todos", use_container_width=True, disabled=not is_connected)
+        download_clicked = col_download_selected.form_submit_button("📥 Descargar seleccionados", use_container_width=True, type="primary", disabled=not is_connected)
 
         # Manejo de envíos del formulario
         if select_all:
@@ -283,7 +314,7 @@ if files:
     col_prev, col_page, col_next = st.columns([1, 2, 1])
     
     with col_prev:
-        if st.button("⬅️ Anterior", disabled=(st.session_state.current_page == 1), use_container_width=True):
+        if st.button("⬅️ Anterior", disabled=(st.session_state.current_page == 1 or not is_connected), use_container_width=True):
             # No persistir selección al cambiar de página
             st.session_state.selected_files = set()
             # Opcional: resetear versión de la tabla para la nueva página
@@ -296,7 +327,7 @@ if files:
         st.markdown("&nbsp;", unsafe_allow_html=True)
 
     with col_next:
-        if st.button("Siguiente ➡️", disabled=(st.session_state.current_page == total_pages), use_container_width=True):
+        if st.button("Siguiente ➡️", disabled=(st.session_state.current_page == total_pages or not is_connected), use_container_width=True):
             # No persistir selección al cambiar de página
             st.session_state.selected_files = set()
             # Opcional: resetear versión de la tabla para la nueva página
@@ -312,16 +343,16 @@ else:
 # --- Botones principales centrados en la parte superior ---
 col_empty_left, col1, col2, col3, col4, col_empty_right = st.columns([1, 2, 2, 2, 2, 1])
 with col1:
-    if st.button("➕ Agregar archivo(s)", key="btn_add_file", use_container_width=True):
+    if st.button("➕ Agregar archivo(s)", key="btn_add_file", use_container_width=True, disabled=not is_connected):
         st.session_state.modal = "add_file"
 with col2:
-    if st.button("🔖➕ Agregar etiqueta(s)", key="btn_add_tags", use_container_width=True):
+    if st.button("🔖➕ Agregar etiqueta(s)", key="btn_add_tags", use_container_width=True, disabled=not is_connected):
         st.session_state.modal = "add_tags"
 with col3:
-    if st.button("🔖❌ Eliminar etiqueta(s)", key="btn_del_tags", use_container_width=True):
+    if st.button("🔖❌ Eliminar etiqueta(s)", key="btn_del_tags", use_container_width=True, disabled=not is_connected):
         st.session_state.modal = "del_tags"
 with col4:
-    if st.button("🗑️ Eliminar archivo(s)", key="btn_del_files", use_container_width=True):
+    if st.button("🗑️ Eliminar archivo(s)", key="btn_del_files", use_container_width=True, disabled=not is_connected):
         st.session_state.modal = "del_files"
 
 # --- Modal: Agregar archivos ---
@@ -332,13 +363,13 @@ if st.session_state.modal == "add_file":
 
         colA, colB = st.columns([1, 1])
         with colA:
-            if st.button("Agregar Archivo(s)", key="upload_button"):
+            if st.button("Agregar Archivo(s)", key="upload_button", disabled=not is_connected):
                 if not uploaded_files:
                     st.warning("Selecciona al menos un archivo.")
                 elif not tags.strip():
                     st.warning("Debes ingresar al menos una etiqueta.")
                 else:
-                    server_url = get_server_url()
+                    server_url, _ = get_server_url()
                     if not server_url:
                         st.error("No hay servidor disponible para subir archivos.")
                     else:
@@ -364,13 +395,13 @@ elif st.session_state.modal == "add_tags":
 
         colA, colB = st.columns([1, 1])
         with colA:
-            if st.button("Agregar Etiqueta(s)", key="confirm_add_tags"):
+            if st.button("Agregar Etiqueta(s)", key="confirm_add_tags", disabled=not is_connected):
                 if not query_tags.strip():
                     st.warning("Debes ingresar las etiquetas a buscar.")
                 elif not new_tags.strip():
                     st.warning("Debes ingresar al menos una nueva etiqueta.")
                 else:
-                    server_url = get_server_url()
+                    server_url, _ = get_server_url()
                     if not server_url:
                         st.error("No hay servidor disponible.")
                     else:
@@ -397,13 +428,13 @@ elif st.session_state.modal == "del_tags":
 
         colA, colB = st.columns([1, 1])
         with colA:
-            if st.button("Eliminar Etiqueta(s)", key="confirm_del_tags"):
+            if st.button("Eliminar Etiqueta(s)", key="confirm_del_tags", disabled=not is_connected):
                 if not query_tags.strip():
                     st.warning("Debes ingresar las etiquetas a buscar.")
                 elif not del_tags.strip():
                     st.warning("Debes ingresar las etiquetas que deseas eliminar.")
                 else:
-                    server_url = get_server_url()
+                    server_url, _ = get_server_url()
                     if not server_url:
                         st.error("No hay servidor disponible.")
                     else:
@@ -429,11 +460,11 @@ elif st.session_state.modal == "del_files":
 
         colA, colB = st.columns([1, 1])
         with colA:
-            if st.button("Eliminar Archivo(s)", key="confirm_del_files"):
+            if st.button("Eliminar Archivo(s)", key="confirm_del_files", disabled=not is_connected):
                 if not tags.strip():
                     st.warning("Debes ingresar las etiquetas de los archivos que deseas eliminar.")
                 else:
-                    server_url = get_server_url()
+                    server_url, _ = get_server_url()
                     if not server_url:
                         st.error("No hay servidor disponible.")
                     else:

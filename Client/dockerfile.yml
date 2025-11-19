@@ -11,8 +11,8 @@ RUN pip install --no-cache-dir requests streamlit
 EXPOSE 8501
 
 # Variables de entorno
-ENV REGISTRY_URL=http://registry:9000
-ENV API_URL=http://backend:8000
+ENV REGISTRY_URL=http://tbfs-registry:9000
+# ENV API_URL=http://tbfs-backend:8000
 ENV DOWNLOAD_DIR="downloads"
 
 CMD ["streamlit", "run", "web.py", "--server.port=8501", "--server.address=0.0.0.0"]

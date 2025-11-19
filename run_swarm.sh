@@ -21,37 +21,34 @@ docker rm tbfs-registry-1 tbfs-registry-2 tbfs-registry-3 tbfs-backend tbfs-fron
 echo "Iniciando Registry Service - Nodo 1..."
 docker run -d --name tbfs-registry-1 --network tbfs_net -p 9000:9000 \
   -e NODE_ID=registry-1 \
-  -e PEERS=registry-2,registry-3 \
+  -e PEERS=tbfs-registry-2,tbfs-registry-3 \
   -e REGISTRY_PORT=9000 \
   -e HEARTBEAT_TIMEOUT=30 \
   -e CLEANUP_INTERVAL=10 \
   -e LEADER_HEARTBEAT_INTERVAL=5 \
   -e ELECTION_TIMEOUT=15 \
-  --restart unless-stopped \
   tbfs-registry
 
 echo "Iniciando Registry Service - Nodo 2..."
 docker run -d --name tbfs-registry-2 --network tbfs_net -p 9001:9000 \
   -e NODE_ID=registry-2 \
-  -e PEERS=registry-1,registry-3 \
+  -e PEERS=tbfs-registry-1,tbfs-registry-3 \
   -e REGISTRY_PORT=9000 \
   -e HEARTBEAT_TIMEOUT=30 \
   -e CLEANUP_INTERVAL=10 \
   -e LEADER_HEARTBEAT_INTERVAL=5 \
   -e ELECTION_TIMEOUT=15 \
-  --restart unless-stopped \
   tbfs-registry
 
 echo "Iniciando Registry Service - Nodo 3..."
 docker run -d --name tbfs-registry-3 --network tbfs_net -p 9002:9000 \
   -e NODE_ID=registry-3 \
-  -e PEERS=registry-1,registry-2 \
+  -e PEERS=tbfs-registry-1,tbfs-registry-2 \
   -e REGISTRY_PORT=9000 \
   -e HEARTBEAT_TIMEOUT=30 \
   -e CLEANUP_INTERVAL=10 \
   -e LEADER_HEARTBEAT_INTERVAL=5 \
   -e ELECTION_TIMEOUT=15 \
-  --restart unless-stopped \
   tbfs-registry
 
 # Esperar un momento para que los registries se estabilicen
@@ -61,19 +58,16 @@ sleep 5
 # Ejecutar Backend Service
 echo "Iniciando Backend Service..."
 docker run -d --name tbfs-backend --network tbfs_net -p 8000:8000 \
-  -e REGISTRY_URL=http://registry-1:9000,http://registry-2:9000,http://registry-3:9000 \
+  -e REGISTRY_URL=http://tbfs-registry-1:9000,http://tbfs-registry-2:9000,http://tbfs-registry-3:9000 \
   -e SERVER_PORT=8000 \
   -e HEARTBEAT_INTERVAL=10 \
-  --restart unless-stopped \
   tbfs-backend
 
 # Ejecutar Frontend Service
 echo "Iniciando Frontend Service..."
 docker run -d --name tbfs-frontend --network tbfs_net -p 8501:8501 \
-  -e REGISTRY_URL=http://registry-1:9000,http://registry-2:9000,http://registry-3:9000 \
-  -e API_URL=http://backend:8000 \
+  -e REGISTRY_URL=http://tbfs-registry-1:9000,http://tbfs-registry-2:9000,http://tbfs-registry-3:9000 \
   -e DOWNLOAD_DIR=downloads \
-  --restart unless-stopped \
   tbfs-frontend
 
 echo ""

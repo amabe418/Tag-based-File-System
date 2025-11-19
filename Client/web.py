@@ -3,27 +3,42 @@ import requests
 import streamlit as st
 import pandas as pd
 import math
+import random
 from registry_client import registry_client
 
-# URL de fallback si el registry no está disponible
-API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", os.path.join(os.path.dirname(__file__),"downloads/"))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def get_server_url():
-    """Obtiene la URL de un servidor desde el registry o usa fallback"""
+    """Obtiene la URL de un servidor desde el registry"""
     try:
+        # Intentar obtener servidor del registry
         server_url = registry_client.get_server_url(strategy="random")
         if server_url:
             return server_url
+        
+        # Si no hay servidor, intentar obtener lista directamente
+        servers = registry_client.get_active_servers(use_cache=False)
+        if servers and len(servers) > 0:
+            server = random.choice(servers)
+            return server.get("url")
+        
+        # Si no hay servidores disponibles, mostrar error
+        st.error("⚠️ No hay servidores de datos disponibles en el registry. Por favor, verifica que el registry y los servidores backend estén funcionando.")
+        return None
+        
     except Exception as e:
-        st.warning(f"No se pudo obtener servidor del registry: {e}")
-    return API_URL
+        st.error(f"❌ Error al consultar el registry: {e}")
+        st.info("💡 Asegúrate de que el Registry Service esté funcionando y accesible.")
+        return None
 
 # Inicializar URL del servidor en session state
 if "server_url" not in st.session_state:
     st.session_state.server_url = get_server_url()
-    print(f"Usando servidor: {st.session_state.server_url}")
+    if st.session_state.server_url:
+        print(f"Usando servidor: {st.session_state.server_url}")
+    else:
+        print("⚠️ No se pudo obtener servidor del registry")
 
 st.set_page_config(page_title="Tag-based File System", layout="wide")
 st.markdown("---")
@@ -41,13 +56,15 @@ if "table_version" not in st.session_state:
 
 # --- Función para refrescar lista ---
 def refresh_list(tags=None):
+    server_url = get_server_url()
+    if not server_url:
+        return []
+    
     try:
-        # Actualizar URL del servidor si es necesario
-        st.session_state.server_url = get_server_url()
         params = {}
         if tags:
             params["tags"] = tags
-        response = requests.get(f"{st.session_state.server_url}/list", params=params)
+        response = requests.get(f"{server_url}/list", params=params)
         response.raise_for_status()
         data = response.json()
         return data.get("files", [])
@@ -58,8 +75,11 @@ def refresh_list(tags=None):
 # --- Función para descargar archivo ---
 def download_file(file_name):
     """Descarga un archivo individual"""
+    server_url = get_server_url()
+    if not server_url:
+        return False, "No hay servidor disponible"
+    
     try:
-        server_url = get_server_url()
         r = requests.get(f"{server_url}/download/{file_name}", stream=True)
         r.raise_for_status()
         download_path = os.path.join(DOWNLOAD_DIR, file_name)
@@ -318,17 +338,20 @@ if st.session_state.modal == "add_file":
                 elif not tags.strip():
                     st.warning("Debes ingresar al menos una etiqueta.")
                 else:
-                    for file in uploaded_files:
-                        files = {"file": (file.name, file.getvalue())}
-                        data = {"tags": tags}
-                        try:
-                            server_url = get_server_url()
-                            response = requests.post(f"{server_url}/add", files=files, data=data)
-                            response.raise_for_status()
-                            st.success(f"Archivo '{file.name}' subido correctamente.")
-                            # st.rerun()
-                        except requests.RequestException as e:
-                            st.error(f"Error al subir '{file.name}': {e}")
+                    server_url = get_server_url()
+                    if not server_url:
+                        st.error("No hay servidor disponible para subir archivos.")
+                    else:
+                        for file in uploaded_files:
+                            files = {"file": (file.name, file.getvalue())}
+                            data = {"tags": tags}
+                            try:
+                                response = requests.post(f"{server_url}/add", files=files, data=data)
+                                response.raise_for_status()
+                                st.success(f"Archivo '{file.name}' subido correctamente.")
+                                # st.rerun()
+                            except requests.RequestException as e:
+                                st.error(f"Error al subir '{file.name}': {e}")
                     st.session_state.modal = None
                     st.session_state.refresh_needed = True
                     st.rerun()
@@ -347,18 +370,21 @@ elif st.session_state.modal == "add_tags":
                 elif not new_tags.strip():
                     st.warning("Debes ingresar al menos una nueva etiqueta.")
                 else:
-                    params = {"query": query_tags, "new_tags": new_tags}
-                    try:
-                        server_url = get_server_url()
-                        response = requests.post(f"{server_url}/add-tags", params=params)
-                        response.raise_for_status()
-                        data = response.json()
-                        if data.get("success"):
-                            st.success("Etiquetas agregadas correctamente.")
-                        else:
-                            st.warning("No se encontraron archivos que coincidan.")
-                    except requests.RequestException as e:
-                        st.error(f"Error: {e}")
+                    server_url = get_server_url()
+                    if not server_url:
+                        st.error("No hay servidor disponible.")
+                    else:
+                        params = {"query": query_tags, "new_tags": new_tags}
+                        try:
+                            response = requests.post(f"{server_url}/add-tags", params=params)
+                            response.raise_for_status()
+                            data = response.json()
+                            if data.get("success"):
+                                st.success("Etiquetas agregadas correctamente.")
+                            else:
+                                st.warning("No se encontraron archivos que coincidan.")
+                        except requests.RequestException as e:
+                            st.error(f"Error: {e}")
                     st.session_state.modal = None
                     st.session_state.refresh_needed = True
                     st.rerun()
@@ -377,18 +403,21 @@ elif st.session_state.modal == "del_tags":
                 elif not del_tags.strip():
                     st.warning("Debes ingresar las etiquetas que deseas eliminar.")
                 else:
-                    params = {"query": query_tags, "del_tags": del_tags}
-                    try:
-                        server_url = get_server_url()
-                        response = requests.post(f"{server_url}/delete-tags", params=params)
-                        response.raise_for_status()
-                        data = response.json()
-                        if data.get("success"):
-                            st.success("Etiquetas eliminadas correctamente.")
-                        else:
-                            st.warning("No se encontraron archivos que coincidan.")
-                    except requests.RequestException as e:
-                        st.error(f"Error: {e}")
+                    server_url = get_server_url()
+                    if not server_url:
+                        st.error("No hay servidor disponible.")
+                    else:
+                        params = {"query": query_tags, "del_tags": del_tags}
+                        try:
+                            response = requests.post(f"{server_url}/delete-tags", params=params)
+                            response.raise_for_status()
+                            data = response.json()
+                            if data.get("success"):
+                                st.success("Etiquetas eliminadas correctamente.")
+                            else:
+                                st.warning("No se encontraron archivos que coincidan.")
+                        except requests.RequestException as e:
+                            st.error(f"Error: {e}")
                     st.session_state.modal = None
                     st.session_state.refresh_needed = True
                     st.rerun()
@@ -404,18 +433,21 @@ elif st.session_state.modal == "del_files":
                 if not tags.strip():
                     st.warning("Debes ingresar las etiquetas de los archivos que deseas eliminar.")
                 else:
-                    params = {"tags": tags}
-                    try:
-                        server_url = get_server_url()
-                        response = requests.delete(f"{server_url}/delete", params=params)
-                        response.raise_for_status()
-                        data = response.json()
-                        if data.get("success"):
-                            st.success("Archivos eliminados correctamente.")
-                        else:
-                            st.warning("No se encontraron archivos con esas etiquetas.")
-                    except requests.RequestException as e:
-                        st.error(f"Error: {e}")
+                    server_url = get_server_url()
+                    if not server_url:
+                        st.error("No hay servidor disponible.")
+                    else:
+                        params = {"tags": tags}
+                        try:
+                            response = requests.delete(f"{server_url}/delete", params=params)
+                            response.raise_for_status()
+                            data = response.json()
+                            if data.get("success"):
+                                st.success("Archivos eliminados correctamente.")
+                            else:
+                                st.warning("No se encontraron archivos con esas etiquetas.")
+                        except requests.RequestException as e:
+                            st.error(f"Error: {e}")
                     st.session_state.modal = None
                     st.session_state.refresh_needed = True
                     st.rerun()

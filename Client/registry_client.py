@@ -1,5 +1,6 @@
 """
 Cliente del Registry Service para descubrimiento de servidores
+Soporta múltiples nodos del registry con failover automático
 """
 import requests
 import os
@@ -13,10 +14,35 @@ class RegistryClient:
     """Cliente para consultar el Registry Service y obtener servidores disponibles"""
     
     def __init__(self, registry_url: str = REGISTRY_URL):
-        self.registry_url = registry_url
+        # Parsear múltiples URLs del registry (separadas por comas)
+        if isinstance(registry_url, str):
+            self.registry_urls = [url.strip() for url in registry_url.split(",") if url.strip()]
+        else:
+            self.registry_urls = [registry_url]
+        
         self._cached_servers = []
         self._cache_time = 0
         self._cache_ttl = 30  # segundos
+    
+    def _try_registry_request(self, endpoint: str, **kwargs) -> Optional[requests.Response]:
+        """Intenta hacer una petición a cualquiera de los nodos del registry disponibles"""
+        # Mezclar URLs para distribuir carga
+        urls = self.registry_urls.copy()
+        random.shuffle(urls)
+        
+        for registry_url in urls:
+            try:
+                response = requests.get(
+                    f"{registry_url}{endpoint}",
+                    timeout=5,
+                    **kwargs
+                )
+                response.raise_for_status()
+                return response
+            except requests.RequestException as e:
+                print(f"[REGISTRY_CLIENT] Error con nodo {registry_url}: {e}")
+                continue
+        return None
     
     def get_active_servers(self, use_cache: bool = True) -> List[Dict]:
         """
@@ -30,26 +56,19 @@ class RegistryClient:
         if use_cache and self._cached_servers and (current_time - self._cache_time) < self._cache_ttl:
             return self._cached_servers
         
-        try:
-            response = requests.get(
-                f"{self.registry_url}/servers/active",
-                timeout=5
-            )
-            response.raise_for_status()
+        response = self._try_registry_request("/servers/active")
+        if response:
             servers = response.json()
-            
             # Actualizar caché
             self._cached_servers = servers
             self._cache_time = current_time
-            
             return servers
-        except requests.RequestException as e:
-            print(f"[REGISTRY_CLIENT] Error al consultar registry: {e}")
-            # Si hay caché, devolverlo aunque esté expirado
-            if self._cached_servers:
-                print(f"[REGISTRY_CLIENT] Usando servidores en caché")
-                return self._cached_servers
-            return []
+        
+        # Si hay caché, devolverlo aunque esté expirado
+        if self._cached_servers:
+            print(f"[REGISTRY_CLIENT] Usando servidores en caché")
+            return self._cached_servers
+        return []
     
     def get_server_url(self, strategy: str = "random") -> Optional[str]:
         """
@@ -75,16 +94,10 @@ class RegistryClient:
     
     def get_all_servers(self) -> List[Dict]:
         """Obtiene todos los servidores (activos e inactivos)"""
-        try:
-            response = requests.get(
-                f"{self.registry_url}/servers",
-                timeout=5
-            )
-            response.raise_for_status()
+        response = self._try_registry_request("/servers")
+        if response:
             return response.json()
-        except requests.RequestException as e:
-            print(f"[REGISTRY_CLIENT] Error al consultar registry: {e}")
-            return []
+        return []
     
     def make_request_with_failover(self, method: str, endpoint: str, **kwargs):
         """

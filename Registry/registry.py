@@ -47,6 +47,7 @@ class ServerRegistration(BaseModel):
     server_id: str
     url: str
     port: int = 8000
+    ip: Optional[str] = None  # IP del servidor como alternativa de acceso
 
 
 class Heartbeat(BaseModel):
@@ -56,6 +57,7 @@ class Heartbeat(BaseModel):
 class ServerInfo(BaseModel):
     server_id: str
     url: str
+    ip: Optional[str] = None  # IP del servidor como alternativa de acceso
     status: str
     last_heartbeat: str
     registered_at: str
@@ -116,6 +118,10 @@ def replicate_to_peers(servers_data: Dict, term: int):
         peers = cluster_state["peers"].copy()
         leader_id = cluster_state["node_id"]
     
+    # Si no hay peers, no hay nada que replicar (modo desarrollo)
+    if not peers:
+        return True
+    
     success_count = 0
     for peer in peers:
         try:
@@ -127,7 +133,7 @@ def replicate_to_peers(servers_data: Dict, term: int):
                     "term": term,
                     "leader_id": leader_id
                 },
-                timeout=2
+                timeout=3
             )
             if response.status_code == 200:
                 success_count += 1
@@ -137,7 +143,19 @@ def replicate_to_peers(servers_data: Dict, term: int):
     # Se necesita mayoría (quorum): al menos 2 de 3 nodos
     total_nodes = len(peers) + 1  # +1 por este nodo
     quorum = (total_nodes // 2) + 1
-    return success_count + 1 >= quorum  # +1 por este nodo
+    replicated = success_count + 1 >= quorum  # +1 por este nodo
+    
+    # Si solo queda este nodo disponible, la replicación es exitosa (tolerancia a fallos)
+    if success_count == 1 and total_nodes > 1:
+        # Este es el único nodo disponible, pero hay otros configurados
+        # Esto es normal en caso de fallos, no es un warning crítico
+        print(f"[REGISTRY] Solo este nodo está disponible ({success_count + 1}/{total_nodes} nodos). Continuando operación (tolerancia a fallos activa).")
+        return True
+    
+    if not replicated:
+        print(f"[REGISTRY] WARNING: Solo se replicó a {success_count + 1}/{total_nodes} nodos (quorum: {quorum})")
+    
+    return replicated
 
 
 def request_vote(candidate_id: str, term: int) -> bool:
@@ -145,7 +163,13 @@ def request_vote(candidate_id: str, term: int) -> bool:
     with cluster_lock:
         peers = cluster_state["peers"].copy()
     
+    # Si no hay peers, este nodo es el único y es líder
+    if not peers:
+        return True
+    
     votes = 1  # Voto propio
+    successful_contacts = 1  # Contamos este nodo
+    
     for peer in peers:
         try:
             peer_url = get_peer_url(peer)
@@ -155,6 +179,7 @@ def request_vote(candidate_id: str, term: int) -> bool:
                 timeout=2
             )
             if response.status_code == 200:
+                successful_contacts += 1
                 data = response.json()
                 if data.get("granted"):
                     votes += 1
@@ -163,7 +188,20 @@ def request_vote(candidate_id: str, term: int) -> bool:
     
     total_nodes = len(peers) + 1
     quorum = (total_nodes // 2) + 1
-    return votes >= quorum
+    
+    # Si tenemos mayoría de votos Y al menos quorum de nodos respondieron
+    if votes >= quorum and successful_contacts >= quorum:
+        return True
+    
+    # Si no pudimos contactar a ningún peer, pero este nodo está activo,
+    # asumimos que es el único disponible y se convierte en líder
+    # Esto permite tolerancia a fallos: si 2 de 3 nodos fallan, el restante sigue funcionando
+    if successful_contacts == 1:
+        print(f"[REGISTRY] No se pudo contactar a ningún peer. Este nodo es el único disponible, convirtiéndose en líder.")
+        return True
+    
+    print(f"[REGISTRY] Votos obtenidos: {votes}/{quorum}, Nodos contactados: {successful_contacts}/{total_nodes}")
+    return False
 
 
 def start_election():
@@ -172,8 +210,18 @@ def start_election():
         cluster_state["term"] += 1
         candidate_id = cluster_state["node_id"]
         term = cluster_state["term"]
+        peers = cluster_state["peers"].copy()
         cluster_state["is_leader"] = False
         cluster_state["leader_id"] = None
+    
+    # Si no hay peers, este nodo es automáticamente el líder (modo desarrollo)
+    if not peers:
+        with cluster_lock:
+            cluster_state["is_leader"] = True
+            cluster_state["leader_id"] = candidate_id
+            cluster_state["last_heartbeat_time"] = time.time()
+        print(f"[REGISTRY] Modo desarrollo: nodo único, automáticamente líder (término {term})")
+        return True
     
     print(f"[REGISTRY] Iniciando elección (término {term})...")
     
@@ -185,7 +233,7 @@ def start_election():
         print(f"[REGISTRY] ¡Elegido como líder! (término {term})")
         return True
     else:
-        print(f"[REGISTRY] No se obtuvo mayoría en la elección")
+        print(f"[REGISTRY] No se obtuvo mayoría en la elección (término {term})")
         return False
 
 
@@ -253,6 +301,34 @@ def cleanup_inactive_servers():
             replicate_to_peers(servers_copy, term)
 
 
+def election_retry_loop():
+    """Loop que reintenta elecciones si no hay líder"""
+    time.sleep(5)  # Esperar a que todos los nodos estén listos
+    
+    while True:
+        time.sleep(ELECTION_TIMEOUT)
+        
+        with cluster_lock:
+            is_leader = cluster_state["is_leader"]
+            leader_id = cluster_state["leader_id"]
+            peers = cluster_state["peers"].copy()
+        
+        # Si no hay líder, intentar elección
+        if not is_leader and not leader_id:
+            print(f"[REGISTRY] No hay líder detectado, intentando elección...")
+            start_election()
+        elif not is_leader and leader_id:
+            # Hay un líder pero no es este nodo, verificar que sigue activo
+            try:
+                leader_url = get_peer_url(leader_id)
+                response = requests.get(f"{leader_url}/", timeout=2)
+                if response.status_code != 200:
+                    print(f"[REGISTRY] Líder {leader_id} no responde, iniciando elección...")
+                    start_election()
+            except Exception as e:
+                print(f"[REGISTRY] No se puede contactar al líder {leader_id}, iniciando elección...")
+                start_election()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Maneja el ciclo de vida de la aplicación"""
@@ -270,8 +346,11 @@ async def lifespan(app: FastAPI):
     follower_thread = threading.Thread(target=follower_heartbeat_check, daemon=True)
     follower_thread.start()
     
-    # Intentar elección inicial después de un breve delay
-    time.sleep(2)
+    election_thread = threading.Thread(target=election_retry_loop, daemon=True)
+    election_thread.start()
+    
+    # Intentar elección inicial después de un delay para que todos los nodos estén listos
+    time.sleep(5)
     start_election()
     
     yield
@@ -286,19 +365,54 @@ app = FastAPI(title="TBFS Registry Service (Distributed)", lifespan=lifespan)
 @app.get("/")
 def root():
     """Endpoint de estado del registry"""
-    with servers_lock:
-        active_count = sum(1 for s in servers.values() if s["status"] == "active")
-    with cluster_lock:
-        return {
-            "message": "Registry Service funcionando",
-            "node_id": cluster_state["node_id"],
-            "is_leader": cluster_state["is_leader"],
-            "leader_id": cluster_state["leader_id"],
-            "term": cluster_state["term"],
-            "total_servers": len(servers),
-            "active_servers": active_count,
-            "inactive_servers": len(servers) - active_count
+    # Obtener datos de forma segura sin bloquear demasiado tiempo
+    # Usar timeouts más largos para evitar problemas de bloqueo
+    servers_data = {}
+    cluster_data = {}
+    
+    # Obtener datos de servidores con timeout
+    if servers_lock.acquire(timeout=2):
+        try:
+            servers_data = {
+                "total_servers": len(servers),
+                "active_servers": sum(1 for s in servers.values() if s["status"] == "active"),
+                "inactive_servers": sum(1 for s in servers.values() if s["status"] == "inactive")
+            }
+        finally:
+            servers_lock.release()
+    else:
+        # Si no podemos obtener el lock, usar valores por defecto
+        servers_data = {"total_servers": 0, "active_servers": 0, "inactive_servers": 0}
+    
+    # Obtener datos del cluster con timeout
+    # El node_id nunca cambia después de la inicialización, así que es seguro leerlo sin lock
+    node_id = cluster_state["node_id"]  # Siempre disponible, se establece al inicio
+    
+    if cluster_lock.acquire(timeout=2):
+        try:
+            cluster_data = {
+                "node_id": node_id,
+                "is_leader": cluster_state["is_leader"],
+                "leader_id": cluster_state["leader_id"],
+                "term": cluster_state["term"]
+            }
+        finally:
+            cluster_lock.release()
+    else:
+        # Si no podemos obtener el lock, usar valores seguros
+        # node_id siempre está disponible, otros valores pueden estar desactualizados pero no críticos
+        cluster_data = {
+            "node_id": node_id,
+            "is_leader": False,  # Valor conservador si no podemos leer
+            "leader_id": None,
+            "term": 0
         }
+    
+    return {
+        "message": "Registry Service funcionando",
+        **cluster_data,
+        **servers_data
+    }
 
 
 @app.post("/register")
@@ -322,12 +436,32 @@ def register_server(registration: ServerRegistration):
     
     server_id = registration.server_id
     full_url = get_full_url(registration.url, registration.port)
+    server_ip = registration.ip
     current_time = time.time()
     
     with servers_lock:
+        # Verificar si ya existe un servidor con este ID
         is_new = server_id not in servers
+        
+        # Evitar IDs duplicados: si ya existe un servidor con este ID, actualizamos su información
+        # Esto permite que el mismo servidor se re-registre con información actualizada
+        if not is_new:
+            existing_server = servers[server_id]
+            existing_url = existing_server.get("url")
+            existing_ip = existing_server.get("ip")
+            
+            # Si la URL o IP cambió, es una actualización del mismo servidor
+            if existing_url != full_url or existing_ip != server_ip:
+                print(f"[REGISTRY] Actualizando servidor existente {server_id}: URL/IP cambiaron")
+                print(f"[REGISTRY]   URL anterior: {existing_url} -> nueva: {full_url}")
+                print(f"[REGISTRY]   IP anterior: {existing_ip} -> nueva: {server_ip}")
+            else:
+                print(f"[REGISTRY] Servidor {server_id} ya registrado, actualizando heartbeat")
+        
+        # Registrar o actualizar el servidor (evitamos IDs duplicados actualizando el existente)
         servers[server_id] = {
             "url": full_url,
+            "ip": server_ip,  # Guardar IP como alternativa de acceso
             "last_heartbeat": current_time,
             "status": "active",
             "registered_at": current_time if is_new else servers[server_id].get("registered_at", current_time)
@@ -411,6 +545,7 @@ def list_servers(status: Optional[str] = None):
             result.append(ServerInfo(
                 server_id=server_id,
                 url=info["url"],
+                ip=info.get("ip"),  # Incluir IP como alternativa de acceso
                 status=info["status"],
                 last_heartbeat=datetime.fromtimestamp(info["last_heartbeat"]).isoformat(),
                 registered_at=datetime.fromtimestamp(info["registered_at"]).isoformat(),
@@ -440,6 +575,7 @@ def get_server(server_id: str):
         return ServerInfo(
             server_id=server_id,
             url=info["url"],
+            ip=info.get("ip"),  # Incluir IP como alternativa de acceso
             status=info["status"],
             last_heartbeat=datetime.fromtimestamp(info["last_heartbeat"]).isoformat(),
             registered_at=datetime.fromtimestamp(info["registered_at"]).isoformat(),
@@ -452,23 +588,41 @@ def get_server(server_id: str):
 @app.post("/internal/replicate")
 def internal_replicate(data: ReplicationData):
     """Endpoint interno para recibir replicación del líder"""
-    with cluster_lock:
-        # Actualizar término y líder si es mayor
-        if data.term > cluster_state["term"]:
-            cluster_state["term"] = data.term
-            cluster_state["leader_id"] = data.leader_id
-            cluster_state["is_leader"] = False
-            cluster_state["last_heartbeat_time"] = time.time()
+    try:
+        with cluster_lock:
+            current_term = cluster_state["term"]
+            current_leader = cluster_state["leader_id"]
+            
+            # Actualizar término y líder si es mayor
+            if data.term > current_term:
+                cluster_state["term"] = data.term
+                cluster_state["leader_id"] = data.leader_id
+                cluster_state["is_leader"] = False
+                cluster_state["last_heartbeat_time"] = time.time()
+                print(f"[REGISTRY] Actualizado a término {data.term}, líder: {data.leader_id}")
+            elif data.term < current_term:
+                # Término menor, rechazar
+                return {"success": False, "message": f"Término {data.term} menor que término actual {current_term}"}
+            elif data.leader_id != current_leader:
+                # Mismo término pero diferente líder, actualizar
+                cluster_state["leader_id"] = data.leader_id
+                cluster_state["is_leader"] = False
+                cluster_state["last_heartbeat_time"] = time.time()
+                print(f"[REGISTRY] Líder actualizado: {data.leader_id}")
         
-        # Solo aceptar replicación del líder actual
-        if data.leader_id != cluster_state["leader_id"] and data.term <= cluster_state["term"]:
-            return {"success": False, "message": "No es el líder actual"}
-    
-    # Actualizar servidores
-    with servers_lock:
-        servers.update(data.servers)
-    
-    return {"success": True}
+        # Actualizar servidores (fuera del cluster_lock para evitar deadlocks)
+        with servers_lock:
+            # data.servers es un dict con server_id como keys
+            for server_id, server_info in data.servers.items():
+                servers[server_id] = server_info
+            print(f"[REGISTRY] Estado replicado: {len(data.servers)} servidores")
+        
+        return {"success": True}
+    except Exception as e:
+        print(f"[REGISTRY] Error en internal_replicate: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "message": str(e)}
 
 
 @app.post("/internal/vote")

@@ -1,1 +1,1 @@
-rm -rf Server/database Server/storage Server/__pycache__ Server/core/__pycache__ Client/downloads Client/__pycache__ Client/web.pyc uploads/
+rm -rf Server/database Server/storage Server/__pycache__ Server/core/__pycache__ Client/downloads Client/__pycache__ Client/web.pyc uploads/ Registry/__pycache__

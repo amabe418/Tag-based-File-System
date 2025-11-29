@@ -3,9 +3,9 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY Client/main.py /app
-COPY Client/web.py /app
-COPY Client/registry_client.py /app
+COPY client/main.py /app
+COPY client/web.py /app
+COPY client/registry_client.py /app
 RUN pip install --no-cache-dir requests streamlit
 
 EXPOSE 8501

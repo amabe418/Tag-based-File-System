@@ -13,3 +13,5 @@ venv/
 env/
 
 tareas.md
+PLAN_IMPLEMENTACION.md
+run_namenode_cluster.sh

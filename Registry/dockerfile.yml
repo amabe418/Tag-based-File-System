@@ -3,7 +3,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY Registry/registry.py /app/Registry/
+COPY registry/registry.py /app/Registry/
 RUN pip install --no-cache-dir fastapi uvicorn requests
 
 EXPOSE 9000

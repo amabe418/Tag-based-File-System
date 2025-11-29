@@ -20,6 +20,7 @@ from namenode.manager import (
     add_file_metadata, query_files, get_file_by_id, delete_file_metadata,
     delete_files_by_tags, add_tags_to_files, delete_tags_from_files
 )
+from namenode.registry_client import registry_client
 
 app = FastAPI(title="TBFS MetaNameNode (Distributed)")
 
@@ -336,6 +337,9 @@ async def lifespan(app: FastAPI):
     # Inicializar base de datos
     init_db(node_id=NODE_ID)
     
+    # Iniciar registro en el registry
+    registry_client.start()
+    
     # Iniciar hilos
     heartbeat_thread = threading.Thread(target=leader_heartbeat_loop, daemon=True)
     heartbeat_thread.start()
@@ -353,6 +357,7 @@ async def lifespan(app: FastAPI):
     yield
     
     # Shutdown
+    registry_client.stop()
     print(f"[NAMENODE] Nodo deteniéndose...")
 
 

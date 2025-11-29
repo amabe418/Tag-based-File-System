@@ -4,7 +4,8 @@ import os
 from registry_client import registry_client
 
 # URL de fallback si el registry no está disponible
-API_URL = os.getenv("API_URL","http://127.0.0.1:8000")
+# Ahora apunta al MetaNameNode en lugar del backend
+API_URL = os.getenv("API_URL","http://127.0.0.1:8010")
 
 def get_server_url():
     """Obtiene la URL de un servidor desde el registry o usa fallback"""

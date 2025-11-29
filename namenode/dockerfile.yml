@@ -12,6 +12,8 @@ ENV HEARTBEAT_TIMEOUT=15
 ENV LEADER_HEARTBEAT_INTERVAL=5
 ENV ELECTION_TIMEOUT=15
 ENV NAMENODE_PORT=8010
+ENV REGISTRY_URL=http://tbfs-registry-1:9000,http://tbfs-registry-2:9000,http://tbfs-registry-3:9000
+ENV HEARTBEAT_INTERVAL=10
 
 CMD ["uvicorn", "namenode.namenode:app", "--host", "0.0.0.0", "--port", "8010"]
 

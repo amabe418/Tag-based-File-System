@@ -3,7 +3,9 @@ MetaNameNode - Servicio distribuido con 3 réplicas
 Mantiene metadatos de archivos (nombres y etiquetas) con replicación Raft-like
 Los archivos físicos se almacenan en DataNodes, no aquí.
 """
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, Form
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 import time
@@ -14,6 +16,7 @@ import requests
 from contextlib import asynccontextmanager
 import json
 import sqlite3
+import hashlib
 
 from namenode.database import init_db, get_db_path, get_connection, close_connection, db_lock
 from namenode.manager import (
@@ -23,6 +26,15 @@ from namenode.manager import (
 from namenode.registry_client import registry_client
 
 app = FastAPI(title="TBFS MetaNameNode (Distributed)")
+
+# Configurar CORS para permitir peticiones desde el frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # En producción, especificar dominios específicos
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Estado del cluster
 cluster_state = {
@@ -616,6 +628,239 @@ def delete_tags(query: str = Query(...), del_tags: str = Query(...)):
         replicate_to_peers(operation)
     
     return {"success": ok}
+
+
+# ========== ENDPOINTS DE COMPATIBILIDAD (formato antiguo del cliente) ==========
+
+@app.post("/add")
+async def add_file_compat(file: UploadFile, tags: str = Form(...)):
+    """
+    Endpoint de compatibilidad: recibe archivo y guarda solo metadatos.
+    NOTA: El archivo físico no se almacena aquí (se enviará a DataNodes en el futuro).
+    Por ahora solo guardamos los metadatos.
+    """
+    print(f"[NAMENODE] POST /add recibido: archivo={file.filename}, tags={tags}")
+    
+    leader_url = get_leader_url()
+    if leader_url:
+        print(f"[NAMENODE] Redirigiendo a líder: {leader_url}")
+        try:
+            # Leer el archivo una vez
+            file_content = await file.read()
+            # Redirigir al líder
+            files = {"file": (file.filename, file_content)}
+            response = requests.post(
+                f"{leader_url}/add",
+                files=files,
+                data={"tags": tags},
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"[NAMENODE] Error redirigiendo a líder: {e}")
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        print(f"[NAMENODE] Este nodo no es líder, pero no hay líder disponible")
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    print(f"[NAMENODE] Procesando en líder (nodo {NODE_ID})")
+    
+    # Leer el archivo temporalmente para calcular hash y tamaño
+    file_content = await file.read()
+    file_size = len(file_content)
+    
+    print(f"[NAMENODE] Archivo leído: tamaño={file_size} bytes")
+    
+    # Calcular hash del archivo
+    file_hash = hashlib.sha256(file_content).hexdigest()
+    hash_value = f"sha256:{file_hash}"
+    
+    # Parsear tags
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    
+    print(f"[NAMENODE] Agregando metadatos: name={file.filename}, tags={tag_list}, hash={hash_value[:16]}...")
+    
+    # Agregar solo metadatos (el archivo físico se enviará a DataNodes más adelante)
+    file_id = add_file_metadata(
+        name=file.filename,
+        tags=tag_list,
+        size=file_size,
+        hash_value=hash_value,
+        node_id=NODE_ID
+    )
+    
+    if not file_id:
+        print(f"[NAMENODE] Error: No se pudo agregar metadatos")
+        raise HTTPException(status_code=400, detail="No se pudo agregar el archivo")
+    
+    print(f"[NAMENODE] Metadatos agregados con file_id={file_id}")
+    
+    # Replicar operación
+    operation = OperationLog(
+        operation="add_file",
+        data={
+            "name": file.filename,
+            "tags": tag_list,
+            "size": file_size,
+            "hash": hash_value
+        },
+        term=cluster_state["term"],
+        timestamp=time.time()
+    )
+    
+    with log_lock:
+        operation_log.append(operation)
+    
+    replicate_to_peers(operation)
+    
+    print(f"[NAMENODE] Operación replicada a peers")
+    
+    return {
+        "success": True,
+        "message": f"Metadatos de '{file.filename}' agregados correctamente (archivo pendiente de almacenar en DataNodes)"
+    }
+
+
+@app.get("/list")
+def list_files_compat(tags: Optional[List[str]] = Query(None)):
+    """Endpoint de compatibilidad: lista archivos (cualquier nodo puede responder)"""
+    files = query_files(query_tags=tags, node_id=NODE_ID)
+    
+    result = []
+    for file_id, name, tags_str in files:
+        tags_list = tags_str.split(",") if tags_str else []
+        # Formato compatible con el cliente antiguo
+        result.append({
+            "id": file_id,
+            "name": name,
+            "tags": tags_list,
+            "path": ""  # No hay path físico en el namenode
+        })
+    
+    return {"files": result}
+
+
+@app.delete("/delete")
+def delete_files_compat(tags: str = Query(...)):
+    """Endpoint de compatibilidad: elimina archivos por tags (solo el líder)"""
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            response = requests.delete(f"{leader_url}/delete", params={"tags": tags}, timeout=5)
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    deleted = delete_files_by_tags(tag_list, node_id=NODE_ID)
+    
+    if deleted:
+        operation = OperationLog(
+            operation="delete_files_by_tags",
+            data={"tags": tag_list},
+            term=cluster_state["term"],
+            timestamp=time.time()
+        )
+        with log_lock:
+            operation_log.append(operation)
+        replicate_to_peers(operation)
+    
+    return {
+        "success": deleted,
+        "message": "Archivos eliminados" if deleted else "No se encontró coincidencia"
+    }
+
+
+@app.post("/add-tags")
+def add_tags_compat(query: str = Query(...), new_tags: str = Query(...)):
+    """Endpoint de compatibilidad: agrega etiquetas (solo el líder)"""
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            response = requests.post(
+                f"{leader_url}/add-tags",
+                params={"query": query, "new_tags": new_tags},
+                timeout=5
+            )
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    query_tags = [t.strip() for t in query.split(",") if t.strip()]
+    new_tags_list = [t.strip() for t in new_tags.split(",") if t.strip()]
+    
+    ok = add_tags_to_files(query_tags, new_tags_list, node_id=NODE_ID)
+    
+    if ok:
+        operation = OperationLog(
+            operation="add_tags",
+            data={"query_tags": query_tags, "new_tags": new_tags_list},
+            term=cluster_state["term"],
+            timestamp=time.time()
+        )
+        with log_lock:
+            operation_log.append(operation)
+        replicate_to_peers(operation)
+    
+    return {"success": ok}
+
+
+@app.post("/delete-tags")
+def delete_tags_compat(query: str = Query(...), del_tags: str = Query(...)):
+    """Endpoint de compatibilidad: elimina etiquetas (solo el líder)"""
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            response = requests.post(
+                f"{leader_url}/delete-tags",
+                params={"query": query, "del_tags": del_tags},
+                timeout=5
+            )
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    query_tags = [t.strip() for t in query.split(",") if t.strip()]
+    del_tags_list = [t.strip() for t in del_tags.split(",") if t.strip()]
+    
+    ok = delete_tags_from_files(query_tags, del_tags_list, node_id=NODE_ID)
+    
+    if ok:
+        operation = OperationLog(
+            operation="delete_tags",
+            data={"query_tags": query_tags, "del_tags": del_tags_list},
+            term=cluster_state["term"],
+            timestamp=time.time()
+        )
+        with log_lock:
+            operation_log.append(operation)
+        replicate_to_peers(operation)
+    
+    return {"success": ok}
+
+
+@app.get("/download/{file_name}")
+def download_file_compat(file_name: str):
+    """
+    Endpoint de compatibilidad: descarga de archivo.
+    NOTA: Por ahora retorna error porque los archivos físicos están en DataNodes.
+    Esto se implementará cuando se integren los DataNodes.
+    """
+    raise HTTPException(
+        status_code=501,
+        detail="La descarga de archivos se implementará cuando los DataNodes estén disponibles. Por ahora solo se manejan metadatos."
+    )
 
 
 # ========== ENDPOINTS INTERNOS PARA REPLICACIÓN ==========

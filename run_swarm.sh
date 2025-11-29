@@ -2,15 +2,31 @@
 # Crear red si no existe
 docker network create tbfs_net 2>/dev/null || true
 
-# Construir imágenes
-echo "Construyendo imagen del Registry..."
-docker build -t tbfs-registry -f registry/dockerfile.yml .
+# Verificar si se debe forzar la reconstrucción
+FORCE_REBUILD=false
+if [ "$1" == "--rebuild" ] || [ "$1" == "-r" ]; then
+    FORCE_REBUILD=true
+    echo "⚠️  Modo de reconstrucción forzada activado"
+fi
 
-echo "Construyendo imagen del MetaNameNode..."
-docker build -t tbfs-namenode -f namenode/dockerfile.yml .
+# Función para construir imagen solo si no existe o si se fuerza
+build_if_needed() {
+    local image_name=$1
+    local dockerfile_path=$2
+    local service_name=$3
+    
+    if [ "$FORCE_REBUILD" = true ] || ! docker image inspect "$image_name" >/dev/null 2>&1; then
+        echo "Construyendo imagen de $service_name..."
+        docker build -t "$image_name" -f "$dockerfile_path" .
+    else
+        echo "✅ Imagen $service_name ya existe, omitiendo construcción (usa --rebuild para forzar)"
+    fi
+}
 
-echo "Construyendo imagen del Frontend..."
-docker build -t tbfs-frontend -f client/dockerfile.yml .
+# Construir imágenes solo si no existen
+build_if_needed "tbfs-registry" "registry/dockerfile.yml" "Registry"
+build_if_needed "tbfs-namenode" "namenode/dockerfile.yml" "MetaNameNode"
+build_if_needed "tbfs-frontend" "client/dockerfile.yml" "Frontend"
 
 # Detener contenedores existentes si existen
 echo "Deteniendo contenedores existentes..."

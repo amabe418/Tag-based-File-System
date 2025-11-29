@@ -3,8 +3,13 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Instalar sqlite3 y herramientas necesarias
+RUN apt-get update && apt-get install -y \
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY namenode /app/namenode
-RUN pip install --no-cache-dir fastapi uvicorn requests
+RUN pip install --no-cache-dir fastapi uvicorn requests python-multipart
 
 EXPOSE 8010
 

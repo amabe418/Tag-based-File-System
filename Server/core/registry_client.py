@@ -69,6 +69,8 @@ class RegistryClient:
         self.heartbeat_thread = None
         self.running = False
         self.registered = False
+        self._last_error_time = {}  # Track último error por URL para evitar spam
+        self._error_cooldown = 60  # Solo mostrar error cada 60 segundos por URL
     
     def _try_registry_request(self, method: str, endpoint: str, **kwargs) -> requests.Response:
         """Intenta hacer una petición a cualquiera de los nodos del registry disponibles"""
@@ -77,16 +79,40 @@ class RegistryClient:
         random.shuffle(urls)
         
         last_error = None
+        successful_url = None
+        failed_urls = []
+        
         for registry_url in urls:
             try:
                 url = f"{registry_url}{endpoint}"
                 response = requests.request(method, url, timeout=5, **kwargs)
                 response.raise_for_status()
+                successful_url = registry_url
+                # Si tuvimos éxito, limpiar el tracking de errores para esta URL
+                if registry_url in self._last_error_time:
+                    del self._last_error_time[registry_url]
                 return response
             except requests.RequestException as e:
                 last_error = e
-                print(f"[REGISTRY_CLIENT] Error con nodo {registry_url}: {e}")
+                failed_urls.append(registry_url)
+                # Solo mostrar error si ha pasado suficiente tiempo desde el último error para esta URL
+                current_time = time.time()
+                last_error_time = self._last_error_time.get(registry_url, 0)
+                if current_time - last_error_time > self._error_cooldown:
+                    self._last_error_time[registry_url] = current_time
+                    # Solo mostrar si es un error crítico o si todos los nodos fallaron
+                    if len(failed_urls) == len(urls):
+                        print(f"[REGISTRY_CLIENT] Error con nodo {registry_url}: {e}")
                 continue
+        
+        # Si todos fallaron, mostrar un resumen más limpio
+        if successful_url is None:
+            # Solo mostrar un mensaje resumido si ha pasado tiempo desde el último error general
+            current_time = time.time()
+            last_general_error = self._last_error_time.get("_general", 0)
+            if current_time - last_general_error > self._error_cooldown:
+                self._last_error_time["_general"] = current_time
+                print(f"[REGISTRY_CLIENT] Todos los nodos del registry fallaron ({len(failed_urls)}/{len(urls)} nodos)")
         
         # Si todos fallaron, lanzar el último error
         raise last_error or requests.RequestException("Todos los nodos del registry fallaron")
@@ -122,11 +148,18 @@ class RegistryClient:
             )
             return True
         except requests.RequestException as e:
-            print(f"[REGISTRY_CLIENT] Error al enviar heartbeat: {e}")
+            # Solo mostrar error si ha pasado tiempo desde el último error de heartbeat
+            current_time = time.time()
+            last_heartbeat_error = self._last_error_time.get("_heartbeat", 0)
+            if current_time - last_heartbeat_error > self._error_cooldown:
+                self._last_error_time["_heartbeat"] = current_time
+                print(f"[REGISTRY_CLIENT] Error al enviar heartbeat: {e}")
             # Intentar re-registrarse si falla
             if self.registered:
                 self.registered = False
-                print(f"[REGISTRY_CLIENT] Intentando re-registrar servidor...")
+                # Solo mostrar mensaje de re-registro una vez
+                if current_time - last_heartbeat_error > self._error_cooldown:
+                    print(f"[REGISTRY_CLIENT] Intentando re-registrar servidor...")
                 self.register()
             return False
     

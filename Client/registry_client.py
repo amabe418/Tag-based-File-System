@@ -23,12 +23,17 @@ class RegistryClient:
         self._cached_servers = []
         self._cache_time = 0
         self._cache_ttl = 30  # segundos
+        self._last_error_time = {}  # Track último error por URL para evitar spam
+        self._error_cooldown = 60  # Solo mostrar error cada 60 segundos por URL
     
     def _try_registry_request(self, endpoint: str, **kwargs) -> Optional[requests.Response]:
         """Intenta hacer una petición a cualquiera de los nodos del registry disponibles"""
         # Mezclar URLs para distribuir carga
         urls = self.registry_urls.copy()
         random.shuffle(urls)
+        
+        successful_url = None
+        failed_urls = []
         
         for registry_url in urls:
             try:
@@ -38,10 +43,33 @@ class RegistryClient:
                     **kwargs
                 )
                 response.raise_for_status()
+                successful_url = registry_url
+                # Si tuvimos éxito, limpiar el tracking de errores para esta URL
+                if registry_url in self._last_error_time:
+                    del self._last_error_time[registry_url]
                 return response
             except requests.RequestException as e:
-                print(f"[REGISTRY_CLIENT] Error con nodo {registry_url}: {e}")
+                failed_urls.append(registry_url)
+                # Solo mostrar error si ha pasado suficiente tiempo desde el último error para esta URL
+                import time
+                current_time = time.time()
+                last_error_time = self._last_error_time.get(registry_url, 0)
+                if current_time - last_error_time > self._error_cooldown:
+                    self._last_error_time[registry_url] = current_time
+                    # Solo mostrar si todos los nodos fallaron
+                    if len(failed_urls) == len(urls):
+                        print(f"[REGISTRY_CLIENT] Error con nodo {registry_url}: {e}")
                 continue
+        
+        # Si todos fallaron, mostrar un resumen más limpio
+        if successful_url is None and failed_urls:
+            import time
+            current_time = time.time()
+            last_general_error = self._last_error_time.get("_general", 0)
+            if current_time - last_general_error > self._error_cooldown:
+                self._last_error_time["_general"] = current_time
+                print(f"[REGISTRY_CLIENT] Todos los nodos del registry fallaron ({len(failed_urls)}/{len(urls)} nodos)")
+        
         return None
     
     def get_active_servers(self, use_cache: bool = True) -> List[Dict]:

@@ -149,18 +149,45 @@ def get_file_by_id(file_id: int, node_id: str = None) -> Optional[Dict]:
 
 def delete_file_metadata(file_id: int, node_id: str = None) -> bool:
     """
-    Elimina los metadatos de un archivo.
+    Elimina los metadatos de un archivo y el archivo físico de los DataNodes.
     Returns: True si se eliminó, False si no existía
     """
     db_path = get_db_path(node_id)
     
+    # Primero obtener la información del archivo (con bloqueo mínimo)
+    file_name = None
+    file_hash = None
+    
     with db_lock:
         conn, cursor = get_connection(db_path=db_path, node_id=node_id)
-        
         try:
-            cursor.execute("SELECT name FROM files WHERE id = ?", (file_id,))
+            cursor.execute("SELECT name, hash FROM files WHERE id = ?", (file_id,))
             row = cursor.fetchone()
             if not row:
+                return False
+            
+            file_name = row[0]
+            hash_value = row[1]
+            
+            # Extraer hash sin prefijo "sha256:"
+            file_hash = hash_value[7:] if hash_value.startswith("sha256:") else hash_value
+        finally:
+            close_connection(conn)
+    
+    # Eliminar archivo de DataNodes ANTES de eliminar metadatos (fuera del bloqueo)
+    # Esto evita mantener el bloqueo de la BD durante las peticiones HTTP
+    from namenode.datanode_manager import delete_file_from_datanodes
+    print(f"[MANAGER] Eliminando archivo físico {file_hash} de DataNodes...")
+    delete_file_from_datanodes(file_hash, file_id, node_id_db=node_id)
+    
+    # Ahora eliminar metadatos (con bloqueo)
+    with db_lock:
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id)
+        try:
+            # Verificar que el archivo aún existe (puede haber sido eliminado por otro proceso)
+            cursor.execute("SELECT id FROM files WHERE id = ?", (file_id,))
+            if not cursor.fetchone():
+                print(f"[MANAGER] Archivo {file_id} ya no existe en metadatos")
                 return False
             
             # Las relaciones se eliminan por CASCADE
@@ -176,7 +203,7 @@ def delete_file_metadata(file_id: int, node_id: str = None) -> bool:
                 print(f"[INFO] Eliminadas {orphan_tags_deleted} etiquetas huérfanas de la base de datos")
             
             conn.commit()
-            print(f"[INFO] Metadatos eliminados: {row[0]}")
+            print(f"[INFO] Metadatos eliminados: {file_name}")
             return True
         except Exception as e:
             conn.rollback()

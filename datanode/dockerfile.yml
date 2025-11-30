@@ -1,0 +1,24 @@
+# datanode/dockerfile.yml
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Instalar herramientas necesarias
+RUN apt-get update && apt-get install -y \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY datanode /app/datanode
+RUN pip install --no-cache-dir fastapi uvicorn requests python-multipart
+
+# El puerto se expone dinámicamente según la variable de entorno
+EXPOSE 8001
+
+# Variables de entorno por defecto (pueden ser sobrescritas)
+ENV DATANODE_PORT=8001
+ENV REGISTRY_URL=http://tbfs-registry-1:9000,http://tbfs-registry-2:9000,http://tbfs-registry-3:9000
+ENV HEARTBEAT_INTERVAL=10
+ENV STORAGE_PATH=/app/storage
+
+# Usar sh -c para evaluar la variable de entorno dinámicamente
+CMD sh -c "uvicorn datanode.datanode:app --host 0.0.0.0 --port ${DATANODE_PORT}"
+

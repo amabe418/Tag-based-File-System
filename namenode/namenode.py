@@ -23,6 +23,13 @@ from namenode.manager import (
     add_file_metadata, query_files, get_file_by_id, delete_file_metadata,
     delete_files_by_tags, add_tags_to_files, delete_tags_from_files
 )
+from namenode.datanode_manager import (
+    register_datanode, update_datanode_heartbeat, get_datanode, list_datanodes,
+    assign_replicas, save_file_replicas, get_file_replicas, detect_inactive_datanodes,
+    get_best_datanode_for_read, get_all_replicas_for_read, delete_file_from_datanodes,
+    get_files_affected_by_datanode, rereplicate_file, mark_datanode_draining,
+    unmark_datanode_draining, drain_datanode
+)
 from namenode.registry_client import registry_client
 
 app = FastAPI(title="TBFS MetaNameNode (Distributed)")
@@ -365,6 +372,53 @@ async def lifespan(app: FastAPI):
     election_thread = threading.Thread(target=election_retry_loop, daemon=True)
     election_thread.start()
     
+    # Hilo para monitorear DataNodes inactivos y re-replicar archivos (solo en el líder)
+    def datanode_monitor_loop():
+        """Monitorea DataNodes inactivos cada 30 segundos y re-replica archivos afectados"""
+        while True:
+            time.sleep(30)  # Revisar cada 30 segundos
+            if is_leader():
+                try:
+                    inactive = detect_inactive_datanodes(timeout_seconds=30, node_id_db=NODE_ID)
+                    if inactive:
+                        print(f"[NAMENODE] DataNodes inactivos detectados: {inactive}")
+                        
+                        # Re-replicar archivos afectados por cada DataNode inactivo
+                        for failed_datanode_id in inactive:
+                            print(f"[NAMENODE] Iniciando re-replicación para archivos en {failed_datanode_id}...")
+                            
+                            # Obtener archivos afectados
+                            affected_files = get_files_affected_by_datanode(failed_datanode_id, node_id_db=NODE_ID)
+                            print(f"[NAMENODE] {len(affected_files)} archivos afectados por {failed_datanode_id}")
+                            
+                            # Re-replicar cada archivo
+                            from namenode.manager import get_file_by_id
+                            rereplicated_count = 0
+                            failed_count = 0
+                            
+                            for file_id in affected_files:
+                                file_data = get_file_by_id(file_id, node_id=NODE_ID)
+                                if not file_data:
+                                    continue
+                                
+                                hash_value = file_data.get("hash", "")
+                                file_hash = hash_value[7:] if hash_value.startswith("sha256:") else hash_value
+                                
+                                if rereplicate_file(file_id, file_hash, failed_datanode_id, node_id_db=NODE_ID):
+                                    rereplicated_count += 1
+                                else:
+                                    failed_count += 1
+                            
+                            print(f"[NAMENODE] Re-replicación completada para {failed_datanode_id}: {rereplicated_count} exitosas, {failed_count} fallidas")
+                            
+                except Exception as e:
+                    print(f"[NAMENODE] Error en monitoreo de DataNodes: {e}")
+                    import traceback
+                    traceback.print_exc()
+    
+    datanode_monitor_thread = threading.Thread(target=datanode_monitor_loop, daemon=True)
+    datanode_monitor_thread.start()
+    
     # Intentar elección inicial después de un delay
     time.sleep(5)
     start_election()
@@ -424,6 +478,177 @@ def root():
         "total_tags": total_tags,
         "leader_url": leader_url  # URL del líder para que el cliente pueda usarla directamente
     }
+
+
+# ========== ENDPOINTS DE GESTIÓN DE DATANODES ==========
+
+class DataNodeRegistration(BaseModel):
+    node_id: str
+    url: str
+    port: int
+    ip: Optional[str] = None
+    total_space: int
+    free_space: int
+
+
+class DataNodeHeartbeat(BaseModel):
+    free_space: int
+    total_space: int
+
+
+@app.post("/datanodes/register")
+def register_datanode_endpoint(registration: DataNodeRegistration):
+    """
+    Registra un nuevo DataNode o actualiza uno existente.
+    Solo el líder puede registrar DataNodes.
+    """
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            response = requests.post(
+                f"{leader_url}/datanodes/register",
+                json=registration.dict(),
+                timeout=5
+            )
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    print(f"[NAMENODE] Registrando DataNode: {registration.node_id}")
+    
+    success = register_datanode(
+        node_id=registration.node_id,
+        url=registration.url,
+        port=registration.port,
+        ip=registration.ip,
+        total_space=registration.total_space,
+        free_space=registration.free_space,
+        node_id_db=NODE_ID
+    )
+    
+    if success:
+        return {"success": True, "message": f"DataNode {registration.node_id} registrado correctamente"}
+    else:
+        raise HTTPException(status_code=500, detail="Error al registrar DataNode")
+
+
+@app.get("/datanodes")
+def list_datanodes_endpoint(status: Optional[str] = Query(None)):
+    """
+    Lista todos los DataNodes registrados.
+    Cualquier nodo puede responder (lee de su propia base de datos).
+    """
+    datanodes = list_datanodes(status=status, node_id_db=NODE_ID)
+    return {"datanodes": datanodes, "total": len(datanodes)}
+
+
+@app.get("/datanodes/{node_id}")
+def get_datanode_endpoint(node_id: str):
+    """
+    Obtiene información de un DataNode específico.
+    """
+    datanode = get_datanode(node_id, node_id_db=NODE_ID)
+    if not datanode:
+        raise HTTPException(status_code=404, detail=f"DataNode {node_id} no encontrado")
+    return datanode
+
+
+@app.post("/datanodes/{node_id}/heartbeat")
+def datanode_heartbeat_endpoint(node_id: str, heartbeat: DataNodeHeartbeat):
+    """
+    Recibe un heartbeat de un DataNode.
+    Solo el líder procesa heartbeats.
+    """
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            response = requests.post(
+                f"{leader_url}/datanodes/{node_id}/heartbeat",
+                json=heartbeat.dict(),
+                timeout=5
+            )
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    print(f"[NAMENODE] Heartbeat recibido de DataNode: {node_id}")
+    
+    success = update_datanode_heartbeat(
+        node_id=node_id,
+        free_space=heartbeat.free_space,
+        total_space=heartbeat.total_space,
+        node_id_db=NODE_ID
+    )
+    
+    if success:
+        return {"success": True, "message": "Heartbeat procesado"}
+    else:
+        raise HTTPException(status_code=404, detail=f"DataNode {node_id} no encontrado")
+
+
+@app.post("/datanodes/{node_id}/drain")
+def drain_datanode_endpoint(node_id: str):
+    """
+    Inicia el drenaje de un DataNode: re-replica todos sus archivos y evita nuevas asignaciones.
+    Solo el líder puede ejecutar esta operación.
+    """
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            response = requests.post(f"{leader_url}/datanodes/{node_id}/drain", timeout=60)
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    # Verificar que el DataNode existe
+    datanode = get_datanode(node_id, node_id_db=NODE_ID)
+    if not datanode:
+        raise HTTPException(status_code=404, detail=f"DataNode {node_id} no encontrado")
+    
+    print(f"[NAMENODE] Iniciando drenaje de DataNode: {node_id}")
+    
+    # Ejecutar drenaje
+    result = drain_datanode(node_id, node_id_db=NODE_ID)
+    
+    return {
+        "success": result["drained"],
+        "message": f"Drenaje completado: {result['rereplicated']}/{result['total_files']} archivos re-replicados",
+        "statistics": result
+    }
+
+
+@app.post("/datanodes/{node_id}/undrain")
+def undrain_datanode_endpoint(node_id: str):
+    """
+    Desmarca un DataNode del proceso de drenaje, permitiendo nuevas asignaciones.
+    Solo el líder puede ejecutar esta operación.
+    """
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            response = requests.post(f"{leader_url}/datanodes/{node_id}/undrain", timeout=5)
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    success = unmark_datanode_draining(node_id, node_id_db=NODE_ID)
+    
+    if success:
+        return {"success": True, "message": f"DataNode {node_id} desmarcado del drenaje"}
+    else:
+        raise HTTPException(status_code=404, detail=f"DataNode {node_id} no encontrado")
 
 
 # ========== ENDPOINTS DE METADATOS ==========
@@ -701,7 +926,7 @@ async def add_file_compat(file: UploadFile, tags: str = Form(...)):
     
     print(f"[NAMENODE] Agregando metadatos: name={file.filename}, tags={tag_list}, hash={hash_value[:16]}...")
     
-    # Agregar solo metadatos (el archivo físico se enviará a DataNodes más adelante)
+    # Agregar metadatos primero
     file_id = add_file_metadata(
         name=file.filename,
         tags=tag_list,
@@ -716,14 +941,129 @@ async def add_file_compat(file: UploadFile, tags: str = Form(...)):
     
     print(f"[NAMENODE] Metadatos agregados con file_id={file_id}")
     
-    # Replicar operación
+    # Asignar réplicas a DataNodes (usar file_hash sin prefijo "sha256:")
+    datanode_ids = assign_replicas(file_hash, file_size, node_id_db=NODE_ID)
+    
+    if not datanode_ids:
+        print(f"[NAMENODE] Error: No se pudieron asignar réplicas. Eliminando metadatos...")
+        delete_file_metadata(file_id, node_id=NODE_ID)
+        raise HTTPException(
+            status_code=503, 
+            detail="No hay suficientes DataNodes disponibles para almacenar el archivo"
+        )
+    
+    print(f"[NAMENODE] Réplicas asignadas: {datanode_ids}")
+    
+    # Intentar guardar el archivo en DataNodes con reintentos
+    max_attempts = 3
+    final_datanode_ids = datanode_ids.copy()
+    success_count = 0
+    successful_datanodes = []
+    failed_datanodes = []
+    
+    for attempt in range(max_attempts):
+        if success_count >= 2:
+            # Ya tenemos suficientes réplicas, salir
+            break
+        
+        if attempt > 0:
+            print(f"[NAMENODE] Reintento {attempt + 1}/{max_attempts} para almacenar archivo...")
+            # Reasignar réplicas excluyendo los DataNodes que ya fallaron
+            remaining_datanodes = [dn_id for dn_id in final_datanode_ids if dn_id not in failed_datanodes]
+            if len(remaining_datanodes) < 3:
+                # Necesitamos más DataNodes, reasignar completamente
+                new_datanode_ids = assign_replicas(file_hash, file_size, node_id_db=NODE_ID)
+                if new_datanode_ids:
+                    # Excluir los que ya fallaron
+                    available_datanodes = [dn_id for dn_id in new_datanode_ids if dn_id not in failed_datanodes]
+                    if len(available_datanodes) >= 2:
+                        final_datanode_ids = available_datanodes[:3] if len(available_datanodes) >= 3 else available_datanodes
+                    else:
+                        final_datanode_ids = new_datanode_ids
+                else:
+                    print(f"[NAMENODE] No hay más DataNodes disponibles para reasignar")
+                    break
+            else:
+                # Usar los DataNodes restantes
+                final_datanode_ids = remaining_datanodes[:3]
+        
+        # Obtener URLs de los DataNodes
+        from namenode.datanode_manager import get_datanode
+        datanode_urls = []
+        for dn_id in final_datanode_ids:
+            if dn_id in successful_datanodes:
+                continue  # Ya se guardó exitosamente en este DataNode
+            dn_info = get_datanode(dn_id, node_id_db=NODE_ID)
+            if dn_info:
+                url = dn_info["url"]
+                if not url.startswith("http"):
+                    url = f"http://{url}:{dn_info['port']}"
+                datanode_urls.append((dn_id, url))
+        
+        if not datanode_urls:
+            break  # No hay más DataNodes para intentar
+        
+        print(f"[NAMENODE] Enviando archivo a {len(datanode_urls)} DataNodes (intento {attempt + 1}/{max_attempts})...")
+        
+        # Enviar archivo a los DataNodes
+        for dn_id, dn_url in datanode_urls:
+            if dn_id in successful_datanodes:
+                continue  # Ya se guardó exitosamente
+            
+            try:
+                files = {"file": (file.filename, file_content)}
+                data = {"file_id": file_hash}
+                
+                response = requests.post(
+                    f"{dn_url}/store",
+                    files=files,
+                    data=data,
+                    timeout=30
+                )
+                response.raise_for_status()
+                print(f"[NAMENODE] Archivo almacenado en {dn_id} ({dn_url})")
+                success_count += 1
+                successful_datanodes.append(dn_id)
+            except Exception as e:
+                print(f"[NAMENODE] Error almacenando en {dn_id} ({dn_url}): {e}")
+                if dn_id not in failed_datanodes:
+                    failed_datanodes.append(dn_id)
+    
+    # Verificar que al menos 2 de 3 réplicas se guardaron (tolerancia a fallos)
+    if success_count < 2:
+        print(f"[NAMENODE] Error: Solo {success_count}/3 réplicas se guardaron después de {max_attempts} intentos. Eliminando metadatos...")
+        # Intentar eliminar de los DataNodes que sí recibieron el archivo
+        for dn_id in successful_datanodes:
+            dn_info = get_datanode(dn_id, node_id_db=NODE_ID)
+            if dn_info:
+                url = dn_info["url"]
+                if not url.startswith("http"):
+                    url = f"http://{url}:{dn_info['port']}"
+                try:
+                    requests.delete(f"{url}/delete/{file_hash}", timeout=10)
+                except:
+                    pass
+        delete_file_metadata(file_id, node_id=NODE_ID)
+        raise HTTPException(
+            status_code=507,
+            detail=f"No se pudo almacenar el archivo en suficientes DataNodes después de {max_attempts} intentos ({success_count}/3)"
+        )
+    
+    # Guardar asignación de réplicas con los DataNodes exitosos
+    final_replicas = successful_datanodes[:3] if len(successful_datanodes) >= 3 else successful_datanodes
+    save_file_replicas(file_id, final_replicas, node_id_db=NODE_ID)
+    
+    print(f"[NAMENODE] Archivo almacenado exitosamente en {success_count} DataNodes: {successful_datanodes}")
+    
+    # Replicar operación a otros MetaNameNodes
     operation = OperationLog(
         operation="add_file",
         data={
             "name": file.filename,
             "tags": tag_list,
             "size": file_size,
-            "hash": hash_value
+            "hash": hash_value,
+            "datanode_ids": datanode_ids
         },
         term=cluster_state["term"],
         timestamp=time.time()
@@ -738,7 +1078,10 @@ async def add_file_compat(file: UploadFile, tags: str = Form(...)):
     
     return {
         "success": True,
-        "message": f"Metadatos de '{file.filename}' agregados correctamente (archivo pendiente de almacenar en DataNodes)"
+        "message": f"Archivo '{file.filename}' agregado correctamente",
+        "file_id": file_id,
+        "replicas": datanode_ids,
+        "replicas_stored": success_count
     }
 
 
@@ -864,13 +1207,103 @@ def delete_tags_compat(query: str = Query(...), del_tags: str = Query(...)):
 @app.get("/download/{file_name}")
 def download_file_compat(file_name: str):
     """
-    Endpoint de compatibilidad: descarga de archivo.
-    NOTA: Por ahora retorna error porque los archivos físicos están en DataNodes.
-    Esto se implementará cuando se integren los DataNodes.
+    Endpoint de compatibilidad: descarga de archivo desde DataNodes.
+    Busca el archivo por nombre, obtiene sus réplicas y descarga desde un DataNode disponible.
     """
+    print(f"[NAMENODE] GET /download/{file_name} (nodo: {NODE_ID})")
+    
+    # Verificar si somos el líder
+    if not is_leader():
+        # Si no somos el líder, intentar obtener la URL del líder y redirigir
+        leader_url = get_leader_url()
+        if leader_url:
+            print(f"[NAMENODE] Redirigiendo descarga a líder: {leader_url}/download/{file_name}")
+            return RedirectResponse(
+                url=f"{leader_url}/download/{file_name}",
+                status_code=307
+            )
+        else:
+            # No hay líder disponible
+            print(f"[NAMENODE] ERROR: No hay líder disponible para redirigir")
+            raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    # Buscar archivo por nombre en metadatos
+    files = query_files(query_tags=None, node_id=NODE_ID)
+    file_data = None
+    file_id = None
+    file_hash = None
+    
+    for fid, name, _ in files:
+        if name == file_name:
+            file_data = get_file_by_id(fid, node_id=NODE_ID)
+            if file_data:
+                file_id = fid
+                # Extraer hash del formato "sha256:hash"
+                hash_value = file_data.get("hash", "")
+                if hash_value.startswith("sha256:"):
+                    file_hash = hash_value[7:]  # Remover prefijo "sha256:"
+                else:
+                    file_hash = hash_value
+                break
+    
+    if not file_data or not file_hash:
+        raise HTTPException(status_code=404, detail=f"Archivo '{file_name}' no encontrado")
+    
+    print(f"[NAMENODE] Archivo encontrado: file_id={file_id}, hash={file_hash[:16]}...")
+    
+    # Obtener todas las réplicas disponibles para lectura
+    replicas = get_all_replicas_for_read(file_id, node_id_db=NODE_ID)
+    
+    if not replicas:
+        print(f"[NAMENODE] ERROR: No hay réplicas disponibles para file_id={file_id}")
+        raise HTTPException(
+            status_code=503,
+            detail="No hay réplicas disponibles del archivo en DataNodes activos"
+        )
+    
+    print(f"[NAMENODE] Réplicas disponibles para lectura: {len(replicas)}")
+    for r in replicas:
+        print(f"[NAMENODE]   - {r['datanode_id']} ({r['replica_type']}): {r['url']}")
+    
+    # Intentar leer desde las réplicas en orden de prioridad (con fallback)
+    last_error = None
+    for replica in replicas:
+        datanode_url = replica["url"]
+        replica_type = replica["replica_type"]
+        
+        try:
+            print(f"[NAMENODE] Intentando leer desde {replica['datanode_id']} ({replica_type})...")
+            response = requests.get(
+                f"{datanode_url}/retrieve/{file_hash}",
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            # Obtener el contenido del archivo
+            file_content = response.content
+            
+            print(f"[NAMENODE] Archivo leído exitosamente desde {replica['datanode_id']} ({len(file_content)} bytes)")
+            
+            # Retornar archivo como respuesta
+            from fastapi.responses import Response
+            return Response(
+                content=file_content,
+                media_type="application/octet-stream",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{file_name}"',
+                    "Content-Length": str(len(file_content))
+                }
+            )
+            
+        except requests.RequestException as e:
+            print(f"[NAMENODE] Error leyendo desde {replica['datanode_id']}: {e}")
+            last_error = e
+            continue  # Intentar con la siguiente réplica
+    
+    # Si todas las réplicas fallaron
     raise HTTPException(
-        status_code=501,
-        detail="La descarga de archivos se implementará cuando los DataNodes estén disponibles. Por ahora solo se manejan metadatos."
+        status_code=503,
+        detail=f"No se pudo leer el archivo desde ningún DataNode disponible. Último error: {last_error}"
     )
 
 

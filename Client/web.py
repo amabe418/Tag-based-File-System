@@ -69,6 +69,17 @@ def get_leader_url():
         leader_url = data.get("leader_url")
         if leader_url:
             print(f"[CLIENT] Líder encontrado desde leader_url: {leader_url}")
+            # Verificar que el líder realmente es el líder consultando su endpoint /
+            try:
+                leader_response = requests.get(f"{leader_url}/", timeout=3)
+                leader_response.raise_for_status()
+                leader_data = leader_response.json()
+                if leader_data.get("is_leader"):
+                    return leader_url, None
+                else:
+                    print(f"[CLIENT] WARNING: {leader_url} reporta que no es el líder")
+            except:
+                pass  # Si falla la verificación, usar la URL de todos modos
             return leader_url, None
         
         # Prioridad 2: Si este namenode es el líder, usar su URL
@@ -148,7 +159,9 @@ if "refresh_needed" not in st.session_state:
 if "selected_files" not in st.session_state:
     st.session_state.selected_files = set()  # conjunto de nombres de archivos seleccionados
 if "table_version" not in st.session_state:
-    st.session_state.table_version = {}  # versión por página para forzar reset del widget
+    st.session_state.table_version = {}
+if "files_to_download" not in st.session_state:
+    st.session_state.files_to_download = []  # lista de archivos para descargar  # versión por página para forzar reset del widget
 
 # --- Función para refrescar lista ---
 def refresh_list(tags=None):
@@ -168,23 +181,35 @@ def refresh_list(tags=None):
         # No mostrar error aquí, ya se muestra en el expander de conexión
         return []
 
-# --- Función para descargar archivo ---
-def download_file(file_name):
-    """Descarga un archivo individual"""
+# --- Función para obtener contenido de archivo ---
+def get_file_content(file_name):
+    """Obtiene el contenido de un archivo para descarga"""
     server_url, _ = get_server_url()
     if not server_url:
-        return False, "No hay servidor disponible"
+        return None, "No hay servidor disponible"
     
     try:
-        r = requests.get(f"{server_url}/download/{file_name}", stream=True)
+        # Obtener la URL del líder para la descarga
+        leader_url, leader_error = get_leader_url()
+        if not leader_url:
+            return None, f"No se pudo obtener el líder: {leader_error}"
+        
+        # Intentar descargar desde el líder, siguiendo redirecciones automáticamente
+        r = requests.get(
+            f"{leader_url}/download/{file_name}", 
+            stream=True, 
+            timeout=30,
+            allow_redirects=True  # Seguir redirecciones HTTP 307 automáticamente
+        )
         r.raise_for_status()
-        download_path = os.path.join(DOWNLOAD_DIR, file_name)
-        with open(download_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
-        return True, download_path
+        return r.content, None
+    except requests.HTTPError as e:
+        # Si es un error 503, puede ser que el namenode no sea el líder
+        if e.response and e.response.status_code == 503:
+            return None, f"Servicio no disponible. El namenode puede no ser el líder. Intenta de nuevo."
+        return None, str(e)
     except requests.RequestException as e:
-        return False, str(e)
+        return None, str(e)
 
 # --- Mostrar lista ---
 st.subheader("📖 Archivos disponibles")
@@ -353,25 +378,41 @@ if files:
             if not selected_in_page:
                 st.warning("Selecciona al menos un archivo.")
             else:
-                success_count = 0
-                error_count = 0
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                for idx, file_name in enumerate(selected_in_page):
-                    status_text.text(f"Descargando {file_name}... ({idx + 1}/{len(selected_in_page)})")
-                    success, result = download_file(file_name)
-                    if success:
-                        success_count += 1
-                    else:
-                        error_count += 1
-                        st.error(f"Error al descargar '{file_name}': {result}")
-                    progress_bar.progress((idx + 1) / len(selected_in_page))
-                status_text.empty()
-                progress_bar.empty()
-                if success_count > 0:
-                    st.success(f"✅ {success_count} archivo(s) descargado(s) correctamente en {DOWNLOAD_DIR}")
-                if error_count > 0:
-                    st.warning(f"⚠️ {error_count} archivo(s) fallaron al descargar")
+                # Guardar archivos para descargar fuera del formulario
+                st.session_state.files_to_download = selected_in_page.copy()
+                st.rerun()
+
+    # Mostrar botones de descarga fuera del formulario
+    if st.session_state.files_to_download:
+        st.markdown("### 📥 Descargar archivos seleccionados")
+        files_to_remove = []
+        for file_name in st.session_state.files_to_download:
+            file_content, error = get_file_content(file_name)
+            if file_content:
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.download_button(
+                        label=f"📥 Descargar {file_name}",
+                        data=file_content,
+                        file_name=file_name,
+                        mime="application/octet-stream",
+                        key=f"download_{file_name}_{page_idx}",
+                        use_container_width=True
+                    )
+                with col2:
+                    if st.button("❌", key=f"remove_{file_name}_{page_idx}", help="Quitar de la lista"):
+                        files_to_remove.append(file_name)
+            else:
+                st.error(f"❌ Error al obtener '{file_name}': {error}")
+                files_to_remove.append(file_name)
+        
+        # Remover archivos de la lista
+        for file_name in files_to_remove:
+            st.session_state.files_to_download.remove(file_name)
+        
+        if st.button("🗑️ Limpiar lista de descargas", key="clear_downloads"):
+            st.session_state.files_to_download = []
+            st.rerun()
 
     # --- Controles de paginación ---
     st.markdown("<br>", unsafe_allow_html=True)
@@ -474,13 +515,9 @@ if st.session_state.modal == "add_file":
                                     st.success(f"✅ Todos los archivos ({success_count}) subidos correctamente.")
                                 else:
                                     st.warning(f"⚠️ {success_count} de {len(uploaded_files)} archivos subidos correctamente. {error_count} fallaron.")
-                                # Refrescar la lista de archivos manteniendo el modal abierto
+                                # Cerrar el modal y refrescar la lista de archivos
+                                st.session_state.modal = None
                                 st.session_state.refresh_needed = True
-                                # Mantener el modal abierto para permitir subir más archivos
-                                # El estado del modal se mantiene porque no lo cambiamos a None
-                                st.info("💡 Puedes seguir subiendo más archivos. La lista se actualizará automáticamente.")
-                                # Hacer rerun para refrescar la lista, pero mantener el modal abierto
-                                # Como no cambiamos st.session_state.modal, permanecerá como "add_file"
                                 st.rerun()
                             # Si todos fallaron, mantener el modal abierto para que el usuario pueda intentar de nuevo
                             elif error_count > 0:

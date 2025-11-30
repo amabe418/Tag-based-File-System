@@ -91,6 +91,22 @@ def init_db(db_path: str = None, node_id: str = None):
         )
     """)
     
+    # Tabla de DataNodes registrados
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS datanodes (
+            node_id TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            port INTEGER NOT NULL,
+            ip TEXT,
+            total_space INTEGER NOT NULL,
+            free_space INTEGER NOT NULL,
+            last_heartbeat TIMESTAMP,
+            status TEXT DEFAULT 'active',
+            draining BOOLEAN DEFAULT 0,
+            registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
     conn.commit()
     conn.close()
     print(f"[DATABASE] Base de datos inicializada: {db_path}")

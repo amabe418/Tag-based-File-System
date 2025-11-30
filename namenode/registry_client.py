@@ -59,7 +59,12 @@ class RegistryClient:
         else:
             self.registry_urls = [registry_url]
         self.server_port = NAMENODE_PORT
-        self.server_url = get_hostname()
+        # Usar el NODE_ID para construir el nombre del servicio Docker
+        # Si NODE_ID es "namenode-1", el nombre del servicio será "tbfs-namenode-1"
+        if NAMENODE_ID:
+            self.server_url = f"tbfs-{NAMENODE_ID}"  # tbfs-namenode-1, tbfs-namenode-2, etc.
+        else:
+            self.server_url = get_hostname()  # Fallback al hostname
         self.server_ip = get_server_ip()
         self.heartbeat_thread = None
         self.running = False

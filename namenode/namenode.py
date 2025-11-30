@@ -4,7 +4,7 @@ Mantiene metadatos de archivos (nombres y etiquetas) con replicación Raft-like
 Los archivos físicos se almacenan en DataNodes, no aquí.
 """
 from fastapi import FastAPI, HTTPException, Query, UploadFile, Form
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
@@ -110,6 +110,9 @@ commit_index = 0
 def get_peer_url(peer: str) -> str:
     """Obtiene la URL completa de un peer"""
     if not peer.startswith("http"):
+        # Si el peer es "namenode-1", construir "tbfs-namenode-1" (nombre del servicio Docker)
+        if peer.startswith("namenode-"):
+            peer = f"tbfs-{peer}"
         return f"http://{peer}:{NAMENODE_PORT}"
     return peer
 
@@ -386,6 +389,8 @@ def root():
             "leader_id": cluster_state["leader_id"],
             "term": cluster_state["term"]
         }
+        leader_id = cluster_state["leader_id"]
+        is_leader_flag = cluster_state["is_leader"]
     
     # Obtener estadísticas de la base de datos
     db_path = get_db_path(NODE_ID)
@@ -399,235 +404,249 @@ def root():
         finally:
             close_connection(conn)
     
+    # Incluir URL del líder
+    leader_url = None
+    if is_leader_flag:
+        # Si este nodo es el líder, devolver su propia URL
+        # Construir la URL usando el nombre del servicio Docker
+        node_service_name = f"tbfs-{cluster_state['node_id']}"
+        leader_url = f"http://{node_service_name}:{NAMENODE_PORT}"
+        print(f"[NAMENODE] Endpoint /: Este nodo es el líder. leader_url={leader_url}")
+    elif leader_id:
+        # Si no es líder, devolver la URL del líder
+        leader_url = get_peer_url(leader_id)
+        print(f"[NAMENODE] Endpoint /: leader_id={leader_id}, leader_url={leader_url}")
+    
     return {
         "message": "MetaNameNode funcionando",
         **cluster_data,
         "total_files": total_files,
-        "total_tags": total_tags
+        "total_tags": total_tags,
+        "leader_url": leader_url  # URL del líder para que el cliente pueda usarla directamente
     }
 
 
 # ========== ENDPOINTS DE METADATOS ==========
 
-@app.post("/files")
-def add_file(metadata: FileMetadata):
-    """Agrega metadatos de un archivo (solo el líder)"""
-    leader_url = get_leader_url()
-    if leader_url:
-        try:
-            response = requests.post(
-                f"{leader_url}/files",
-                json=metadata.dict(),
-                timeout=5
-            )
-            return response.json()
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+# @app.post("/files")
+# def add_file(metadata: FileMetadata):
+#     """Agrega metadatos de un archivo (solo el líder)"""
+#     leader_url = get_leader_url()
+#     if leader_url:
+#         try:
+#             response = requests.post(
+#                 f"{leader_url}/files",
+#                 json=metadata.dict(),
+#                 timeout=5
+#             )
+#             return response.json()
+#         except Exception as e:
+#             raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
     
-    if not is_leader():
-        raise HTTPException(status_code=503, detail="No hay líder disponible")
+#     if not is_leader():
+#         raise HTTPException(status_code=503, detail="No hay líder disponible")
     
-    # Agregar metadatos localmente
-    file_id = add_file_metadata(
-        name=metadata.name,
-        tags=metadata.tags,
-        size=metadata.size,
-        hash_value=metadata.hash,
-        node_id=NODE_ID
-    )
+#     # Agregar metadatos localmente
+#     file_id = add_file_metadata(
+#         name=metadata.name,
+#         tags=metadata.tags,
+#         size=metadata.size,
+#         hash_value=metadata.hash,
+#         node_id=NODE_ID
+#     )
     
-    if not file_id:
-        raise HTTPException(status_code=400, detail="No se pudo agregar el archivo")
+#     if not file_id:
+#         raise HTTPException(status_code=400, detail="No se pudo agregar el archivo")
     
-    # Replicar operación a los seguidores
-    operation = OperationLog(
-        operation="add_file",
-        data={
-            "name": metadata.name,
-            "tags": metadata.tags,
-            "size": metadata.size,
-            "hash": metadata.hash
-        },
-        term=cluster_state["term"],
-        timestamp=time.time()
-    )
+#     # Replicar operación a los seguidores
+#     operation = OperationLog(
+#         operation="add_file",
+#         data={
+#             "name": metadata.name,
+#             "tags": metadata.tags,
+#             "size": metadata.size,
+#             "hash": metadata.hash
+#         },
+#         term=cluster_state["term"],
+#         timestamp=time.time()
+#     )
     
-    with log_lock:
-        operation_log.append(operation)
+#     with log_lock:
+#         operation_log.append(operation)
     
-    replicate_to_peers(operation)
+#     replicate_to_peers(operation)
     
-    return {
-        "success": True,
-        "message": f"Metadatos de '{metadata.name}' agregados correctamente",
-        "file_id": file_id
-    }
+#     return {
+#         "success": True,
+#         "message": f"Metadatos de '{metadata.name}' agregados correctamente",
+#         "file_id": file_id
+#     }
 
 
-@app.get("/files")
-def list_files(tags: Optional[List[str]] = Query(None)):
-    """Lista archivos por tags (cualquier nodo puede responder)"""
-    files = query_files(query_tags=tags, node_id=NODE_ID)
+# @app.get("/files")
+# def list_files(tags: Optional[List[str]] = Query(None)):
+#     """Lista archivos por tags (cualquier nodo puede responder)"""
+#     files = query_files(query_tags=tags, node_id=NODE_ID)
     
-    result = []
-    for file_id, name, tags_str in files:
-        tags_list = tags_str.split(",") if tags_str else []
-        result.append({
-            "id": file_id,
-            "name": name,
-            "tags": tags_list
-        })
+#     result = []
+#     for file_id, name, tags_str in files:
+#         tags_list = tags_str.split(",") if tags_str else []
+#         result.append({
+#             "id": file_id,
+#             "name": name,
+#             "tags": tags_list
+#         })
     
-    return {"files": result}
+#     return {"files": result}
 
 
-@app.get("/files/{file_id}")
-def get_file(file_id: int):
-    """Obtiene metadatos de un archivo específico"""
-    file_data = get_file_by_id(file_id, node_id=NODE_ID)
-    if not file_data:
-        raise HTTPException(status_code=404, detail="Archivo no encontrado")
-    return file_data
+# @app.get("/files/{file_id}")
+# def get_file(file_id: int):
+#     """Obtiene metadatos de un archivo específico"""
+#     file_data = get_file_by_id(file_id, node_id=NODE_ID)
+#     if not file_data:
+#         raise HTTPException(status_code=404, detail="Archivo no encontrado")
+#     return file_data
 
 
-@app.delete("/files/{file_id}")
-def delete_file(file_id: int):
-    """Elimina metadatos de un archivo (solo el líder)"""
-    leader_url = get_leader_url()
-    if leader_url:
-        try:
-            response = requests.delete(f"{leader_url}/files/{file_id}", timeout=5)
-            return response.json()
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+# @app.delete("/files/{file_id}")
+# def delete_file(file_id: int):
+#     """Elimina metadatos de un archivo (solo el líder)"""
+#     leader_url = get_leader_url()
+#     if leader_url:
+#         try:
+#             response = requests.delete(f"{leader_url}/files/{file_id}", timeout=5)
+#             return response.json()
+#         except Exception as e:
+#             raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
     
-    if not is_leader():
-        raise HTTPException(status_code=503, detail="No hay líder disponible")
+#     if not is_leader():
+#         raise HTTPException(status_code=503, detail="No hay líder disponible")
     
-    file_data = get_file_by_id(file_id, node_id=NODE_ID)
-    if not file_data:
-        raise HTTPException(status_code=404, detail="Archivo no encontrado")
+#     file_data = get_file_by_id(file_id, node_id=NODE_ID)
+#     if not file_data:
+#         raise HTTPException(status_code=404, detail="Archivo no encontrado")
     
-    deleted = delete_file_metadata(file_id, node_id=NODE_ID)
+#     deleted = delete_file_metadata(file_id, node_id=NODE_ID)
     
-    if deleted:
-        # Replicar operación
-        operation = OperationLog(
-            operation="delete_file",
-            data={"file_id": file_id},
-            term=cluster_state["term"],
-            timestamp=time.time()
-        )
-        with log_lock:
-            operation_log.append(operation)
-        replicate_to_peers(operation)
+#     if deleted:
+#         # Replicar operación
+#         operation = OperationLog(
+#             operation="delete_file",
+#             data={"file_id": file_id},
+#             term=cluster_state["term"],
+#             timestamp=time.time()
+#         )
+#         with log_lock:
+#             operation_log.append(operation)
+#         replicate_to_peers(operation)
     
-    return {"success": deleted, "message": "Metadatos eliminados" if deleted else "No se encontró el archivo"}
+#     return {"success": deleted, "message": "Metadatos eliminados" if deleted else "No se encontró el archivo"}
 
 
-@app.delete("/files")
-def delete_files_by_query(tags: str = Query(...)):
-    """Elimina archivos por tags (solo el líder)"""
-    leader_url = get_leader_url()
-    if leader_url:
-        try:
-            response = requests.delete(f"{leader_url}/files", params={"tags": tags}, timeout=5)
-            return response.json()
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+# @app.delete("/files")
+# def delete_files_by_query(tags: str = Query(...)):
+#     """Elimina archivos por tags (solo el líder)"""
+#     leader_url = get_leader_url()
+#     if leader_url:
+#         try:
+#             response = requests.delete(f"{leader_url}/files", params={"tags": tags}, timeout=5)
+#             return response.json()
+#         except Exception as e:
+#             raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
     
-    if not is_leader():
-        raise HTTPException(status_code=503, detail="No hay líder disponible")
+#     if not is_leader():
+#         raise HTTPException(status_code=503, detail="No hay líder disponible")
     
-    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
-    deleted = delete_files_by_tags(tag_list, node_id=NODE_ID)
+#     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+#     deleted = delete_files_by_tags(tag_list, node_id=NODE_ID)
     
-    if deleted:
-        operation = OperationLog(
-            operation="delete_files_by_tags",
-            data={"tags": tag_list},
-            term=cluster_state["term"],
-            timestamp=time.time()
-        )
-        with log_lock:
-            operation_log.append(operation)
-        replicate_to_peers(operation)
+#     if deleted:
+#         operation = OperationLog(
+#             operation="delete_files_by_tags",
+#             data={"tags": tag_list},
+#             term=cluster_state["term"],
+#             timestamp=time.time()
+#         )
+#         with log_lock:
+#             operation_log.append(operation)
+#         replicate_to_peers(operation)
     
-    return {"success": deleted, "message": "Archivos eliminados" if deleted else "No se encontraron coincidencias"}
+#     return {"success": deleted, "message": "Archivos eliminados" if deleted else "No se encontraron coincidencias"}
 
 
-@app.post("/files/tags/add")
-def add_tags(query: str = Query(...), new_tags: str = Query(...)):
-    """Agrega etiquetas a archivos (solo el líder)"""
-    leader_url = get_leader_url()
-    if leader_url:
-        try:
-            response = requests.post(
-                f"{leader_url}/files/tags/add",
-                params={"query": query, "new_tags": new_tags},
-                timeout=5
-            )
-            return response.json()
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+# @app.post("/files/tags/add")
+# def add_tags(query: str = Query(...), new_tags: str = Query(...)):
+#     """Agrega etiquetas a archivos (solo el líder)"""
+#     leader_url = get_leader_url()
+#     if leader_url:
+#         try:
+#             response = requests.post(
+#                 f"{leader_url}/files/tags/add",
+#                 params={"query": query, "new_tags": new_tags},
+#                 timeout=5
+#             )
+#             return response.json()
+#         except Exception as e:
+#             raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
     
-    if not is_leader():
-        raise HTTPException(status_code=503, detail="No hay líder disponible")
+#     if not is_leader():
+#         raise HTTPException(status_code=503, detail="No hay líder disponible")
     
-    query_tags = [t.strip() for t in query.split(",") if t.strip()]
-    new_tags_list = [t.strip() for t in new_tags.split(",") if t.strip()]
+#     query_tags = [t.strip() for t in query.split(",") if t.strip()]
+#     new_tags_list = [t.strip() for t in new_tags.split(",") if t.strip()]
     
-    ok = add_tags_to_files(query_tags, new_tags_list, node_id=NODE_ID)
+#     ok = add_tags_to_files(query_tags, new_tags_list, node_id=NODE_ID)
     
-    if ok:
-        operation = OperationLog(
-            operation="add_tags",
-            data={"query_tags": query_tags, "new_tags": new_tags_list},
-            term=cluster_state["term"],
-            timestamp=time.time()
-        )
-        with log_lock:
-            operation_log.append(operation)
-        replicate_to_peers(operation)
+#     if ok:
+#         operation = OperationLog(
+#             operation="add_tags",
+#             data={"query_tags": query_tags, "new_tags": new_tags_list},
+#             term=cluster_state["term"],
+#             timestamp=time.time()
+#         )
+#         with log_lock:
+#             operation_log.append(operation)
+#         replicate_to_peers(operation)
     
-    return {"success": ok}
+#     return {"success": ok}
 
 
-@app.post("/files/tags/delete")
-def delete_tags(query: str = Query(...), del_tags: str = Query(...)):
-    """Elimina etiquetas de archivos (solo el líder)"""
-    leader_url = get_leader_url()
-    if leader_url:
-        try:
-            response = requests.post(
-                f"{leader_url}/files/tags/delete",
-                params={"query": query, "del_tags": del_tags},
-                timeout=5
-            )
-            return response.json()
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+# @app.post("/files/tags/delete")
+# def delete_tags(query: str = Query(...), del_tags: str = Query(...)):
+#     """Elimina etiquetas de archivos (solo el líder)"""
+#     leader_url = get_leader_url()
+#     if leader_url:
+#         try:
+#             response = requests.post(
+#                 f"{leader_url}/files/tags/delete",
+#                 params={"query": query, "del_tags": del_tags},
+#                 timeout=5
+#             )
+#             return response.json()
+#         except Exception as e:
+#             raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
     
-    if not is_leader():
-        raise HTTPException(status_code=503, detail="No hay líder disponible")
+#     if not is_leader():
+#         raise HTTPException(status_code=503, detail="No hay líder disponible")
     
-    query_tags = [t.strip() for t in query.split(",") if t.strip()]
-    del_tags_list = [t.strip() for t in del_tags.split(",") if t.strip()]
+#     query_tags = [t.strip() for t in query.split(",") if t.strip()]
+#     del_tags_list = [t.strip() for t in del_tags.split(",") if t.strip()]
     
-    ok = delete_tags_from_files(query_tags, del_tags_list, node_id=NODE_ID)
+#     ok = delete_tags_from_files(query_tags, del_tags_list, node_id=NODE_ID)
     
-    if ok:
-        operation = OperationLog(
-            operation="delete_tags",
-            data={"query_tags": query_tags, "del_tags": del_tags_list},
-            term=cluster_state["term"],
-            timestamp=time.time()
-        )
-        with log_lock:
-            operation_log.append(operation)
-        replicate_to_peers(operation)
+#     if ok:
+#         operation = OperationLog(
+#             operation="delete_tags",
+#             data={"query_tags": query_tags, "del_tags": del_tags_list},
+#             term=cluster_state["term"],
+#             timestamp=time.time()
+#         )
+#         with log_lock:
+#             operation_log.append(operation)
+#         replicate_to_peers(operation)
     
-    return {"success": ok}
+#     return {"success": ok}
 
 
 # ========== ENDPOINTS DE COMPATIBILIDAD (formato antiguo del cliente) ==========
@@ -727,19 +746,11 @@ async def add_file_compat(file: UploadFile, tags: str = Form(...)):
 def list_files_compat(tags: Optional[List[str]] = Query(None)):
     """Endpoint de compatibilidad: lista archivos (cualquier nodo puede responder)"""
     files = query_files(query_tags=tags, node_id=NODE_ID)
-    
-    result = []
-    for file_id, name, tags_str in files:
-        tags_list = tags_str.split(",") if tags_str else []
-        # Formato compatible con el cliente antiguo
-        result.append({
-            "id": file_id,
-            "name": name,
-            "tags": tags_list,
-            "path": ""  # No hay path físico en el namenode
-        })
-    
-    return {"files": result}
+    formatted = [
+        {"id": fid, "name": name, "tags": tags, "path": ""}
+        for fid, name, tags in files
+    ]
+    return {"files": formatted}
 
 
 @app.delete("/delete")

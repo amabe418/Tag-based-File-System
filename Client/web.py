@@ -15,19 +15,84 @@ def get_server_url():
         # Intentar obtener servidor del registry
         server_url = registry_client.get_server_url(strategy="random")
         if server_url:
+            print(f"[CLIENT] URL obtenida del registry: {server_url}")
+            # Verificar que la URL tenga el formato correcto
+            if not server_url.startswith("http"):
+                # Si el registry devuelve solo el hostname, agregar http:// y puerto
+                if ":" not in server_url:
+                    server_url = f"http://{server_url}:8010"
+                else:
+                    server_url = f"http://{server_url}"
+            print(f"[CLIENT] URL final a usar: {server_url}")
             return server_url, None
         
         # Si no hay servidor, intentar obtener lista directamente
+        print("[CLIENT] No se obtuvo URL directa, intentando obtener lista de servidores...")
         servers = registry_client.get_active_servers(use_cache=False)
+        print(f"[CLIENT] Servidores obtenidos: {servers}")
         if servers and len(servers) > 0:
             server = random.choice(servers)
-            return server.get("url"), None
+            server_url = server.get("url")
+            print(f"[CLIENT] URL del servidor seleccionado: {server_url}")
+            # Verificar formato de URL
+            if server_url and not server_url.startswith("http"):
+                if ":" not in server_url:
+                    server_url = f"http://{server_url}:8010"
+                else:
+                    server_url = f"http://{server_url}"
+            print(f"[CLIENT] URL final a usar: {server_url}")
+            return server_url, None
         
         # Si no hay servidores disponibles, retornar error
+        print("[CLIENT] ERROR: No hay servidores disponibles en el registry")
         return None, "No hay servidores de datos disponibles en el registry. Por favor, verifica que el registry y los servidores backend estén funcionando."
         
     except Exception as e:
+        print(f"[CLIENT] EXCEPCIÓN al obtener servidor: {e}")
+        import traceback
+        traceback.print_exc()
         return None, f"Error al consultar el registry: {e}"
+
+def get_leader_url():
+    """Obtiene la URL del líder del namenode consultando el endpoint / de cualquier namenode"""
+    server_url, error = get_server_url()
+    if not server_url:
+        return None, error
+    
+    try:
+        # Consultar el endpoint / para obtener información del líder
+        response = requests.get(f"{server_url}/", timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Prioridad 1: Usar leader_url si está disponible (siempre debe estar si hay líder)
+        leader_url = data.get("leader_url")
+        if leader_url:
+            print(f"[CLIENT] Líder encontrado desde leader_url: {leader_url}")
+            return leader_url, None
+        
+        # Prioridad 2: Si este namenode es el líder, usar su URL
+        if data.get("is_leader"):
+            print(f"[CLIENT] Namenode consultado es el líder: {server_url}")
+            return server_url, None
+        
+        # Prioridad 3: Si hay leader_id pero no leader_url, construir la URL
+        leader_id = data.get("leader_id")
+        if leader_id:
+            # Construir URL del líder basado en el leader_id
+            # Si el leader_id es "namenode-1", la URL será "http://tbfs-namenode-1:8010"
+            leader_url = f"http://tbfs-{leader_id}:8010"
+            print(f"[CLIENT] Líder construido desde leader_id: {leader_url}")
+            return leader_url, None
+        
+        # Si no hay líder disponible, retornar el servidor actual como fallback
+        print(f"[CLIENT] No se pudo obtener líder, usando servidor actual: {server_url}")
+        return server_url, None
+        
+    except requests.RequestException as e:
+        print(f"[CLIENT] Error al consultar líder: {e}")
+        return None, f"Error al consultar el líder: {e}"
+
 
 def check_server_connection():
     """Verifica si hay conexión con el servidor. Retorna (connected, error_message)"""
@@ -361,9 +426,10 @@ if st.session_state.modal == "add_file":
         uploaded_files = st.file_uploader("Selecciona archivos", accept_multiple_files=True, key="file_uploader")
         tags = st.text_input("Etiquetas (separadas por comas):", key="add_file_tags")
 
-        colA, colB = st.columns([1, 1])
+        colA, colB, colC = st.columns([2, 1, 1])
         with colA:
-            if st.button("Agregar Archivo(s)", key="upload_button", disabled=not is_connected):
+            if st.button("Agregar Archivo(s)", key="upload_button", disabled=not is_connected, use_container_width=True):
+                print(f"[CLIENT] Botón 'Agregar Archivo(s)' presionado. uploaded_files={uploaded_files}, tags={tags}, is_connected={is_connected}")
                 if not uploaded_files:
                     st.warning("Selecciona al menos un archivo.")
                 elif not tags.strip():
@@ -373,19 +439,60 @@ if st.session_state.modal == "add_file":
                     if not server_url:
                         st.error("No hay servidor disponible para subir archivos.")
                     else:
-                        for file in uploaded_files:
-                            files = {"file": (file.name, file.getvalue())}
-                            data = {"tags": tags}
-                            try:
-                                response = requests.post(f"{server_url}/add", files=files, data=data)
-                                response.raise_for_status()
-                                st.success(f"Archivo '{file.name}' subido correctamente.")
-                                # st.rerun()
-                            except requests.RequestException as e:
-                                st.error(f"Error al subir '{file.name}': {e}")
-                    st.session_state.modal = None
-                    st.session_state.refresh_needed = True
-                    st.rerun()
+                        # Obtener la URL del líder antes de subir archivos
+                        leader_url, leader_error = get_leader_url()
+                        if not leader_url:
+                            st.error(f"No se pudo obtener el líder del namenode: {leader_error}")
+                        else:
+                            print(f"[CLIENT] Intentando subir archivo(s) al líder: {leader_url}/add")
+                            success_count = 0
+                            error_count = 0
+                            for file in uploaded_files:
+                                files = {"file": (file.name, file.getvalue())}
+                                data = {"tags": tags}
+                                try:
+                                    print(f"[CLIENT] Enviando POST a {leader_url}/add con archivo: {file.name}, tags: {tags}")
+                                    response = requests.post(f"{leader_url}/add", files=files, data=data, timeout=30)
+                                    print(f"[CLIENT] Respuesta recibida: status={response.status_code}, body={response.text[:200]}")
+                                    response.raise_for_status()
+                                    result = response.json()
+                                    print(f"[CLIENT] Archivo subido exitosamente: {result}")
+                                    st.success(f"Archivo '{file.name}' subido correctamente.")
+                                    success_count += 1
+                                except requests.RequestException as e:
+                                    print(f"[CLIENT] ERROR al subir '{file.name}': {e}")
+                                    print(f"[CLIENT] Tipo de error: {type(e)}")
+                                    if hasattr(e, 'response') and e.response is not None:
+                                        print(f"[CLIENT] Status code: {e.response.status_code}")
+                                        print(f"[CLIENT] Response body: {e.response.text[:500]}")
+                                    st.error(f"Error al subir '{file.name}': {e}")
+                                    error_count += 1
+                            
+                            # Mostrar resumen
+                            if success_count > 0:
+                                if success_count == len(uploaded_files):
+                                    st.success(f"✅ Todos los archivos ({success_count}) subidos correctamente.")
+                                else:
+                                    st.warning(f"⚠️ {success_count} de {len(uploaded_files)} archivos subidos correctamente. {error_count} fallaron.")
+                                # Refrescar la lista de archivos manteniendo el modal abierto
+                                st.session_state.refresh_needed = True
+                                # Mantener el modal abierto para permitir subir más archivos
+                                # El estado del modal se mantiene porque no lo cambiamos a None
+                                st.info("💡 Puedes seguir subiendo más archivos. La lista se actualizará automáticamente.")
+                                # Hacer rerun para refrescar la lista, pero mantener el modal abierto
+                                # Como no cambiamos st.session_state.modal, permanecerá como "add_file"
+                                st.rerun()
+                            # Si todos fallaron, mantener el modal abierto para que el usuario pueda intentar de nuevo
+                            elif error_count > 0:
+                                st.error(f"❌ No se pudo subir ningún archivo. Por favor, verifica la conexión e intenta de nuevo.")
+        with colB:
+            if st.button("🔄 Refrescar lista", key="refresh_list_button", use_container_width=True):
+                st.session_state.refresh_needed = True
+                st.rerun()
+        with colC:
+            if st.button("❌ Cerrar", key="close_modal_button", use_container_width=True):
+                st.session_state.modal = None
+                st.rerun()
 
 # --- Modal: Agregar etiquetas ---
 elif st.session_state.modal == "add_tags":

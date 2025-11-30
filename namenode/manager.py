@@ -165,6 +165,16 @@ def delete_file_metadata(file_id: int, node_id: str = None) -> bool:
             
             # Las relaciones se eliminan por CASCADE
             cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
+            
+            # Limpiar etiquetas huérfanas (etiquetas que no tienen ningún archivo asociado)
+            cursor.execute("""
+                DELETE FROM tags 
+                WHERE id NOT IN (SELECT DISTINCT tag_id FROM file_tags)
+            """)
+            orphan_tags_deleted = cursor.rowcount
+            if orphan_tags_deleted > 0:
+                print(f"[INFO] Eliminadas {orphan_tags_deleted} etiquetas huérfanas de la base de datos")
+            
             conn.commit()
             print(f"[INFO] Metadatos eliminados: {row[0]}")
             return True
@@ -189,10 +199,32 @@ def delete_files_by_tags(query_tags: List[str], node_id: str = None) -> bool:
     if not files:
         return False
     
+    db_path = get_db_path(node_id)
     deleted_count = 0
+    
+    # Eliminar archivos
     for file_id, name, _ in files:
         if delete_file_metadata(file_id, node_id=node_id):
             deleted_count += 1
+    
+    # Limpiar etiquetas huérfanas después de eliminar archivos
+    # (delete_file_metadata ya limpia, pero hacemos una limpieza final por si acaso)
+    with db_lock:
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id)
+        try:
+            cursor.execute("""
+                DELETE FROM tags 
+                WHERE id NOT IN (SELECT DISTINCT tag_id FROM file_tags WHERE tag_id IS NOT NULL)
+            """)
+            orphan_tags_deleted = cursor.rowcount
+            if orphan_tags_deleted > 0:
+                print(f"[INFO] Limpieza final: eliminadas {orphan_tags_deleted} etiquetas huérfanas")
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"[ERROR] Error en limpieza de etiquetas huérfanas: {e}")
+        finally:
+            close_connection(conn)
     
     return deleted_count > 0
 
@@ -288,6 +320,15 @@ def delete_tags_from_files(query_tags: List[str], del_tags: List[str], node_id: 
                         tag_count -= 1
                 
                 print(f"[INFO] Etiquetas eliminadas de {name} (quedan {tag_count})")
+            
+            # Limpiar etiquetas huérfanas (etiquetas que no tienen ningún archivo asociado)
+            cursor.execute("""
+                DELETE FROM tags 
+                WHERE id NOT IN (SELECT DISTINCT tag_id FROM file_tags)
+            """)
+            orphan_tags_deleted = cursor.rowcount
+            if orphan_tags_deleted > 0:
+                print(f"[INFO] Eliminadas {orphan_tags_deleted} etiquetas huérfanas de la base de datos")
             
             conn.commit()
             return total_deleted > 0

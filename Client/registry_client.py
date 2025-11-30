@@ -105,6 +105,10 @@ class RegistryClient:
         """
         servers = self.get_active_servers()
         
+        print(f"[REGISTRY_CLIENT] Servidores obtenidos: {len(servers) if servers else 0}")
+        if servers:
+            print(f"[REGISTRY_CLIENT] Primer servidor: {servers[0]}")
+        
         if not servers:
             return None
         
@@ -118,7 +122,9 @@ class RegistryClient:
         else:
             server = servers[0]
         
-        return server.get("url")
+        url = server.get("url")
+        print(f"[REGISTRY_CLIENT] URL seleccionada: {url}")
+        return url
     
     def get_all_servers(self) -> List[Dict]:
         """Obtiene todos los servidores (activos e inactivos)"""

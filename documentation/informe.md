@@ -40,7 +40,6 @@ Los volúmenes persistentes asociados a cada servicio resuelven el problema de p
 
 La exposición de puertos específicos en cada servicio responde a la necesidad de acceso externo para clientes y herramientas de administración, mientras que la comunicación interna entre servicios utiliza la red overlay privada. Esta separación de redes públicas y privadas proporciona una capa adicional de seguridad, limitando el acceso directo a servicios internos mientras permite acceso controlado a servicios que deben ser accesibles externamente.
 
----
 
 ## 2. Procesos: El Problema de Cuántos Programas o Servicios Posee el Sistema
 
@@ -78,7 +77,6 @@ Los **procesos independientes** representan el nivel más alto de aislamiento y 
 
 El **patrón líder-seguidor** implementado en el Registry y MetaNameNode resuelve el problema de coordinación en sistemas distribuidos donde múltiples réplicas deben mantener consistencia. Este patrón garantiza que solo una réplica procese operaciones de escritura en un momento dado, evitando conflictos y condiciones de carrera. Los seguidores replican las operaciones del líder, manteniendo sus propios estados sincronizados. La elección automática de un nuevo líder cuando el líder actual falla proporciona alta disponibilidad sin intervención manual. Este patrón es esencial para mantener la consistencia en un sistema distribuido donde las réplicas pueden tener diferentes estados debido a latencia de red o fallos temporales.
 
----
 
 ## 3. Comunicación: El Problema de Cómo Enviar Información Mediante la Red
 
@@ -124,7 +122,6 @@ La comunicación intra-proceso utiliza mecanismos de memoria compartida protegid
 
 La comunicación inter-proceso utiliza exclusivamente peticiones HTTP REST, incluso cuando los procesos se ejecutan en el mismo nodo físico. Esta decisión puede parecer ineficiente, pero proporciona beneficios significativos: desacoplamiento completo entre servicios, independencia de implementación (cada servicio puede implementarse en diferentes lenguajes o frameworks), y facilidad de escalabilidad (los servicios pueden moverse entre nodos sin cambios en la comunicación). Esta uniformidad en el mecanismo de comunicación simplifica significativamente el diseño del sistema y facilita el mantenimiento y la evolución futura.
 
----
 
 ## 4. Coordinación: El Problema de Poner Todos los Servicios de Acuerdo
 
@@ -160,7 +157,6 @@ El consenso en replicación aborda el problema de cómo garantizar que las opera
 
 La decisión de asignación de réplicas representa un problema de optimización distribuida: el MetaNameNode debe decidir en qué DataNodes almacenar cada archivo, considerando múltiples factores como espacio disponible, carga actual, estado de salud de los DataNodes, y distribución de carga. El sistema implementa un algoritmo que evalúa todos los DataNodes disponibles, excluye aquellos que están en proceso de drenaje o marcados como inactivos, y selecciona DataNodes que maximicen la distribución de carga y minimicen el riesgo de pérdida de datos. La decisión utiliza información del hash del archivo para proporcionar una distribución determinística: archivos con hashes similares tienden a distribuirse de forma similar, pero la selección final considera el estado actual del sistema. Esta combinación de determinismo y adaptabilidad permite que el sistema mantenga una distribución balanceada mientras responde dinámicamente a cambios en el estado del sistema.
 
----
 
 ## 5. Nombrado y Localización: El Problema de Dónde se Encuentra un Recurso y Cómo Llegar al Mismo
 
@@ -196,7 +192,6 @@ La localización de réplicas de archivos aborda el problema de cómo encontrar 
 
 La búsqueda por etiquetas representa un mecanismo de localización de nivel más alto, donde los usuarios identifican archivos mediante características descriptivas (etiquetas) en lugar de nombres o identificadores técnicos. El sistema implementa esta búsqueda mediante asociaciones almacenadas en la base de datos de metadatos, donde cada archivo puede tener múltiples etiquetas y cada etiqueta puede estar asociada a múltiples archivos. Las consultas filtran archivos que contienen todas las etiquetas especificadas, proporcionando una capacidad de búsqueda semántica que es más intuitiva para los usuarios que la búsqueda por nombres o identificadores técnicos. El MetaNameNode procesa estas consultas localmente en su base de datos, aprovechando índices para proporcionar respuestas rápidas incluso cuando hay grandes cantidades de archivos y etiquetas. Esta capacidad de búsqueda semántica es una característica distintiva del sistema que responde directamente al problema que el sistema está diseñado para resolver: la gestión de archivos mediante etiquetas en lugar de jerarquías de directorios tradicionales.
 
----
 
 ## 6. Consistencia y Replicación: El Problema de Solucionar los Problemas que Surgen a Partir de Tener Varias Copias de un Mismo Dato en el Sistema
 
@@ -232,7 +227,6 @@ La verificación de integridad mediante hashes criptográficos proporciona una c
 
 La re-replicación automática proporciona un mecanismo para restaurar el nivel de replicación cuando se detectan fallos. El sistema monitorea continuamente el estado de los DataNodes, detectando cuando un DataNode deja de enviar heartbeats o se vuelve inaccesible. Cuando se detecta un DataNode inactivo, el sistema identifica todos los archivos que estaban almacenados en ese DataNode y los re-replica desde réplicas activas a nuevos DataNodes disponibles. Este proceso ocurre automáticamente en segundo plano, sin requerir intervención manual, y restaura el nivel de replicación deseado sin interrumpir las operaciones normales del sistema. La re-replicación automática es esencial para mantener la confiabilidad a largo plazo: sin este mecanismo, los fallos de DataNodes reducirían gradualmente el nivel de replicación hasta que el sistema ya no pudiera tolerar fallos adicionales.
 
----
 
 ## 7. Tolerancia a Fallos: El Problema de Para Qué Pasar Tanto Trabajo Distribuyendo Datos y Servicios si al Fallar una Componente del Sistema Todo se Viene Abajo
 
@@ -270,7 +264,6 @@ El drenaje controlado de nodos proporciona un mecanismo para remover DataNodes d
 
 La recuperación automática proporciona mecanismos que restauran el sistema a su estado normal después de fallos sin requerir intervención manual. Los procesos de re-replicación se ejecutan automáticamente en segundo plano cuando se detectan fallos, restaurando el nivel de replicación deseado. El sistema restaura automáticamente la capacidad de tolerar fallos adicionales mediante la re-replicación de datos afectados. Los clientes experimentan mínima interrupción durante la recuperación porque el sistema puede continuar sirviendo datos desde réplicas activas mientras la recuperación ocurre. La capacidad de recuperación automática sin intervención manual es esencial para la operación del sistema en entornos de producción donde los fallos ocurren regularmente y la intervención manual inmediata no siempre es posible.
 
----
 
 ## 8. Seguridad: El Problema de Qué Tan Vulnerable es el Diseño
 

@@ -75,8 +75,6 @@ El sistema TBFS está organizado en una arquitectura de tres capas principales:
 - Puerto expuesto: 8501
 - Acceso a red overlay para comunicación con backend
 
----
-
 ## 2. Procesos
 
 ### Tipos de Procesos
@@ -138,8 +136,6 @@ El sistema TBFS está organizado en una arquitectura de tres capas principales:
 - Líder procesa todas las operaciones de escritura
 - Seguidores replican operaciones del líder
 - Elección automática de nuevo líder ante fallo
-
----
 
 ## 3. Comunicación
 
@@ -211,8 +207,6 @@ El sistema TBFS está organizado en una arquitectura de tres capas principales:
 - Independencia de implementación
 - Facilidad de escalabilidad
 
----
-
 ## 4. Coordinación
 
 ### Sincronización de Acciones
@@ -275,8 +269,6 @@ El sistema TBFS está organizado en una arquitectura de tres capas principales:
 - Asigna réplicas balanceadas para distribuir carga
 - Excluye DataNodes en drenaje o inactivos
 - Algoritmo basado en hash del archivo para distribución determinística
-
----
 
 ## 5. Nombrado y Localización
 
@@ -342,8 +334,6 @@ El sistema TBFS está organizado en una arquitectura de tres capas principales:
 - MetaNameNode procesa consultas localmente en su base de datos
 - Query: `SELECT files WHERE tags IN (...) GROUP BY file_id HAVING COUNT(DISTINCT tag) = ?`
 
----
-
 ## 6. Consistencia y Replicación
 
 ### Distribución de Datos
@@ -405,8 +395,6 @@ El sistema TBFS está organizado en una arquitectura de tres capas principales:
   2. Se lee cada archivo desde réplica activa
   3. Se re-replica a nuevo DataNode disponible
   4. Se actualiza registro de réplicas en MetaNameNode
-
----
 
 ## 7. Tolerancia a Fallos
 
@@ -482,8 +470,6 @@ El sistema TBFS está organizado en una arquitectura de tres capas principales:
 - Clientes experimentan mínima interrupción durante recuperación
 - No requiere intervención manual para mayoría de fallos
 
----
-
 ## 8. Seguridad
 
 ### Seguridad en la Comunicación
@@ -552,8 +538,6 @@ El sistema TBFS está organizado en una arquitectura de tres capas principales:
 - Control de acceso basado en roles (RBAC)
 - Permisos diferenciados para lectura y escritura
 - Auditoría de operaciones para trazabilidad
-
----
 
 ## Conclusión
 

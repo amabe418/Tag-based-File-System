@@ -28,7 +28,7 @@ from namenode.datanode_manager import (
     assign_replicas, save_file_replicas, get_file_replicas, detect_inactive_datanodes,
     get_best_datanode_for_read, get_all_replicas_for_read, delete_file_from_datanodes,
     get_files_affected_by_datanode, rereplicate_file, mark_datanode_draining,
-    unmark_datanode_draining, drain_datanode
+    unmark_datanode_draining, drain_datanode, discover_file_replicas
 )
 from namenode.registry_client import registry_client
 
@@ -1255,11 +1255,16 @@ def download_file_compat(file_name: str):
     replicas = get_all_replicas_for_read(file_id, node_id_db=NODE_ID)
     
     if not replicas:
-        print(f"[NAMENODE] ERROR: No hay réplicas disponibles para file_id={file_id}")
-        raise HTTPException(
-            status_code=503,
-            detail="No hay réplicas disponibles del archivo en DataNodes activos"
-        )
+        print(f"[NAMENODE] WARNING: No hay réplicas registradas para file_id={file_id}, intentando descubrir desde DataNodes...")
+        # Intentar descubrir réplicas consultando todos los DataNodes activos
+        replicas = discover_file_replicas(file_hash, file_id, node_id_db=NODE_ID)
+        
+        if not replicas:
+            print(f"[NAMENODE] ERROR: No hay réplicas disponibles para file_id={file_id}")
+            raise HTTPException(
+                status_code=503,
+                detail="No hay réplicas disponibles del archivo en DataNodes activos"
+            )
     
     print(f"[NAMENODE] Réplicas disponibles para lectura: {len(replicas)}")
     for r in replicas:
@@ -1330,13 +1335,20 @@ def internal_replicate(data: Dict):
         
         # Aplicar operación localmente
         if operation == "add_file":
-            add_file_metadata(
+            file_id = add_file_metadata(
                 name=operation_data["name"],
                 tags=operation_data["tags"],
                 size=operation_data.get("size"),
                 hash_value=operation_data.get("hash"),
                 node_id=NODE_ID
             )
+            # También guardar las réplicas si están en los datos de la operación
+            if file_id and "datanode_ids" in operation_data:
+                from namenode.datanode_manager import save_file_replicas
+                datanode_ids = operation_data["datanode_ids"]
+                if datanode_ids:
+                    save_file_replicas(file_id, datanode_ids, node_id_db=NODE_ID)
+                    print(f"[NAMENODE] Réplicas replicadas para file_id={file_id}: {datanode_ids}")
         elif operation == "delete_file":
             delete_file_metadata(operation_data["file_id"], node_id=NODE_ID)
         elif operation == "delete_files_by_tags":

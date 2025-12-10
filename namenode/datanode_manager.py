@@ -428,6 +428,62 @@ def get_best_datanode_for_read(file_id: int, node_id_db: str = None) -> Optional
     }
 
 
+def discover_file_replicas(file_hash: str, file_id: int, node_id_db: str = None) -> List[Dict]:
+    """
+    Descubre en qué DataNodes está almacenado un archivo consultando todos los DataNodes activos.
+    Útil cuando la información de réplicas no está disponible (ej: después de cambio de líder).
+    
+    Args:
+        file_hash: Hash del archivo (sin prefijo "sha256:")
+        file_id: ID del archivo en la base de datos
+    
+    Returns:
+        Lista de diccionarios con información de réplicas encontradas
+    """
+    print(f"[DATANODE_MANAGER] Descubriendo réplicas para file_id={file_id} consultando DataNodes...")
+    
+    active_datanodes = get_active_datanodes(node_id_db=node_id_db, exclude_draining=True)
+    discovered_replicas = []
+    
+    for datanode in active_datanodes:
+        datanode_id = datanode["node_id"]
+        url = datanode["url"]
+        if not url.startswith("http"):
+            url = f"http://{url}:{datanode['port']}"
+        
+        try:
+            # Intentar leer el archivo desde este DataNode
+            response = requests.get(f"{url}/retrieve/{file_hash}", timeout=5)
+            if response.status_code == 200:
+                print(f"[DATANODE_MANAGER] Archivo encontrado en {datanode_id}")
+                discovered_replicas.append({
+                    "datanode_id": datanode_id,
+                    "url": url,
+                    "port": datanode["port"],
+                    "replica_type": "discovered",  # Tipo temporal hasta que se asigne
+                    "status": "active"
+                })
+        except Exception as e:
+            # El archivo no está en este DataNode o hay un error
+            pass
+    
+    # Si se encontraron réplicas, guardarlas en la base de datos
+    if discovered_replicas:
+        print(f"[DATANODE_MANAGER] {len(discovered_replicas)} réplicas descubiertas, guardando en base de datos...")
+        # Asignar tipos de réplica (primary, secondary, tertiary)
+        replica_types = ["primary", "secondary", "tertiary"]
+        datanode_ids = [r["datanode_id"] for r in discovered_replicas[:3]]  # Máximo 3
+        
+        if save_file_replicas(file_id, datanode_ids, node_id_db=node_id_db):
+            # Actualizar la lista con los tipos correctos
+            for i, replica in enumerate(discovered_replicas[:3]):
+                if i < len(replica_types):
+                    replica["replica_type"] = replica_types[i]
+            print(f"[DATANODE_MANAGER] Réplicas guardadas: {datanode_ids}")
+    
+    return discovered_replicas
+
+
 def get_all_replicas_for_read(file_id: int, node_id_db: str = None) -> List[Dict]:
     """
     Obtiene todas las réplicas activas de un archivo para lectura con fallback.

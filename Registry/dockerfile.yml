@@ -4,7 +4,11 @@ FROM python:3.12-slim
 WORKDIR /app
 
 COPY registry/registry.py /app/Registry/
-RUN pip install --no-cache-dir fastapi uvicorn requests
+COPY security /app/security
+# Fijar versiones de bcrypt/passlib para evitar errores de backend
+RUN pip install --no-cache-dir \
+    fastapi uvicorn requests python-jose[cryptography] \
+    passlib[bcrypt]==1.7.4 bcrypt==4.0.1
 
 EXPOSE 9000
 

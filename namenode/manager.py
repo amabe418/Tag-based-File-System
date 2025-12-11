@@ -7,15 +7,23 @@ from typing import List, Optional, Tuple, Dict
 from namenode.database import get_connection, close_connection, get_db_path, db_lock
 
 def add_file_metadata(name: str, tags: List[str], size: Optional[int] = None, 
-                     hash_value: Optional[str] = None, node_id: str = None) -> Optional[int]:
+                     hash_value: Optional[str] = None, node_id: str = None,
+                     user_id: str = None) -> Optional[int]:
     """
     Agrega metadatos de un archivo al sistema.
     NO almacena el archivo físico, solo los metadatos.
+    
+    Args:
+        user_id: ID del usuario propietario del archivo (requerido)
     
     Returns: file_id si se agregó correctamente, None en caso contrario
     """
     if not tags:
         print("[ERROR] No se pueden agregar archivos sin etiquetas.")
+        return None
+    
+    if not user_id:
+        print("[ERROR] Se requiere user_id para agregar archivos.")
         return None
     
     db_path = get_db_path(node_id)
@@ -24,17 +32,17 @@ def add_file_metadata(name: str, tags: List[str], size: Optional[int] = None,
         conn, cursor = get_connection(db_path=db_path, node_id=node_id)
         
         try:
-            # Verificar si ya existe
-            cursor.execute("SELECT id FROM files WHERE name = ?", (name,))
+            # Verificar si ya existe para este usuario
+            cursor.execute("SELECT id FROM files WHERE user_id = ? AND name = ?", (user_id, name))
             row = cursor.fetchone()
             if row:
-                print(f"[WARNING] El archivo '{name}' ya existe en la base de datos.")
+                print(f"[WARNING] El archivo '{name}' ya existe para el usuario '{user_id}'.")
                 file_id = row[0]
             else:
                 # Insertar archivo (solo metadatos)
                 cursor.execute(
-                    "INSERT INTO files (name, size, hash) VALUES (?, ?, ?)",
-                    (name, size, hash_value)
+                    "INSERT INTO files (name, size, hash, user_id) VALUES (?, ?, ?, ?)",
+                    (name, size, hash_value, user_id)
                 )
                 file_id = cursor.lastrowid
             
@@ -65,14 +73,19 @@ def add_file_metadata(name: str, tags: List[str], size: Optional[int] = None,
             close_connection(conn)
 
 
-def query_files(query_tags: Optional[List[str]] = None, node_id: str = None) -> List[Tuple[int, str, str]]:
+def query_files(query_tags: Optional[List[str]] = None, node_id: str = None,
+                user_id: str = None) -> List[Tuple[int, str, str]]:
     """
     Devuelve lista de tuplas (id, name, tags_concat) que cumplen la consulta.
     - query_tags: lista de etiquetas (AND). Si None o vacía -> devuelve todo.
+    - user_id: ID del usuario. Si None, devuelve archivos de todos los usuarios (solo admin).
     Returns: Lista de (id, name, tags)
     """
     if query_tags is None:
         query_tags = []
+    
+    if not user_id:
+        print("[WARNING] query_files llamado sin user_id. Solo admin debería hacer esto.")
     
     db_path = get_db_path(node_id)
     
@@ -81,28 +94,78 @@ def query_files(query_tags: Optional[List[str]] = None, node_id: str = None) -> 
         
         try:
             if not query_tags:
-                cursor.execute("""
-                    SELECT f.id, f.name, GROUP_CONCAT(DISTINCT t.tag) as tags
-                    FROM files f
-                    LEFT JOIN file_tags ft ON f.id = ft.file_id
-                    LEFT JOIN tags t ON ft.tag_id = t.id
-                    GROUP BY f.id
-                    ORDER BY f.id
-                """)
+                if user_id:
+                    # Incluir archivos del usuario Y archivos legacy (system o NULL) si el usuario es admin
+                    # Para usuarios normales, solo mostrar sus propios archivos
+                    if user_id == "admin":
+                        cursor.execute("""
+                            SELECT f.id, f.name, GROUP_CONCAT(DISTINCT t.tag) as tags
+                            FROM files f
+                            LEFT JOIN file_tags ft ON f.id = ft.file_id
+                            LEFT JOIN tags t ON ft.tag_id = t.id
+                            WHERE f.user_id = ? OR f.user_id = 'system' OR f.user_id IS NULL
+                            GROUP BY f.id
+                            ORDER BY f.id
+                        """, (user_id,))
+                    else:
+                        cursor.execute("""
+                            SELECT f.id, f.name, GROUP_CONCAT(DISTINCT t.tag) as tags
+                            FROM files f
+                            LEFT JOIN file_tags ft ON f.id = ft.file_id
+                            LEFT JOIN tags t ON ft.tag_id = t.id
+                            WHERE f.user_id = ?
+                            GROUP BY f.id
+                            ORDER BY f.id
+                        """, (user_id,))
+                else:
+                    cursor.execute("""
+                        SELECT f.id, f.name, GROUP_CONCAT(DISTINCT t.tag) as tags
+                        FROM files f
+                        LEFT JOIN file_tags ft ON f.id = ft.file_id
+                        LEFT JOIN tags t ON ft.tag_id = t.id
+                        GROUP BY f.id
+                        ORDER BY f.id
+                    """)
                 results = cursor.fetchall()
             else:
                 placeholders = ",".join("?" for _ in query_tags)
-                sql = f"""
-                    SELECT f.id, f.name, GROUP_CONCAT(DISTINCT t.tag) as tags
-                    FROM files f
-                    JOIN file_tags ft ON f.id = ft.file_id
-                    JOIN tags t ON ft.tag_id = t.id
-                    WHERE t.tag IN ({placeholders})
-                    GROUP BY f.id
-                    HAVING COUNT(DISTINCT t.tag) = ?
-                    ORDER BY f.id
-                """
-                cursor.execute(sql, (*query_tags, len(query_tags)))
+                if user_id:
+                    # Incluir archivos del usuario Y archivos legacy (system o NULL) si el usuario es admin
+                    if user_id == "admin":
+                        sql = f"""
+                            SELECT f.id, f.name, GROUP_CONCAT(DISTINCT t.tag) as tags
+                            FROM files f
+                            JOIN file_tags ft ON f.id = ft.file_id
+                            JOIN tags t ON ft.tag_id = t.id
+                            WHERE (f.user_id = ? OR f.user_id = 'system' OR f.user_id IS NULL) AND t.tag IN ({placeholders})
+                            GROUP BY f.id
+                            HAVING COUNT(DISTINCT t.tag) = ?
+                            ORDER BY f.id
+                        """
+                    else:
+                        sql = f"""
+                            SELECT f.id, f.name, GROUP_CONCAT(DISTINCT t.tag) as tags
+                            FROM files f
+                            JOIN file_tags ft ON f.id = ft.file_id
+                            JOIN tags t ON ft.tag_id = t.id
+                            WHERE f.user_id = ? AND t.tag IN ({placeholders})
+                            GROUP BY f.id
+                            HAVING COUNT(DISTINCT t.tag) = ?
+                            ORDER BY f.id
+                        """
+                    cursor.execute(sql, (user_id, *query_tags, len(query_tags)))
+                else:
+                    sql = f"""
+                        SELECT f.id, f.name, GROUP_CONCAT(DISTINCT t.tag) as tags
+                        FROM files f
+                        JOIN file_tags ft ON f.id = ft.file_id
+                        JOIN tags t ON ft.tag_id = t.id
+                        WHERE t.tag IN ({placeholders})
+                        GROUP BY f.id
+                        HAVING COUNT(DISTINCT t.tag) = ?
+                        ORDER BY f.id
+                    """
+                    cursor.execute(sql, (*query_tags, len(query_tags)))
                 results = cursor.fetchall()
             
             return [(row[0], row[1], row[2] or "") for row in results]
@@ -111,10 +174,11 @@ def query_files(query_tags: Optional[List[str]] = None, node_id: str = None) -> 
             close_connection(conn)
 
 
-def get_file_by_id(file_id: int, node_id: str = None) -> Optional[Dict]:
+def get_file_by_id(file_id: int, node_id: str = None, user_id: str = None) -> Optional[Dict]:
     """
     Obtiene los metadatos de un archivo por su ID.
-    Returns: Dict con {id, name, tags, size, hash} o None
+    Si se proporciona user_id, verifica que el archivo pertenezca al usuario.
+    Returns: Dict con {id, name, tags, size, hash, user_id} o None
     """
     db_path = get_db_path(node_id)
     
@@ -122,7 +186,11 @@ def get_file_by_id(file_id: int, node_id: str = None) -> Optional[Dict]:
         conn, cursor = get_connection(db_path=db_path, node_id=node_id)
         
         try:
-            cursor.execute("SELECT id, name, size, hash FROM files WHERE id = ?", (file_id,))
+            if user_id:
+                cursor.execute("SELECT id, name, size, hash, user_id FROM files WHERE id = ? AND user_id = ?", 
+                             (file_id, user_id))
+            else:
+                cursor.execute("SELECT id, name, size, hash, user_id FROM files WHERE id = ?", (file_id,))
             row = cursor.fetchone()
             if not row:
                 return None
@@ -141,13 +209,14 @@ def get_file_by_id(file_id: int, node_id: str = None) -> Optional[Dict]:
                 "name": row[1],
                 "size": row[2],
                 "hash": row[3],
+                "user_id": row[4] if len(row) > 4 else None,
                 "tags": tags
             }
         finally:
             close_connection(conn)
 
 
-def delete_file_metadata(file_id: int, node_id: str = None) -> bool:
+def delete_file_metadata(file_id: int, node_id: str = None, user_id: str = None) -> bool:
     """
     Elimina los metadatos de un archivo y el archivo físico de los DataNodes.
     Returns: True si se eliminó, False si no existía
@@ -161,7 +230,10 @@ def delete_file_metadata(file_id: int, node_id: str = None) -> bool:
     with db_lock:
         conn, cursor = get_connection(db_path=db_path, node_id=node_id)
         try:
-            cursor.execute("SELECT name, hash FROM files WHERE id = ?", (file_id,))
+            if user_id:
+                cursor.execute("SELECT name, hash FROM files WHERE id = ? AND user_id = ?", (file_id, user_id))
+            else:
+                cursor.execute("SELECT name, hash FROM files WHERE id = ?", (file_id,))
             row = cursor.fetchone()
             if not row:
                 return False
@@ -213,7 +285,7 @@ def delete_file_metadata(file_id: int, node_id: str = None) -> bool:
             close_connection(conn)
 
 
-def delete_files_by_tags(query_tags: List[str], node_id: str = None) -> bool:
+def delete_files_by_tags(query_tags: List[str], node_id: str = None, user_id: str = None) -> bool:
     """
     Elimina metadatos de archivos que cumplen la query (por etiquetas).
     Returns: True si se eliminó al menos un archivo, False si no hubo coincidencias.
@@ -222,7 +294,7 @@ def delete_files_by_tags(query_tags: List[str], node_id: str = None) -> bool:
         print("[ERROR] delete_files_by_tags requiere una query de etiquetas.")
         return False
     
-    files = query_files(query_tags, node_id=node_id)
+    files = query_files(query_tags, node_id=node_id, user_id=user_id)
     if not files:
         return False
     
@@ -231,7 +303,7 @@ def delete_files_by_tags(query_tags: List[str], node_id: str = None) -> bool:
     
     # Eliminar archivos
     for file_id, name, _ in files:
-        if delete_file_metadata(file_id, node_id=node_id):
+        if delete_file_metadata(file_id, node_id=node_id, user_id=user_id):
             deleted_count += 1
     
     # Limpiar etiquetas huérfanas después de eliminar archivos
@@ -256,7 +328,7 @@ def delete_files_by_tags(query_tags: List[str], node_id: str = None) -> bool:
     return deleted_count > 0
 
 
-def add_tags_to_files(query_tags: List[str], new_tags: List[str], node_id: str = None) -> bool:
+def add_tags_to_files(query_tags: List[str], new_tags: List[str], node_id: str = None, user_id: str = None) -> bool:
     """
     Añade etiquetas new_tags a todos los archivos que cumplen query_tags.
     Returns: True si se agregó al menos a un archivo, False si no hubo coincidencias.
@@ -299,7 +371,7 @@ def add_tags_to_files(query_tags: List[str], new_tags: List[str], node_id: str =
             close_connection(conn)
 
 
-def delete_tags_from_files(query_tags: List[str], del_tags: List[str], node_id: str = None) -> bool:
+def delete_tags_from_files(query_tags: List[str], del_tags: List[str], node_id: str = None, user_id: str = None) -> bool:
     """
     Elimina las etiquetas del_tags de los archivos que cumplen query_tags.
     No elimina etiquetas si el archivo quedaría sin ninguna.

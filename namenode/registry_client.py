@@ -10,6 +10,13 @@ import os
 import socket
 import uuid
 import random
+import sys
+from pathlib import Path
+
+# Agregar directorio raíz al path para importar security
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from security.service_auth import generate_service_token
 
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://registry:9000")
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "10"))  # segundos
@@ -72,10 +79,24 @@ class RegistryClient:
         self._last_error_time = {}
         self._error_cooldown = 60
     
+    def _get_service_token(self) -> str:
+        """Obtiene un token de servicio para autenticación"""
+        try:
+            return generate_service_token(self.server_id, "service")
+        except Exception as e:
+            print(f"[REGISTRY_CLIENT] Error generando token de servicio: {e}")
+            # Fallback: usar token pre-compartido si está disponible
+            return os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+    
     def _try_registry_request(self, method: str, endpoint: str, **kwargs) -> requests.Response:
         """Intenta hacer una petición a cualquiera de los nodos del registry disponibles"""
         urls = self.registry_urls.copy()
         random.shuffle(urls)
+        
+        # Agregar token de servicio a los headers
+        if "headers" not in kwargs:
+            kwargs["headers"] = {}
+        kwargs["headers"]["Authorization"] = f"Bearer {self._get_service_token()}"
         
         last_error = None
         successful_url = None

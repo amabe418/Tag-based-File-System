@@ -9,6 +9,13 @@ import time
 import os
 import socket
 from typing import Optional
+import sys
+from pathlib import Path
+
+# Agregar directorio raíz al path para importar security
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from security.service_auth import generate_service_token
 
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://registry:9000")
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "10"))  # segundos
@@ -116,8 +123,22 @@ class DataNodeRegistryClient:
         self._last_error_time = {}
         self._error_cooldown = 60
     
+    def _get_service_token(self) -> str:
+        """Obtiene un token de servicio para autenticación"""
+        try:
+            return generate_service_token(self.datanode_id, "service")
+        except Exception as e:
+            print(f"[REGISTRY_CLIENT] Error generando token de servicio: {e}")
+            # Fallback: usar token pre-compartido si está disponible
+            return os.getenv("DATANODE_SERVICE_TOKEN", "datanode-service-token")
+    
     def _try_registry_request(self, method: str, endpoint: str, **kwargs):
         """Intenta hacer una petición a cualquiera de los registries disponibles"""
+        # Agregar token de servicio a los headers
+        if "headers" not in kwargs:
+            kwargs["headers"] = {}
+        kwargs["headers"]["Authorization"] = f"Bearer {self._get_service_token()}"
+        
         for registry_url in self.registry_urls:
             try:
                 url = f"{registry_url}{endpoint}"
@@ -150,7 +171,8 @@ class DataNodeRegistryClient:
             from datanode.storage import get_storage_info
             storage_info = get_storage_info()
             
-            # Registrar con el MetaNameNode
+            # Registrar con el MetaNameNode (con token de servicio)
+            token = self._get_service_token()
             response = requests.post(
                 f"{self.namenode_url}/datanodes/register",
                 json={
@@ -161,6 +183,7 @@ class DataNodeRegistryClient:
                     "total_space": storage_info["total_space"],
                     "free_space": storage_info["free_space"]
                 },
+                headers={"Authorization": f"Bearer {token}"},
                 timeout=10
             )
             response.raise_for_status()
@@ -192,12 +215,15 @@ class DataNodeRegistryClient:
             from datanode.storage import get_storage_info
             storage_info = get_storage_info()
             
+            # Enviar heartbeat con token de servicio
+            token = self._get_service_token()
             response = requests.post(
                 f"{self.namenode_url}/datanodes/{self.datanode_id}/heartbeat",
                 json={
                     "free_space": storage_info["free_space"],
                     "total_space": storage_info["total_space"]
                 },
+                headers={"Authorization": f"Bearer {token}"},
                 timeout=5
             )
             response.raise_for_status()

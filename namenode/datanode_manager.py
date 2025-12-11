@@ -452,8 +452,20 @@ def discover_file_replicas(file_hash: str, file_id: int, node_id_db: str = None)
             url = f"http://{url}:{datanode['port']}"
         
         try:
+            # Obtener token de servicio para autenticación con DataNode
+            import os
+            try:
+                from security.service_auth import generate_service_token
+                service_token = generate_service_token(os.getenv("NODE_ID", "namenode-1"), "service")
+            except Exception:
+                service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+            
             # Intentar leer el archivo desde este DataNode
-            response = requests.get(f"{url}/retrieve/{file_hash}", timeout=5)
+            response = requests.get(
+                f"{url}/retrieve/{file_hash}",
+                headers={"Authorization": f"Bearer {service_token}"},
+                timeout=5
+            )
             if response.status_code == 200:
                 print(f"[DATANODE_MANAGER] Archivo encontrado en {datanode_id}")
                 discovered_replicas.append({
@@ -546,8 +558,17 @@ def delete_file_from_datanodes(file_hash: str, file_id: int, node_id_db: str = N
         
         print(f"[DATANODE_MANAGER] Eliminando de {datanode_id} ({url})...")
         try:
+            # Obtener token de servicio para autenticación con DataNode
+            import os
+            try:
+                from security.service_auth import generate_service_token
+                service_token = generate_service_token(os.getenv("NODE_ID", "namenode-1"), "service")
+            except Exception:
+                service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+            
             response = requests.delete(
                 f"{url}/delete/{file_hash}",
+                headers={"Authorization": f"Bearer {service_token}"},
                 timeout=5  # Reducido a 5 segundos para evitar cuelgues
             )
             response.raise_for_status()
@@ -622,9 +643,18 @@ def rereplicate_file(file_id: int, file_hash: str, failed_datanode_id: str,
         source_url = f"http://{source_url}:{source_replica['port']}"
     
     try:
+        # Obtener token de servicio para autenticación con DataNode
+        import os
+        try:
+            from security.service_auth import generate_service_token
+            service_token = generate_service_token(os.getenv("NODE_ID", "namenode-1"), "service")
+        except Exception:
+            service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+        
         # Leer archivo desde la réplica existente
         response = requests.get(
             f"{source_url}/retrieve/{file_hash}",
+            headers={"Authorization": f"Bearer {service_token}"},
             timeout=30
         )
         response.raise_for_status()
@@ -659,6 +689,14 @@ def rereplicate_file(file_id: int, file_hash: str, failed_datanode_id: str,
         if not new_datanode_url.startswith("http"):
             new_datanode_url = f"http://{new_datanode_url}:{new_datanode_info['port']}"
         
+        # Obtener token de servicio para autenticación con DataNode
+        import os
+        try:
+            from security.service_auth import generate_service_token
+            service_token = generate_service_token(os.getenv("NODE_ID", "namenode-1"), "service")
+        except Exception:
+            service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+        
         # Enviar archivo al nuevo DataNode
         files = {"file": ("replica", file_content)}
         data = {"file_id": file_hash}
@@ -667,6 +705,7 @@ def rereplicate_file(file_id: int, file_hash: str, failed_datanode_id: str,
             f"{new_datanode_url}/store",
             files=files,
             data=data,
+            headers={"Authorization": f"Bearer {service_token}"},
             timeout=30
         )
         response.raise_for_status()

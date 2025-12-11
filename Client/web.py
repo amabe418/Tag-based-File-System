@@ -130,9 +130,180 @@ if "server_url" not in st.session_state:
     else:
         print("⚠️ No se pudo obtener servidor del registry")
 
+# Inicializar autenticación
+if "auth_token" not in st.session_state:
+    st.session_state.auth_token = None
+if "logged_in_user" not in st.session_state:
+    st.session_state.logged_in_user = None
+
+def login(username: str, password: str):
+    """Autentica al usuario y guarda el token"""
+    server_url, _ = get_server_url()
+    if not server_url:
+        return False, "No hay servidor disponible"
+    
+    try:
+        response = requests.post(
+            f"{server_url}/auth/login",
+            json={"username": username, "password": password},
+            timeout=5
+        )
+        response.raise_for_status()
+        data = response.json()
+        st.session_state.auth_token = data.get("access_token")
+        st.session_state.logged_in_user = data.get("user", {}).get("username")
+        return True, None
+    except requests.RequestException as e:
+        return False, str(e)
+
+def get_auth_headers():
+    """Retorna los headers con el token de autenticación"""
+    if st.session_state.auth_token:
+        return {"Authorization": f"Bearer {st.session_state.auth_token}"}
+    return {}
+
 st.set_page_config(page_title="Tag-based File System", layout="wide")
 st.markdown("---")
 st.title("📂 Tag-based File System")
+
+# --- Sistema de autenticación ---
+if "auth_mode" not in st.session_state:
+    st.session_state.auth_mode = "login"  # login | signup
+
+if not st.session_state.auth_token:
+    col_login, col_signup = st.columns(2)
+    with col_login:
+        if st.button("Iniciar sesión", use_container_width=True, type="primary"):
+            st.session_state.auth_mode = "login"
+    with col_signup:
+        if st.button("Crear cuenta", use_container_width=True):
+            st.session_state.auth_mode = "signup"
+
+    if st.session_state.auth_mode == "login":
+        st.subheader("Iniciar sesión")
+        with st.form("login_form"):
+            username = st.text_input("Usuario:", key="login_username")
+            password = st.text_input("Contraseña:", type="password", key="login_password")
+            login_button = st.form_submit_button("Iniciar Sesión", use_container_width=True)
+            
+            if login_button:
+                if username and password:
+                    success, error = login(username.strip().lower(), password)
+                    if success:
+                        st.success(f"✅ Bienvenido, {st.session_state.logged_in_user}!")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Error al iniciar sesión: {error}")
+                else:
+                    st.warning("Por favor, ingresa usuario y contraseña")
+        st.info("💡 Usuario por defecto: `admin` / Contraseña: `admin`")
+
+    else:
+        st.subheader("Crear cuenta")
+        with st.form("signup_form"):
+            su_username = st.text_input("Usuario:", key="signup_username")
+            su_password = st.text_input("Contraseña:", type="password", key="signup_password")
+            su_password2 = st.text_input("Confirmar contraseña:", type="password", key="signup_password2")
+            signup_button = st.form_submit_button("Crear cuenta", use_container_width=True)
+
+            if signup_button:
+                if not su_username or not su_password or not su_password2:
+                    st.warning("Por favor, completa todos los campos")
+                elif su_password != su_password2:
+                    st.error("Las contraseñas no coinciden")
+                elif len(su_password) < 6:
+                    st.warning("La contraseña debe tener al menos 6 caracteres")
+                else:
+                    su_username = su_username.strip().lower()
+                    server_url, _ = get_server_url()
+                    if not server_url:
+                        st.error("No hay servidor disponible")
+                    else:
+                        try:
+                            resp = requests.post(
+                                f"{server_url}/auth/signup",
+                                json={"username": su_username, "password": su_password},
+                                timeout=5,
+                            )
+                            if resp.status_code == 400:
+                                st.error("El usuario ya existe, elige otro nombre de usuario.")
+                            resp.raise_for_status()
+                            data = resp.json()
+                            st.success("✅ Cuenta creada. Inicia sesión con tus credenciales.")
+                            # Limpiar campos y cambiar a login
+                            st.session_state.auth_mode = "login"
+                            st.session_state.login_username = su_username
+                            st.session_state.login_password = ""
+                            st.rerun()
+                        except requests.RequestException as e:
+                            st.error(f"Error al crear cuenta: {e}")
+    st.stop()  # Detener la ejecución hasta que se autentique
+else:
+    # Mostrar información del usuario y opciones
+    col_user, col_password, col_logout = st.columns([2, 1, 1])
+    with col_user:
+        st.info(f"👤 Usuario: **{st.session_state.logged_in_user}**")
+    with col_password:
+        if st.button("🔐 Cambiar Contraseña", use_container_width=True):
+            st.session_state.show_change_password = True
+            st.rerun()
+    with col_logout:
+        if st.button("🚪 Cerrar Sesión", use_container_width=True):
+            st.session_state.auth_token = None
+            st.session_state.logged_in_user = None
+            st.session_state.show_change_password = False
+            st.rerun()
+    
+    # Modal para cambiar contraseña
+    if st.session_state.get("show_change_password", False):
+        with st.expander("🔐 Cambiar Contraseña", expanded=True):
+            old_password = st.text_input("Contraseña actual:", type="password", key="old_password")
+            new_password = st.text_input("Nueva contraseña:", type="password", key="new_password")
+            confirm_password = st.text_input("Confirmar nueva contraseña:", type="password", key="confirm_password")
+            
+            col_change, col_cancel = st.columns([1, 1])
+            with col_change:
+                if st.button("Cambiar Contraseña", key="confirm_change_password", use_container_width=True):
+                    if not old_password or not new_password or not confirm_password:
+                        st.warning("Por favor, completa todos los campos")
+                    elif new_password != confirm_password:
+                        st.error("Las contraseñas nuevas no coinciden")
+                    elif len(new_password) < 6:
+                        st.warning("La nueva contraseña debe tener al menos 6 caracteres")
+                    else:
+                        server_url, _ = get_server_url()
+                        if not server_url:
+                            st.error("No hay servidor disponible")
+                        else:
+                            try:
+                                response = requests.post(
+                                    f"{server_url}/auth/change-password",
+                                    json={
+                                        "old_password": old_password,
+                                        "new_password": new_password
+                                    },
+                                    headers=get_auth_headers(),
+                                    timeout=5
+                                )
+                                response.raise_for_status()
+                                data = response.json()
+                                if data.get("success"):
+                                    st.success("✅ Contraseña cambiada exitosamente")
+                                    st.session_state.show_change_password = False
+                                    st.rerun()
+                                else:
+                                    st.error("Error al cambiar la contraseña")
+                            except requests.HTTPError as e:
+                                if e.response and e.response.status_code == 400:
+                                    st.error("❌ La contraseña actual es incorrecta")
+                                else:
+                                    st.error(f"Error: {e}")
+                            except requests.RequestException as e:
+                                st.error(f"Error de conexión: {e}")
+            with col_cancel:
+                if st.button("Cancelar", key="cancel_change_password", use_container_width=True):
+                    st.session_state.show_change_password = False
+                    st.rerun()
 
 # Verificar conexión con el servidor y mostrar errores en un expander
 is_connected, connection_error = check_server_connection()
@@ -169,11 +340,19 @@ def refresh_list(tags=None):
     if not server_url:
         return []
     
+    if not st.session_state.auth_token:
+        return []
+    
     try:
         params = {}
         if tags:
             params["tags"] = tags
-        response = requests.get(f"{server_url}/list", params=params)
+        response = requests.get(
+            f"{server_url}/list",
+            params=params,
+            headers=get_auth_headers(),
+            timeout=5
+        )
         response.raise_for_status()
         data = response.json()
         return data.get("files", [])
@@ -199,6 +378,7 @@ def get_file_content(file_name):
             f"{leader_url}/download/{file_name}", 
             stream=True, 
             timeout=30,
+            headers=get_auth_headers(),
             allow_redirects=True  # Seguir redirecciones HTTP 307 automáticamente
         )
         r.raise_for_status()
@@ -493,7 +673,13 @@ if st.session_state.modal == "add_file":
                                 data = {"tags": tags}
                                 try:
                                     print(f"[CLIENT] Enviando POST a {leader_url}/add con archivo: {file.name}, tags: {tags}")
-                                    response = requests.post(f"{leader_url}/add", files=files, data=data, timeout=30)
+                                    response = requests.post(
+                                        f"{leader_url}/add",
+                                        files=files,
+                                        data=data,
+                                        headers=get_auth_headers(),
+                                        timeout=30
+                                    )
                                     print(f"[CLIENT] Respuesta recibida: status={response.status_code}, body={response.text[:200]}")
                                     response.raise_for_status()
                                     result = response.json()
@@ -551,7 +737,11 @@ elif st.session_state.modal == "add_tags":
                     else:
                         params = {"query": query_tags, "new_tags": new_tags}
                         try:
-                            response = requests.post(f"{server_url}/add-tags", params=params)
+                            response = requests.post(
+                                f"{server_url}/add-tags",
+                                params=params,
+                                headers=get_auth_headers()
+                            )
                             response.raise_for_status()
                             data = response.json()
                             if data.get("success"):
@@ -584,7 +774,11 @@ elif st.session_state.modal == "del_tags":
                     else:
                         params = {"query": query_tags, "del_tags": del_tags}
                         try:
-                            response = requests.post(f"{server_url}/delete-tags", params=params)
+                            response = requests.post(
+                                f"{server_url}/delete-tags",
+                                params=params,
+                                headers=get_auth_headers()
+                            )
                             response.raise_for_status()
                             data = response.json()
                             if data.get("success"):
@@ -614,7 +808,11 @@ elif st.session_state.modal == "del_files":
                     else:
                         params = {"tags": tags}
                         try:
-                            response = requests.delete(f"{server_url}/delete", params=params)
+                            response = requests.delete(
+                                f"{server_url}/delete",
+                                params=params,
+                                headers=get_auth_headers()
+                            )
                             response.raise_for_status()
                             data = response.json()
                             if data.get("success"):

@@ -56,18 +56,60 @@ def init_db(db_path: str = None, node_id: str = None):
         name TEXT NOT NULL,
         size INTEGER,
         hash TEXT,
+        user_id TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(name)
+        UNIQUE(user_id, name)
     )
     """)
     
-    # Tabla de etiquetas (únicas)
+    # Migración: agregar user_id a files si no existe (para bases de datos existentes)
+    try:
+        cursor.execute("ALTER TABLE files ADD COLUMN user_id TEXT")
+        cursor.execute("UPDATE files SET user_id = 'system' WHERE user_id IS NULL")
+        # Recrear índice único con user_id
+        cursor.execute("DROP INDEX IF EXISTS idx_files_user_name")
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_user_name ON files(user_id, name)")
+    except sqlite3.OperationalError:
+        # La columna ya existe o el índice ya existe, continuar
+        pass
+    
+    # Migración: inicializar usuario admin si no existe
+    try:
+        from passlib.context import CryptContext
+        pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+        admin_password_hash = pwd_context.hash("admin")
+        
+        cursor.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("""
+                INSERT INTO users (username, password_hash, role, is_active)
+                VALUES (?, ?, ?, ?)
+            """, ("admin", admin_password_hash, "ADMIN", 1))
+            print("[DATABASE] Usuario admin creado con contraseña 'admin'")
+    except Exception as e:
+        # Si falla (por ejemplo, passlib no disponible), continuar
+        print(f"[DATABASE] No se pudo crear usuario admin: {e}")
+        pass
+    
+    # Tabla de etiquetas (pueden ser globales o por usuario)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS tags (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tag TEXT UNIQUE NOT NULL
+            tag TEXT NOT NULL,
+            user_id TEXT,  -- NULL para tags globales, username para tags privadas
+            UNIQUE(user_id, tag)
         )
     """)
+    
+    # Migración: agregar user_id a tags si no existe
+    try:
+        cursor.execute("ALTER TABLE tags ADD COLUMN user_id TEXT")
+        # Actualizar índice único
+        cursor.execute("DROP INDEX IF EXISTS idx_tags_user_tag")
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_user_tag ON tags(user_id, tag)")
+    except sqlite3.OperationalError:
+        # La columna ya existe o el índice ya existe, continuar
+        pass
     
     # Tabla intermedia archivo-etiqueta
     cursor.execute("""
@@ -107,6 +149,24 @@ def init_db(db_path: str = None, node_id: str = None):
         )
     """)
     
+    # Tabla de usuarios (autenticación)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP,
+            email TEXT
+        )
+    """)
+    
+    # Índices para mejorar rendimiento
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_user_id ON files(user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tags_user_id ON tags(user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+    
     conn.commit()
     conn.close()
     print(f"[DATABASE] Base de datos inicializada: {db_path}")
@@ -136,11 +196,13 @@ def reset_db(db_path: str = None, node_id: str = None) -> None:
     cursor.execute("DROP TABLE IF EXISTS file_tags")
     cursor.execute("DROP TABLE IF EXISTS tags")
     cursor.execute("DROP TABLE IF EXISTS files")
+    cursor.execute("DROP TABLE IF EXISTS datanodes")
+    cursor.execute("DROP TABLE IF EXISTS users")
     conn.commit()
     conn.close()
     
     # Recrear las tablas vacías
-    init_db(db_path=db_path)
+    init_db(db_path=db_path, node_id=node_id)
     
     print(f"[DATABASE] Base de datos reiniciada: {db_path}")
 

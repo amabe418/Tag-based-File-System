@@ -2,12 +2,20 @@
 DataNode - Servicio de almacenamiento distribuido
 Almacena archivos físicos y se registra con el MetaNameNode
 """
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Header
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 import os
 from contextlib import asynccontextmanager
+import sys
+from pathlib import Path
+
+# Agregar directorio raíz al path para importar security
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from security.service_auth import verify_service_token, validate_service_request
+from security.rate_limit import RateLimitMiddleware
 
 from datanode.storage import (
     store_file, retrieve_file, delete_file, file_exists, get_storage_info
@@ -53,6 +61,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Configurar rate limiting
+app.add_middleware(RateLimitMiddleware, max_requests=100, time_window=60)
+
 
 @app.get("/")
 def root():
@@ -80,17 +91,36 @@ def health():
 
 
 @app.post("/store")
-async def store(file_id: str = Form(...), file: UploadFile = File(...)):
+async def store(
+    file_id: str = Form(...),
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
     """
     Almacena un archivo en el DataNode.
+    Requiere token de servicio del MetaNameNode.
     
     Args:
         file_id: Identificador único del archivo (hash)
         file: Archivo a almacenar
+        authorization: Token de servicio
     
     Returns:
         Confirmación de almacenamiento
     """
+    # Verificar autenticación de servicio (solo MetaNameNode puede almacenar)
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene del MetaNameNode
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not service_id.startswith("namenode-"):
+        raise HTTPException(status_code=403, detail="Solo MetaNameNode puede almacenar archivos")
     print(f"[DATANODE] POST /store recibido: file_id={file_id}, filename={file.filename}")
     
     # Validar que file_id no esté vacío
@@ -135,16 +165,34 @@ async def store(file_id: str = Form(...), file: UploadFile = File(...)):
 
 
 @app.get("/retrieve/{file_id}")
-def retrieve(file_id: str):
+def retrieve(
+    file_id: str,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
     """
     Recupera un archivo del DataNode.
+    Requiere token de servicio del MetaNameNode.
     
     Args:
         file_id: Identificador único del archivo (hash)
+        authorization: Token de servicio
     
     Returns:
         Contenido del archivo
     """
+    # Verificar autenticación de servicio (solo MetaNameNode puede leer)
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene del MetaNameNode
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not service_id.startswith("namenode-"):
+        raise HTTPException(status_code=403, detail="Solo MetaNameNode puede leer archivos")
     print(f"[DATANODE] GET /retrieve/{file_id}")
     
     file_content = retrieve_file(file_id)
@@ -164,16 +212,35 @@ def retrieve(file_id: str):
 
 
 @app.delete("/delete/{file_id}")
-def delete(file_id: str):
+def delete(
+    file_id: str,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
     """
     Elimina un archivo del DataNode.
+    Requiere token de servicio del MetaNameNode.
     
     Args:
         file_id: Identificador único del archivo (hash)
+        authorization: Token de servicio
     
     Returns:
         Confirmación de eliminación
     """
+    # Verificar autenticación de servicio (solo MetaNameNode puede eliminar)
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene del MetaNameNode
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not service_id.startswith("namenode-"):
+        raise HTTPException(status_code=403, detail="Solo MetaNameNode puede eliminar archivos")
+    
     print(f"[DATANODE] DELETE /delete/{file_id}")
     
     if not file_exists(file_id):

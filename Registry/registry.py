@@ -2,7 +2,8 @@
 Registry Service - Servicio de descubrimiento distribuido con 3 nodos
 Mantiene registro de todos los servidores de datos activos con replicación
 """
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 import time
@@ -11,6 +12,14 @@ from datetime import datetime
 import os
 import requests
 from contextlib import asynccontextmanager
+import sys
+from pathlib import Path
+
+# Agregar directorio raíz al path para importar security
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from security.service_auth import verify_service_token, validate_service_request
+from security.rate_limit import RateLimitMiddleware
 
 app = FastAPI(title="TBFS Registry Service (Distributed)")
 
@@ -123,6 +132,13 @@ def replicate_to_peers(servers_data: Dict, term: int):
     if not peers:
         return True
     
+    # Obtener token de servicio para autenticación
+    try:
+        from security.service_auth import generate_service_token
+        service_token = generate_service_token(leader_id, "service")
+    except Exception:
+        service_token = os.getenv("REGISTRY_SERVICE_TOKEN", "registry-service-token")
+    
     success_count = 0
     for peer in peers:
         try:
@@ -134,6 +150,7 @@ def replicate_to_peers(servers_data: Dict, term: int):
                     "term": term,
                     "leader_id": leader_id
                 },
+                headers={"Authorization": f"Bearer {service_token}"},
                 timeout=3
             )
             if response.status_code == 200:
@@ -168,6 +185,13 @@ def request_vote(candidate_id: str, term: int) -> bool:
     if not peers:
         return True
     
+    # Obtener token de servicio para autenticación
+    try:
+        from security.service_auth import generate_service_token
+        service_token = generate_service_token(candidate_id, "service")
+    except Exception:
+        service_token = os.getenv("REGISTRY_SERVICE_TOKEN", "registry-service-token")
+    
     votes = 1  # Voto propio
     successful_contacts = 1  # Contamos este nodo
     
@@ -177,6 +201,7 @@ def request_vote(candidate_id: str, term: int) -> bool:
             response = requests.post(
                 f"{peer_url}/internal/vote",
                 json={"candidate_id": candidate_id, "term": term},
+                headers={"Authorization": f"Bearer {service_token}"},
                 timeout=2
             )
             if response.status_code == 200:
@@ -413,6 +438,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="TBFS Registry Service (Distributed)", lifespan=lifespan)
 
+# Configurar CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configurar rate limiting
+app.add_middleware(RateLimitMiddleware, max_requests=100, time_window=60)
+
 
 @app.get("/")
 def root():
@@ -468,8 +505,18 @@ def root():
 
 
 @app.post("/register")
-def register_server(registration: ServerRegistration):
-    """Registra un nuevo servidor de datos (solo el líder)"""
+def register_server(
+    registration: ServerRegistration,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """Registra un nuevo servidor de datos (requiere token de servicio)"""
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    if not validate_service_request(registration.server_id, token):
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
     leader_url = get_leader_url()
     if leader_url:
         # Redirigir al líder
@@ -539,8 +586,18 @@ def register_server(registration: ServerRegistration):
 
 
 @app.post("/heartbeat")
-def receive_heartbeat(heartbeat: Heartbeat):
-    """Recibe heartbeat de un servidor (solo el líder)"""
+def receive_heartbeat(
+    heartbeat: Heartbeat,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """Recibe heartbeat de un servidor (requiere token de servicio)"""
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    if not validate_service_request(heartbeat.server_id, token):
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
     leader_url = get_leader_url()
     if leader_url:
         try:
@@ -638,8 +695,24 @@ def get_server(server_id: str):
 # Endpoints internos para replicación y elección
 
 @app.post("/internal/replicate")
-def internal_replicate(data: ReplicationData):
-    """Endpoint interno para recibir replicación del líder"""
+def internal_replicate(
+    data: ReplicationData,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """Endpoint interno para recibir replicación del líder (requiere token de servicio)"""
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene de otro registry
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not service_id.startswith("registry-"):
+        raise HTTPException(status_code=403, detail="Solo registries pueden replicar")
     try:
         with cluster_lock:
             current_term = cluster_state["term"]
@@ -682,8 +755,24 @@ def internal_replicate(data: ReplicationData):
 
 
 @app.post("/internal/vote")
-def internal_vote(request: VoteRequest):
-    """Endpoint interno para votar en elecciones"""
+def internal_vote(
+    request: VoteRequest,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """Endpoint interno para votar en elecciones (requiere token de servicio)"""
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene de otro registry
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not service_id.startswith("registry-"):
+        raise HTTPException(status_code=403, detail="Solo registries pueden votar")
     with cluster_lock:
         # Votar si el término es mayor o igual
         if request.term > cluster_state["term"]:

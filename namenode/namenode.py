@@ -3,20 +3,93 @@ MetaNameNode - Servicio distribuido con 3 réplicas
 Mantiene metadatos de archivos (nombres y etiquetas) con replicación Raft-like
 Los archivos físicos se almacenan en DataNodes, no aquí.
 """
-from fastapi import FastAPI, HTTPException, Query, UploadFile, Form
+from fastapi import FastAPI, HTTPException, Query, UploadFile, Form, Depends, Header
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import requests
 from contextlib import asynccontextmanager
 import json
 import sqlite3
 import hashlib
+import sys
+from pathlib import Path
+
+# Agregar directorio raíz al path para importar security
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Importar modelos primero (necesarios para los tipos)
+from security.models import (
+    User,
+    Role,
+    Permission,
+    UserLogin,
+    UserCreate,
+    TokenResponse,
+    PasswordChange,
+    UserSignup,
+)
+
+from security.auth import (
+    create_access_token,
+    verify_token,
+    get_current_user as _get_current_user_base,
+    get_current_service,
+    require_role as _require_role_base,
+    require_permission as _require_permission_base,
+    authenticate_user,
+    create_user,
+    get_user,
+    change_password
+)
+from security.service_auth import (
+    verify_service_token,
+    validate_service_request,
+    generate_service_token
+)
+from security.rate_limit import RateLimitMiddleware
+
+# NODE_ID se define más abajo, así que usaremos una función que lo obtiene dinámicamente
+def _get_node_id() -> str:
+    """Obtiene el NODE_ID del namenode"""
+    return os.getenv("NODE_ID", "namenode-1")
+
+# Wrapper para get_current_user que usa el node_id del namenode
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())
+) -> User:
+    """Wrapper que obtiene el usuario actual usando el node_id del namenode"""
+    return await _get_current_user_base(credentials, node_id=_get_node_id())
+
+# Wrapper para require_role que usa el node_id del namenode
+def require_role(allowed_roles: List[Role]):
+    """Wrapper para require_role que usa el node_id del namenode"""
+    async def role_checker(current_user: User = Depends(get_current_user)) -> User:
+        if current_user.role not in allowed_roles:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Se requiere uno de los roles: {[r.value for r in allowed_roles]}"
+            )
+        return current_user
+    return role_checker
+
+# Wrapper para require_permission que usa el node_id del namenode
+def require_permission(permission: Permission):
+    """Wrapper para require_permission que usa el node_id del namenode"""
+    async def permission_checker(current_user: User = Depends(get_current_user)) -> User:
+        if not current_user.has_permission(permission):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Se requiere el permiso: {permission.value}"
+            )
+        return current_user
+    return permission_checker
 
 from namenode.database import init_db, get_db_path, get_connection, close_connection, db_lock
 from namenode.manager import (
@@ -42,6 +115,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Configurar rate limiting (100 peticiones por minuto por IP/usuario)
+app.add_middleware(RateLimitMiddleware, max_requests=100, time_window=60)
 
 # Estado del cluster
 cluster_state = {
@@ -151,6 +227,12 @@ def replicate_to_peers(operation: OperationLog):
     if not peers:
         return True
     
+    # Obtener token de servicio para autenticación
+    try:
+        service_token = generate_service_token(cluster_state["node_id"], "service")
+    except Exception:
+        service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+    
     success_count = 0
     for peer in peers:
         try:
@@ -163,6 +245,7 @@ def replicate_to_peers(operation: OperationLog):
                     "term": operation.term,
                     "timestamp": operation.timestamp
                 },
+                headers={"Authorization": f"Bearer {service_token}"},
                 timeout=3
             )
             if response.status_code == 200:
@@ -189,6 +272,12 @@ def request_vote(candidate_id: str, term: int) -> bool:
     if not peers:
         return True
     
+    # Obtener token de servicio para autenticación
+    try:
+        service_token = generate_service_token(candidate_id, "service")
+    except Exception:
+        service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+    
     votes = 1  # Voto propio
     successful_contacts = 1
     
@@ -198,6 +287,7 @@ def request_vote(candidate_id: str, term: int) -> bool:
             response = requests.post(
                 f"{peer_url}/internal/vote",
                 json={"candidate_id": candidate_id, "term": term},
+                headers={"Authorization": f"Bearer {service_token}"},
                 timeout=2
             )
             if response.status_code == 200:
@@ -276,12 +366,19 @@ def leader_heartbeat_loop():
             leader_id = cluster_state["node_id"]
             peers = cluster_state["peers"].copy()
         
+        # Obtener token de servicio para autenticación
+        try:
+            service_token = generate_service_token(leader_id, "service")
+        except Exception:
+            service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+        
         for peer in peers:
             try:
                 peer_url = get_peer_url(peer)
                 requests.post(
                     f"{peer_url}/internal/heartbeat",
                     json={"term": term, "leader_id": leader_id},
+                    headers={"Authorization": f"Bearer {service_token}"},
                     timeout=2
                 )
             except Exception as e:
@@ -357,7 +454,12 @@ async def lifespan(app: FastAPI):
     print(f"[NAMENODE] Peers: {cluster_state['peers']}")
     
     # Inicializar base de datos
-    init_db(node_id=NODE_ID)
+    # Inicializar base de datos (incluye tabla de usuarios)
+    init_db(node_id=cluster_state["node_id"])
+    
+    # Asegurar que el usuario admin existe
+    from security.auth import init_users_db
+    init_users_db(node_id=cluster_state["node_id"])
     
     # Iniciar registro en el registry
     registry_client.start()
@@ -435,7 +537,7 @@ app = FastAPI(title="TBFS MetaNameNode (Distributed)", lifespan=lifespan)
 
 @app.get("/")
 def root():
-    """Endpoint de estado del MetaNameNode"""
+    """Endpoint de estado del MetaNameNode (público, sin autenticación)"""
     with cluster_lock:
         cluster_data = {
             "node_id": cluster_state["node_id"],
@@ -480,6 +582,172 @@ def root():
     }
 
 
+# ========== ENDPOINTS DE AUTENTICACIÓN ==========
+
+@app.post("/auth/login", response_model=TokenResponse)
+def login(credentials: UserLogin):
+    """Endpoint de login para obtener token JWT - verifica usuario y contraseña en la base de datos"""
+    user = authenticate_user(credentials.username, credentials.password, node_id=_get_node_id())
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Credenciales inválidas"
+        )
+    
+    access_token = create_access_token(
+        data={"sub": user.username, "role": user.role.value}
+    )
+    
+    return TokenResponse(
+        access_token=access_token,
+        token_type="bearer",
+        expires_in=3600,  # 1 hora
+        user={
+            "username": user.username,
+            "role": user.role.value,
+            "is_active": user.is_active
+        }
+    )
+
+
+@app.post("/auth/register")
+def register(user_data: UserCreate, current_user: User = Depends(require_role([Role.ADMIN]))):
+    """Endpoint para registrar nuevos usuarios (solo admin) - crea usuario en la base de datos del namenode"""
+    try:
+        new_user = create_user(user_data, node_id=_get_node_id())
+        return {
+            "success": True,
+            "message": f"Usuario {new_user.username} creado exitosamente",
+            "user": {
+                "username": new_user.username,
+                "role": new_user.role.value
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/auth/signup", response_model=TokenResponse)
+def signup(user_data: UserSignup):
+    """
+    Registro de usuario sin autenticación.
+    - Fuerza rol USER.
+    - Rechaza si el usuario ya existe.
+    - Devuelve token JWT para inicio de sesión inmediato.
+    """
+    try:
+        # Forzar rol USER
+        user_create = UserCreate(username=user_data.username, password=user_data.password, role=Role.USER)
+        new_user = create_user(user_create, node_id=_get_node_id())
+        # Emitir token
+        access_token = create_access_token(
+            data={"sub": new_user.username, "role": new_user.role.value}
+        )
+        return TokenResponse(
+            access_token=access_token,
+            token_type="bearer",
+            expires_in=3600,
+            user={
+                "username": new_user.username,
+                "role": new_user.role.value,
+                "is_active": new_user.is_active
+            }
+        )
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/auth/me")
+def get_current_user_info(current_user: User = Depends(get_current_user)):
+    """Obtiene información del usuario actual"""
+    return {
+        "username": current_user.username,
+        "role": current_user.role.value,
+        "is_active": current_user.is_active,
+        "created_at": current_user.created_at
+    }
+
+
+@app.post("/auth/change-password")
+def change_user_password(
+    password_data: PasswordChange,
+    current_user: User = Depends(get_current_user),
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """
+    Cambia la contraseña del usuario actual.
+    Requiere autenticación y verifica la contraseña antigua.
+    Si este nodo es el líder, replica el cambio a otros namenodes.
+    """
+    node_id = _get_node_id()
+    
+    # Solo el líder puede cambiar contraseñas (para evitar inconsistencias)
+    leader_url = get_leader_url()
+    if leader_url:
+        # Redirigir al líder con el token de autenticación
+        try:
+            headers = {}
+            if authorization:
+                headers["Authorization"] = authorization
+            response = requests.post(
+                f"{leader_url}/auth/change-password",
+                json=password_data.dict(),
+                headers=headers,
+                timeout=5
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    # Cambiar contraseña en el líder
+    success = change_password(
+        username=current_user.username,
+        old_password=password_data.old_password,
+        new_password=password_data.new_password,
+        node_id=node_id
+    )
+    
+    if not success:
+        raise HTTPException(
+            status_code=400,
+            detail="La contraseña antigua es incorrecta"
+        )
+    
+    # Obtener el nuevo hash de contraseña después del cambio
+    updated_user = get_user(current_user.username, node_id)
+    if not updated_user:
+        raise HTTPException(status_code=500, detail="Error al verificar el cambio de contraseña")
+    
+    # Replicar cambio de contraseña a otros namenodes
+    operation = OperationLog(
+        operation="change_password",
+        data={
+            "username": current_user.username,
+            "new_password_hash": updated_user.password_hash
+        },
+        term=cluster_state["term"],
+        timestamp=time.time()
+    )
+    
+    with log_lock:
+        operation_log.append(operation)
+    
+    replicate_to_peers(operation)
+    
+    return {
+        "success": True,
+        "message": "Contraseña cambiada exitosamente"
+    }
+
+
 # ========== ENDPOINTS DE GESTIÓN DE DATANODES ==========
 
 class DataNodeRegistration(BaseModel):
@@ -497,11 +765,21 @@ class DataNodeHeartbeat(BaseModel):
 
 
 @app.post("/datanodes/register")
-def register_datanode_endpoint(registration: DataNodeRegistration):
+def register_datanode_endpoint(
+    registration: DataNodeRegistration,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
     """
     Registra un nuevo DataNode o actualiza uno existente.
-    Solo el líder puede registrar DataNodes.
+    Requiere token de servicio para autenticación.
     """
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    if not validate_service_request(registration.node_id, token):
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
     leader_url = get_leader_url()
     if leader_url:
         try:
@@ -557,11 +835,22 @@ def get_datanode_endpoint(node_id: str):
 
 
 @app.post("/datanodes/{node_id}/heartbeat")
-def datanode_heartbeat_endpoint(node_id: str, heartbeat: DataNodeHeartbeat):
+def datanode_heartbeat_endpoint(
+    node_id: str,
+    heartbeat: DataNodeHeartbeat,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
     """
     Recibe un heartbeat de un DataNode.
-    Solo el líder procesa heartbeats.
+    Requiere token de servicio para autenticación.
     """
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    if not validate_service_request(node_id, token):
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
     leader_url = get_leader_url()
     if leader_url:
         try:
@@ -593,10 +882,13 @@ def datanode_heartbeat_endpoint(node_id: str, heartbeat: DataNodeHeartbeat):
 
 
 @app.post("/datanodes/{node_id}/drain")
-def drain_datanode_endpoint(node_id: str):
+def drain_datanode_endpoint(
+    node_id: str,
+    current_user: User = Depends(require_permission(Permission.MANAGE_DATANODES))
+):
     """
     Inicia el drenaje de un DataNode: re-replica todos sus archivos y evita nuevas asignaciones.
-    Solo el líder puede ejecutar esta operación.
+    Requiere permiso de administración de DataNodes.
     """
     leader_url = get_leader_url()
     if leader_url:
@@ -627,10 +919,13 @@ def drain_datanode_endpoint(node_id: str):
 
 
 @app.post("/datanodes/{node_id}/undrain")
-def undrain_datanode_endpoint(node_id: str):
+def undrain_datanode_endpoint(
+    node_id: str,
+    current_user: User = Depends(require_permission(Permission.MANAGE_DATANODES))
+):
     """
     Desmarca un DataNode del proceso de drenaje, permitiendo nuevas asignaciones.
-    Solo el líder puede ejecutar esta operación.
+    Requiere permiso de administración de DataNodes.
     """
     leader_url = get_leader_url()
     if leader_url:
@@ -877,7 +1172,11 @@ def undrain_datanode_endpoint(node_id: str):
 # ========== ENDPOINTS DE COMPATIBILIDAD (formato antiguo del cliente) ==========
 
 @app.post("/add")
-async def add_file_compat(file: UploadFile, tags: str = Form(...)):
+async def add_file_compat(
+    file: UploadFile,
+    tags: str = Form(...),
+    current_user: User = Depends(require_permission(Permission.WRITE_FILES))
+):
     """
     Endpoint de compatibilidad: recibe archivo y guarda solo metadatos.
     NOTA: El archivo físico no se almacena aquí (se enviará a DataNodes en el futuro).
@@ -926,13 +1225,14 @@ async def add_file_compat(file: UploadFile, tags: str = Form(...)):
     
     print(f"[NAMENODE] Agregando metadatos: name={file.filename}, tags={tag_list}, hash={hash_value[:16]}...")
     
-    # Agregar metadatos primero
+    # Agregar metadatos primero (asociado al usuario actual)
     file_id = add_file_metadata(
         name=file.filename,
         tags=tag_list,
         size=file_size,
         hash_value=hash_value,
-        node_id=NODE_ID
+        node_id=NODE_ID,
+        user_id=current_user.username
     )
     
     if not file_id:
@@ -1011,6 +1311,12 @@ async def add_file_compat(file: UploadFile, tags: str = Form(...)):
                 continue  # Ya se guardó exitosamente
             
             try:
+                # Obtener token de servicio para autenticación con DataNode
+                try:
+                    service_token = generate_service_token(cluster_state["node_id"], "service")
+                except Exception:
+                    service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+                
                 files = {"file": (file.filename, file_content)}
                 data = {"file_id": file_hash}
                 
@@ -1018,6 +1324,7 @@ async def add_file_compat(file: UploadFile, tags: str = Form(...)):
                     f"{dn_url}/store",
                     files=files,
                     data=data,
+                    headers={"Authorization": f"Bearer {service_token}"},
                     timeout=30
                 )
                 response.raise_for_status()
@@ -1040,7 +1347,17 @@ async def add_file_compat(file: UploadFile, tags: str = Form(...)):
                 if not url.startswith("http"):
                     url = f"http://{url}:{dn_info['port']}"
                 try:
-                    requests.delete(f"{url}/delete/{file_hash}", timeout=10)
+                    # Obtener token de servicio para autenticación con DataNode
+                    try:
+                        service_token = generate_service_token(cluster_state["node_id"], "service")
+                    except Exception:
+                        service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+                    
+                    requests.delete(
+                        f"{url}/delete/{file_hash}",
+                        headers={"Authorization": f"Bearer {service_token}"},
+                        timeout=10
+                    )
                 except:
                     pass
         delete_file_metadata(file_id, node_id=NODE_ID)
@@ -1063,7 +1380,8 @@ async def add_file_compat(file: UploadFile, tags: str = Form(...)):
             "tags": tag_list,
             "size": file_size,
             "hash": hash_value,
-            "datanode_ids": datanode_ids
+            "datanode_ids": datanode_ids,
+            "user_id": current_user.username  # Incluir user_id en replicación
         },
         term=cluster_state["term"],
         timestamp=time.time()
@@ -1086,9 +1404,12 @@ async def add_file_compat(file: UploadFile, tags: str = Form(...)):
 
 
 @app.get("/list")
-def list_files_compat(tags: Optional[List[str]] = Query(None)):
-    """Endpoint de compatibilidad: lista archivos (cualquier nodo puede responder)"""
-    files = query_files(query_tags=tags, node_id=NODE_ID)
+def list_files_compat(
+    tags: Optional[List[str]] = Query(None),
+    current_user: User = Depends(require_permission(Permission.READ_FILES))
+):
+    """Endpoint de compatibilidad: lista archivos del usuario actual (requiere autenticación)"""
+    files = query_files(query_tags=tags, node_id=NODE_ID, user_id=current_user.username)
     formatted = [
         {"id": fid, "name": name, "tags": tags, "path": ""}
         for fid, name, tags in files
@@ -1097,8 +1418,11 @@ def list_files_compat(tags: Optional[List[str]] = Query(None)):
 
 
 @app.delete("/delete")
-def delete_files_compat(tags: str = Query(...)):
-    """Endpoint de compatibilidad: elimina archivos por tags (solo el líder)"""
+def delete_files_compat(
+    tags: str = Query(...),
+    current_user: User = Depends(require_permission(Permission.DELETE_FILES))
+):
+    """Endpoint de compatibilidad: elimina archivos por tags (requiere autenticación y permiso)"""
     leader_url = get_leader_url()
     if leader_url:
         try:
@@ -1111,12 +1435,12 @@ def delete_files_compat(tags: str = Query(...)):
         raise HTTPException(status_code=503, detail="No hay líder disponible")
     
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
-    deleted = delete_files_by_tags(tag_list, node_id=NODE_ID)
+    deleted = delete_files_by_tags(tag_list, node_id=NODE_ID, user_id=current_user.username)
     
     if deleted:
         operation = OperationLog(
             operation="delete_files_by_tags",
-            data={"tags": tag_list},
+            data={"tags": tag_list, "user_id": current_user.username},
             term=cluster_state["term"],
             timestamp=time.time()
         )
@@ -1131,8 +1455,12 @@ def delete_files_compat(tags: str = Query(...)):
 
 
 @app.post("/add-tags")
-def add_tags_compat(query: str = Query(...), new_tags: str = Query(...)):
-    """Endpoint de compatibilidad: agrega etiquetas (solo el líder)"""
+def add_tags_compat(
+    query: str = Query(...),
+    new_tags: str = Query(...),
+    current_user: User = Depends(require_permission(Permission.MANAGE_TAGS))
+):
+    """Endpoint de compatibilidad: agrega etiquetas (requiere autenticación y permiso)"""
     leader_url = get_leader_url()
     if leader_url:
         try:
@@ -1151,12 +1479,12 @@ def add_tags_compat(query: str = Query(...), new_tags: str = Query(...)):
     query_tags = [t.strip() for t in query.split(",") if t.strip()]
     new_tags_list = [t.strip() for t in new_tags.split(",") if t.strip()]
     
-    ok = add_tags_to_files(query_tags, new_tags_list, node_id=NODE_ID)
+    ok = add_tags_to_files(query_tags, new_tags_list, node_id=NODE_ID, user_id=current_user.username)
     
     if ok:
         operation = OperationLog(
             operation="add_tags",
-            data={"query_tags": query_tags, "new_tags": new_tags_list},
+            data={"query_tags": query_tags, "new_tags": new_tags_list, "user_id": current_user.username},
             term=cluster_state["term"],
             timestamp=time.time()
         )
@@ -1168,8 +1496,12 @@ def add_tags_compat(query: str = Query(...), new_tags: str = Query(...)):
 
 
 @app.post("/delete-tags")
-def delete_tags_compat(query: str = Query(...), del_tags: str = Query(...)):
-    """Endpoint de compatibilidad: elimina etiquetas (solo el líder)"""
+def delete_tags_compat(
+    query: str = Query(...),
+    del_tags: str = Query(...),
+    current_user: User = Depends(require_permission(Permission.MANAGE_TAGS))
+):
+    """Endpoint de compatibilidad: elimina etiquetas (requiere autenticación y permiso)"""
     leader_url = get_leader_url()
     if leader_url:
         try:
@@ -1188,12 +1520,12 @@ def delete_tags_compat(query: str = Query(...), del_tags: str = Query(...)):
     query_tags = [t.strip() for t in query.split(",") if t.strip()]
     del_tags_list = [t.strip() for t in del_tags.split(",") if t.strip()]
     
-    ok = delete_tags_from_files(query_tags, del_tags_list, node_id=NODE_ID)
+    ok = delete_tags_from_files(query_tags, del_tags_list, node_id=NODE_ID, user_id=current_user.username)
     
     if ok:
         operation = OperationLog(
             operation="delete_tags",
-            data={"query_tags": query_tags, "del_tags": del_tags_list},
+            data={"query_tags": query_tags, "del_tags": del_tags_list, "user_id": current_user.username},
             term=cluster_state["term"],
             timestamp=time.time()
         )
@@ -1205,7 +1537,10 @@ def delete_tags_compat(query: str = Query(...), del_tags: str = Query(...)):
 
 
 @app.get("/download/{file_name}")
-def download_file_compat(file_name: str):
+def download_file_compat(
+    file_name: str,
+    current_user: User = Depends(require_permission(Permission.READ_FILES))
+):
     """
     Endpoint de compatibilidad: descarga de archivo desde DataNodes.
     Busca el archivo por nombre, obtiene sus réplicas y descarga desde un DataNode disponible.
@@ -1227,15 +1562,15 @@ def download_file_compat(file_name: str):
             print(f"[NAMENODE] ERROR: No hay líder disponible para redirigir")
             raise HTTPException(status_code=503, detail="No hay líder disponible")
     
-    # Buscar archivo por nombre en metadatos
-    files = query_files(query_tags=None, node_id=NODE_ID)
+    # Buscar archivo por nombre en metadatos (solo del usuario actual)
+    files = query_files(query_tags=None, node_id=NODE_ID, user_id=current_user.username)
     file_data = None
     file_id = None
     file_hash = None
     
     for fid, name, _ in files:
         if name == file_name:
-            file_data = get_file_by_id(fid, node_id=NODE_ID)
+            file_data = get_file_by_id(fid, node_id=NODE_ID, user_id=current_user.username)
             if file_data:
                 file_id = fid
                 # Extraer hash del formato "sha256:hash"
@@ -1277,9 +1612,16 @@ def download_file_compat(file_name: str):
         replica_type = replica["replica_type"]
         
         try:
+            # Obtener token de servicio para autenticación con DataNode
+            try:
+                service_token = generate_service_token(cluster_state["node_id"], "service")
+            except Exception:
+                service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+            
             print(f"[NAMENODE] Intentando leer desde {replica['datanode_id']} ({replica_type})...")
             response = requests.get(
                 f"{datanode_url}/retrieve/{file_hash}",
+                headers={"Authorization": f"Bearer {service_token}"},
                 timeout=30
             )
             response.raise_for_status()
@@ -1315,8 +1657,24 @@ def download_file_compat(file_name: str):
 # ========== ENDPOINTS INTERNOS PARA REPLICACIÓN ==========
 
 @app.post("/internal/replicate")
-def internal_replicate(data: Dict):
-    """Endpoint interno para recibir replicación del líder"""
+def internal_replicate(
+    data: Dict,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """Endpoint interno para recibir replicación del líder (requiere token de servicio)"""
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene de otro namenode
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not service_id.startswith("namenode-"):
+        raise HTTPException(status_code=403, detail="Solo namenodes pueden replicar")
     try:
         operation = data.get("operation")
         operation_data = data.get("data")
@@ -1340,7 +1698,8 @@ def internal_replicate(data: Dict):
                 tags=operation_data["tags"],
                 size=operation_data.get("size"),
                 hash_value=operation_data.get("hash"),
-                node_id=NODE_ID
+                node_id=NODE_ID,
+                user_id=operation_data.get("user_id", "system")  # Para replicación
             )
             # También guardar las réplicas si están en los datos de la operación
             if file_id and "datanode_ids" in operation_data:
@@ -1352,19 +1711,41 @@ def internal_replicate(data: Dict):
         elif operation == "delete_file":
             delete_file_metadata(operation_data["file_id"], node_id=NODE_ID)
         elif operation == "delete_files_by_tags":
-            delete_files_by_tags(operation_data["tags"], node_id=NODE_ID)
+            delete_files_by_tags(operation_data["tags"], node_id=NODE_ID, 
+                                user_id=operation_data.get("user_id", "system"))
         elif operation == "add_tags":
             add_tags_to_files(
                 operation_data["query_tags"],
                 operation_data["new_tags"],
-                node_id=NODE_ID
+                node_id=NODE_ID,
+                user_id=operation_data.get("user_id", "system")
             )
         elif operation == "delete_tags":
             delete_tags_from_files(
                 operation_data["query_tags"],
                 operation_data["del_tags"],
-                node_id=NODE_ID
+                node_id=NODE_ID,
+                user_id=operation_data.get("user_id", "system")
             )
+        elif operation == "change_password":
+            # Replicar cambio de contraseña
+            from security.auth import get_users_db_path
+            db_path = get_users_db_path(NODE_ID)
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            try:
+                cursor.execute("""
+                    UPDATE users 
+                    SET password_hash = ?
+                    WHERE username = ?
+                """, (operation_data["new_password_hash"], operation_data["username"]))
+                conn.commit()
+                print(f"[NAMENODE] Contraseña replicada para usuario {operation_data['username']}")
+            except Exception as e:
+                print(f"[NAMENODE] Error replicando cambio de contraseña: {e}")
+                conn.rollback()
+            finally:
+                conn.close()
         
         return {"success": True}
     except Exception as e:
@@ -1375,8 +1756,24 @@ def internal_replicate(data: Dict):
 
 
 @app.post("/internal/vote")
-def internal_vote(request: VoteRequest):
-    """Endpoint interno para votar en elecciones"""
+def internal_vote(
+    request: VoteRequest,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """Endpoint interno para votar en elecciones (requiere token de servicio)"""
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene de otro namenode
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not service_id.startswith("namenode-"):
+        raise HTTPException(status_code=403, detail="Solo namenodes pueden votar")
     with cluster_lock:
         if request.term > cluster_state["term"]:
             cluster_state["term"] = request.term
@@ -1390,8 +1787,24 @@ def internal_vote(request: VoteRequest):
 
 
 @app.post("/internal/heartbeat")
-def internal_heartbeat(data: Dict):
-    """Endpoint interno para recibir heartbeats del líder"""
+def internal_heartbeat(
+    data: Dict,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """Endpoint interno para recibir heartbeats del líder (requiere token de servicio)"""
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene de otro namenode
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not service_id.startswith("namenode-"):
+        raise HTTPException(status_code=403, detail="Solo namenodes pueden enviar heartbeats")
     term = data.get("term")
     leader_id = data.get("leader_id")
     

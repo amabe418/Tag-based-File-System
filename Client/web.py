@@ -4,6 +4,8 @@ import streamlit as st
 import pandas as pd
 import math
 import random
+import time
+from typing import Optional
 from registry_client import registry_client
 
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", os.path.join(os.path.dirname(__file__),"downloads/"))
@@ -130,28 +132,195 @@ if "server_url" not in st.session_state:
     else:
         print("⚠️ No se pudo obtener servidor del registry")
 
-# Inicializar autenticación
+# Inicializar autenticación con persistencia usando cookies
+COOKIE_TOKEN_KEY = "tbfs_auth_token"
+COOKIE_USER_KEY = "tbfs_logged_in_user"
+
+# Función para guardar en cookies (usando st.cookies y JavaScript como fallback)
+def save_to_storage(key: str, value: str):
+    """Guarda un valor en cookies del navegador"""
+    try:
+        # Método 1: Usar st.cookies (método nativo de Streamlit)
+        if hasattr(st, 'cookies') and st.cookies is not None:
+            if value:
+                st.cookies[key] = value
+                print(f"[CLIENT] Guardado en st.cookies: {key}")
+            elif key in st.cookies:
+                del st.cookies[key]
+                print(f"[CLIENT] Eliminado de st.cookies: {key}")
+    except Exception as e:
+        print(f"[CLIENT] Error guardando en st.cookies {key}: {e}")
+    
+    # Método 2: También guardar con JavaScript para asegurar persistencia
+    try:
+        if value:
+            # Escapar el valor para evitar problemas con caracteres especiales en JavaScript
+            escaped_value = value.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'").replace('\n', '\\n').replace('\r', '\\r')
+            cookie_script = f"""
+            <script>
+                (function() {{
+                    try {{
+                        // Guardar en cookies con JavaScript
+                        document.cookie = '{key}=' + encodeURIComponent('{escaped_value}') + '; path=/; max-age=86400; SameSite=Lax';
+                        // También guardar en localStorage como backup
+                        localStorage.setItem('{key}', '{escaped_value}');
+                    }} catch(e) {{
+                        console.error('Error guardando cookie:', e);
+                    }}
+                }})();
+            </script>
+            """
+        else:
+            cookie_script = f"""
+            <script>
+                (function() {{
+                    try {{
+                        document.cookie = '{key}=; path=/; max-age=0; SameSite=Lax';
+                        localStorage.removeItem('{key}');
+                    }} catch(e) {{
+                        console.error('Error eliminando cookie:', e);
+                    }}
+                }})();
+            </script>
+            """
+        st.components.v1.html(cookie_script, height=0, width=0)
+    except Exception as e:
+        print(f"[CLIENT] Error guardando cookie con JavaScript {key}: {e}")
+
+# Función para leer desde cookies
+def read_from_storage(key: str) -> Optional[str]:
+    """Lee un valor desde cookies del navegador"""
+    try:
+        # Método 1: Leer desde st.cookies (método nativo de Streamlit)
+        if hasattr(st, 'cookies') and st.cookies is not None:
+            value = st.cookies.get(key)
+            if value:
+                print(f"[CLIENT] Leído desde st.cookies: {key}")
+                return value
+    except Exception as e:
+        print(f"[CLIENT] Error leyendo desde st.cookies {key}: {e}")
+    
+    # Método 2: Intentar leer desde localStorage usando JavaScript
+    # (Streamlit no puede leer localStorage directamente, pero podemos sincronizarlo con cookies)
+    try:
+        sync_script = f"""
+        <script>
+            (function() {{
+                try {{
+                    // Leer desde localStorage y sincronizar con cookies
+                    const value = localStorage.getItem('{key}');
+                    if (value) {{
+                        document.cookie = '{key}=' + encodeURIComponent(value) + '; path=/; max-age=86400; SameSite=Lax';
+                    }}
+                }} catch(e) {{
+                    console.error('Error sincronizando localStorage:', e);
+                }}
+            }})();
+        </script>
+        """
+        st.components.v1.html(sync_script, height=0, width=0)
+        
+        # Intentar leer desde cookies nuevamente después de la sincronización
+        if hasattr(st, 'cookies') and st.cookies is not None:
+            value = st.cookies.get(key)
+            if value:
+                print(f"[CLIENT] Leído desde cookies después de sincronización: {key}")
+                return value
+    except Exception as e:
+        print(f"[CLIENT] Error sincronizando storage {key}: {e}")
+    
+    return None
+
+# Inicializar desde storage si están disponibles
+# IMPORTANTE: Sincronizar localStorage -> cookies PRIMERO antes de leer
 if "auth_token" not in st.session_state:
-    st.session_state.auth_token = None
+    # Paso 1: Sincronizar localStorage -> cookies ANTES de intentar leer
+    # Esto asegura que si hay datos en localStorage, estén disponibles en cookies
+    sync_script = """
+    <script>
+        (function() {
+            try {
+                // Sincronizar localStorage -> cookies para ambos valores
+                const token = localStorage.getItem('tbfs_auth_token');
+                const user = localStorage.getItem('tbfs_logged_in_user');
+                if (token) {
+                    document.cookie = 'tbfs_auth_token=' + encodeURIComponent(token) + '; path=/; max-age=86400; SameSite=Lax';
+                }
+                if (user) {
+                    document.cookie = 'tbfs_logged_in_user=' + encodeURIComponent(user) + '; path=/; max-age=86400; SameSite=Lax';
+                }
+            } catch(e) {
+                console.error('Error sincronizando localStorage:', e);
+            }
+        })();
+    </script>
+    """
+    st.components.v1.html(sync_script, height=0, width=0)
+    
+    # Paso 2: Intentar leer desde cookies (ahora deberían estar sincronizadas)
+    token = None
+    user = None
+    
+    try:
+        # Leer desde st.cookies (método nativo de Streamlit)
+        if hasattr(st, 'cookies') and st.cookies is not None:
+            token = st.cookies.get(COOKIE_TOKEN_KEY)
+            user = st.cookies.get(COOKIE_USER_KEY)
+            if token and user:
+                print(f"[CLIENT] Token y usuario leídos desde st.cookies: user={user}")
+    except Exception as e:
+        print(f"[CLIENT] Error leyendo desde st.cookies: {e}")
+    
+    # Paso 3: Si aún no se encontraron, usar read_from_storage como fallback
+    # (que intentará sincronizar nuevamente y leer)
+    if not token or not user:
+        token_fallback = read_from_storage(COOKIE_TOKEN_KEY)
+        user_fallback = read_from_storage(COOKIE_USER_KEY)
+        if token_fallback:
+            token = token_fallback
+        if user_fallback:
+            user = user_fallback
+    
+    # Paso 4: Asignar valores a session_state
+    if token and user:
+        st.session_state.auth_token = token
+        st.session_state.logged_in_user = user
+        print(f"[CLIENT] ✅ Sesión restaurada desde storage: user={user}")
+    else:
+        st.session_state.auth_token = None
+        st.session_state.logged_in_user = None
+        print(f"[CLIENT] ❌ No se encontró sesión guardada")
+
 if "logged_in_user" not in st.session_state:
     st.session_state.logged_in_user = None
 
 def login(username: str, password: str):
-    """Autentica al usuario y guarda el token"""
-    server_url, _ = get_server_url()
-    if not server_url:
-        return False, "No hay servidor disponible"
+    """Autentica al usuario y guarda el token - siempre usa el líder"""
+    leader_url, error = get_leader_url()
+    if not leader_url:
+        return False, error or "No hay líder disponible"
     
     try:
         response = requests.post(
-            f"{server_url}/auth/login",
+            f"{leader_url}/auth/login",
             json={"username": username, "password": password},
             timeout=5
         )
         response.raise_for_status()
         data = response.json()
-        st.session_state.auth_token = data.get("access_token")
-        st.session_state.logged_in_user = data.get("user", {}).get("username")
+        token = data.get("access_token")
+        user = data.get("user", {}).get("username")
+        
+        # Guardar en session_state
+        st.session_state.auth_token = token
+        st.session_state.logged_in_user = user
+        
+        # Guardar en storage para persistencia (hacer esto ANTES del rerun)
+        if token and user:
+            save_to_storage(COOKIE_TOKEN_KEY, token)
+            save_to_storage(COOKIE_USER_KEY, user)
+            print(f"[CLIENT] Token y usuario guardados en storage: user={user}")
+        
         return True, None
     except requests.RequestException as e:
         return False, str(e)
@@ -215,13 +384,13 @@ if not st.session_state.auth_token:
                     st.warning("La contraseña debe tener al menos 6 caracteres")
                 else:
                     su_username = su_username.strip().lower()
-                    server_url, _ = get_server_url()
-                    if not server_url:
-                        st.error("No hay servidor disponible")
+                    leader_url, error = get_leader_url()
+                    if not leader_url:
+                        st.error(error or "No hay líder disponible")
                     else:
                         try:
                             resp = requests.post(
-                                f"{server_url}/auth/signup",
+                                f"{leader_url}/auth/signup",
                                 json={"username": su_username, "password": su_password},
                                 timeout=5,
                             )
@@ -249,9 +418,15 @@ else:
             st.rerun()
     with col_logout:
         if st.button("🚪 Cerrar Sesión", use_container_width=True):
+            # Limpiar session_state
             st.session_state.auth_token = None
             st.session_state.logged_in_user = None
             st.session_state.show_change_password = False
+            
+            # Eliminar storage
+            save_to_storage(COOKIE_TOKEN_KEY, "")
+            save_to_storage(COOKIE_USER_KEY, "")
+            
             st.rerun()
     
     # Modal para cambiar contraseña
@@ -271,13 +446,13 @@ else:
                     elif len(new_password) < 6:
                         st.warning("La nueva contraseña debe tener al menos 6 caracteres")
                     else:
-                        server_url, _ = get_server_url()
-                        if not server_url:
-                            st.error("No hay servidor disponible")
+                        leader_url, error = get_leader_url()
+                        if not leader_url:
+                            st.error(error or "No hay líder disponible")
                         else:
                             try:
                                 response = requests.post(
-                                    f"{server_url}/auth/change-password",
+                                    f"{leader_url}/auth/change-password",
                                     json={
                                         "old_password": old_password,
                                         "new_password": new_password
@@ -336,8 +511,9 @@ if "files_to_download" not in st.session_state:
 
 # --- Función para refrescar lista ---
 def refresh_list(tags=None):
-    server_url, _ = get_server_url()
-    if not server_url:
+    """Obtiene la lista de archivos desde el líder"""
+    leader_url, _ = get_leader_url()
+    if not leader_url:
         return []
     
     if not st.session_state.auth_token:
@@ -348,7 +524,7 @@ def refresh_list(tags=None):
         if tags:
             params["tags"] = tags
         response = requests.get(
-            f"{server_url}/list",
+            f"{leader_url}/list",
             params=params,
             headers=get_auth_headers(),
             timeout=5
@@ -410,6 +586,25 @@ if tags_filter != st.session_state.prev_tag_filter:
 if st.session_state.refresh_needed:
     st.session_state.refresh_needed = False
     st.rerun()
+
+# --- Auto-refresh de la lista de archivos ---
+AUTO_REFRESH_INTERVAL = 5  # segundos
+if "last_refresh_time" not in st.session_state:
+    st.session_state.last_refresh_time = time.time()
+if "auto_refresh_enabled" not in st.session_state:
+    st.session_state.auto_refresh_enabled = True
+
+# Verificar si es tiempo de refrescar (solo si el usuario está autenticado y no hay modales abiertos)
+if (st.session_state.auto_refresh_enabled and 
+    st.session_state.auth_token and 
+    st.session_state.modal is None):
+    current_time = time.time()
+    time_since_refresh = current_time - st.session_state.last_refresh_time
+    
+    if time_since_refresh >= AUTO_REFRESH_INTERVAL:
+        st.session_state.last_refresh_time = current_time
+        # Usar st.rerun() para refrescar la página automáticamente
+        st.rerun()
 
 # --- CSS para mejorar la presentación ---
 st.markdown("""
@@ -731,14 +926,14 @@ elif st.session_state.modal == "add_tags":
                 elif not new_tags.strip():
                     st.warning("Debes ingresar al menos una nueva etiqueta.")
                 else:
-                    server_url, _ = get_server_url()
-                    if not server_url:
-                        st.error("No hay servidor disponible.")
+                    leader_url, error = get_leader_url()
+                    if not leader_url:
+                        st.error(error or "No hay líder disponible")
                     else:
                         params = {"query": query_tags, "new_tags": new_tags}
                         try:
                             response = requests.post(
-                                f"{server_url}/add-tags",
+                                f"{leader_url}/add-tags",
                                 params=params,
                                 headers=get_auth_headers()
                             )
@@ -768,14 +963,14 @@ elif st.session_state.modal == "del_tags":
                 elif not del_tags.strip():
                     st.warning("Debes ingresar las etiquetas que deseas eliminar.")
                 else:
-                    server_url, _ = get_server_url()
-                    if not server_url:
-                        st.error("No hay servidor disponible.")
+                    leader_url, error = get_leader_url()
+                    if not leader_url:
+                        st.error(error or "No hay líder disponible")
                     else:
                         params = {"query": query_tags, "del_tags": del_tags}
                         try:
                             response = requests.post(
-                                f"{server_url}/delete-tags",
+                                f"{leader_url}/delete-tags",
                                 params=params,
                                 headers=get_auth_headers()
                             )
@@ -802,14 +997,14 @@ elif st.session_state.modal == "del_files":
                 if not tags.strip():
                     st.warning("Debes ingresar las etiquetas de los archivos que deseas eliminar.")
                 else:
-                    server_url, _ = get_server_url()
-                    if not server_url:
-                        st.error("No hay servidor disponible.")
+                    leader_url, error = get_leader_url()
+                    if not leader_url:
+                        st.error(error or "No hay líder disponible")
                     else:
                         params = {"tags": tags}
                         try:
                             response = requests.delete(
-                                f"{server_url}/delete",
+                                f"{leader_url}/delete",
                                 params=params,
                                 headers=get_auth_headers()
                             )

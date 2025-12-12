@@ -91,6 +91,27 @@ def require_permission(permission: Permission):
         return current_user
     return permission_checker
 
+# Dependency especial para eliminar archivos: permite a usuarios eliminar sus propios archivos
+def require_delete_permission():
+    """
+    Dependency que permite eliminar archivos si:
+    - El usuario tiene el permiso DELETE_FILES (ADMIN o SERVICE), O
+    - El usuario es USER (puede eliminar sus propios archivos, que se filtran por user_id)
+    """
+    async def delete_checker(current_user: User = Depends(get_current_user)) -> User:
+        # Si tiene el permiso DELETE_FILES, permitir
+        if current_user.has_permission(Permission.DELETE_FILES):
+            return current_user
+        # Si es USER, también permitir (solo podrá eliminar sus propios archivos)
+        if current_user.role == Role.USER:
+            return current_user
+        # Si no cumple ninguna condición, denegar
+        raise HTTPException(
+            status_code=403,
+            detail="No tienes permiso para eliminar archivos"
+        )
+    return delete_checker
+
 from namenode.database import init_db, get_db_path, get_connection, close_connection, db_lock
 from namenode.manager import (
     add_file_metadata, query_files, get_file_by_id, delete_file_metadata,
@@ -587,6 +608,27 @@ def root():
 @app.post("/auth/login", response_model=TokenResponse)
 def login(credentials: UserLogin):
     """Endpoint de login para obtener token JWT - verifica usuario y contraseña en la base de datos"""
+    # Redirigir al líder si no somos el líder
+    leader_url = get_leader_url()
+    if leader_url:
+        print(f"[NAMENODE] Redirigiendo login a líder: {leader_url}")
+        try:
+            response = requests.post(
+                f"{leader_url}/auth/login",
+                json=credentials.dict(),
+                timeout=5
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"[NAMENODE] Error redirigiendo login a líder: {e}")
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        print(f"[NAMENODE] Este nodo no es líder, pero no hay líder disponible")
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    # Procesar login en el líder
     user = authenticate_user(credentials.username, credentials.password, node_id=_get_node_id())
     if not user:
         raise HTTPException(
@@ -637,6 +679,27 @@ def signup(user_data: UserSignup):
     - Rechaza si el usuario ya existe.
     - Devuelve token JWT para inicio de sesión inmediato.
     """
+    # Redirigir al líder si no somos el líder
+    leader_url = get_leader_url()
+    if leader_url:
+        print(f"[NAMENODE] Redirigiendo signup a líder: {leader_url}")
+        try:
+            response = requests.post(
+                f"{leader_url}/auth/signup",
+                json=user_data.dict(),
+                timeout=5
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"[NAMENODE] Error redirigiendo signup a líder: {e}")
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        print(f"[NAMENODE] Este nodo no es líder, pero no hay líder disponible")
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    # Procesar en el líder
     try:
         # Forzar rol USER
         user_create = UserCreate(username=user_data.username, password=user_data.password, role=Role.USER)
@@ -1406,9 +1469,39 @@ async def add_file_compat(
 @app.get("/list")
 def list_files_compat(
     tags: Optional[List[str]] = Query(None),
-    current_user: User = Depends(require_permission(Permission.READ_FILES))
+    current_user: User = Depends(require_permission(Permission.READ_FILES)),
+    authorization: Optional[str] = Header(None, alias="Authorization")
 ):
     """Endpoint de compatibilidad: lista archivos del usuario actual (requiere autenticación)"""
+    # Redirigir al líder si no somos el líder
+    leader_url = get_leader_url()
+    if leader_url:
+        print(f"[NAMENODE] Redirigiendo list a líder: {leader_url}")
+        try:
+            # Construir parámetros de query
+            params = {}
+            if tags:
+                params["tags"] = tags
+            headers = {}
+            if authorization:
+                headers["Authorization"] = authorization
+            response = requests.get(
+                f"{leader_url}/list",
+                params=params,
+                headers=headers,
+                timeout=5
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"[NAMENODE] Error redirigiendo list a líder: {e}")
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        print(f"[NAMENODE] Este nodo no es líder, pero no hay líder disponible")
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    # Procesar en el líder
     files = query_files(query_tags=tags, node_id=NODE_ID, user_id=current_user.username)
     formatted = [
         {"id": fid, "name": name, "tags": tags, "path": ""}
@@ -1420,13 +1513,23 @@ def list_files_compat(
 @app.delete("/delete")
 def delete_files_compat(
     tags: str = Query(...),
-    current_user: User = Depends(require_permission(Permission.DELETE_FILES))
+    current_user: User = Depends(require_delete_permission()),
+    authorization: Optional[str] = Header(None, alias="Authorization")
 ):
     """Endpoint de compatibilidad: elimina archivos por tags (requiere autenticación y permiso)"""
     leader_url = get_leader_url()
     if leader_url:
         try:
-            response = requests.delete(f"{leader_url}/delete", params={"tags": tags}, timeout=5)
+            headers = {}
+            if authorization:
+                headers["Authorization"] = authorization
+            response = requests.delete(
+                f"{leader_url}/delete",
+                params={"tags": tags},
+                headers=headers,
+                timeout=5
+            )
+            response.raise_for_status()
             return response.json()
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")

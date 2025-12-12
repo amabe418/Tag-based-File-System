@@ -6,12 +6,45 @@ set -e
 
 echo "🐳 Inicializando Docker Swarm..."
 
+# Función para detectar IP de la interfaz de red principal (sin depender de internet)
+detect_network_ip() {
+    # Obtener todas las IPs de interfaces físicas (excluyendo loopback, docker, virtuales)
+    # Priorizar interfaces ethernet y wifi
+    local ip_addresses=$(ip addr show | grep -E 'inet ' | grep -v '127.0.0.1' | grep -v 'docker' | \
+        awk '{print $2}' | cut -d'/' -f1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+    
+    # Filtrar IPs privadas comunes (excluir 169.254.x.x que son link-local)
+    for ip in $ip_addresses; do
+        # Excluir IPs link-local (169.254.x.x)
+        if [[ ! "$ip" =~ ^169\.254\. ]]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    
+    # Si no encontramos ninguna, intentar con hostname -I
+    local hostname_ips=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^$' | grep -v '127.0.0.1' | grep -v '169.254.')
+    if [ -n "$hostname_ips" ]; then
+        echo "$hostname_ips" | head -1
+        return 0
+    fi
+    
+    return 1
+}
+
 # Obtener IP de la interfaz principal si no se proporciona
 if [ -z "$1" ]; then
-    ADVERTISE_ADDR=$(ip route get 8.8.8.8 | grep -oP 'src \K\S+' | head -1)
+    echo "🔍 Detectando IP de la interfaz de red principal..."
+    ADVERTISE_ADDR=$(detect_network_ip)
+    
     if [ -z "$ADVERTISE_ADDR" ]; then
         echo "❌ Error: No se pudo detectar la IP automáticamente"
-        echo "   Por favor, proporciona la IP manualmente: ./swarm-init.sh <IP>"
+        echo ""
+        echo "💡 Interfaces de red disponibles:"
+        ip addr show | grep -E '^[0-9]+:|inet ' | grep -v '127.0.0.1' | head -10
+        echo ""
+        echo "   Por favor, proporciona la IP manualmente:"
+        echo "   ./swarm-init.sh <IP>"
         exit 1
     fi
     echo "📍 IP detectada automáticamente: $ADVERTISE_ADDR"

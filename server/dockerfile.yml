@@ -3,7 +3,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY Server/core /app/Server/core
+COPY server/core /app/Server/core
 COPY Server/api.py /app/Server/
 RUN pip install --no-cache-dir fastapi uvicorn requests python-multipart
 

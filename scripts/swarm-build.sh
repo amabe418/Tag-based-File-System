@@ -4,6 +4,23 @@
 
 set -e
 
+# Obtener el directorio del script y cambiar al directorio raíz del proyecto
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Cambiar al directorio raíz del proyecto
+cd "$PROJECT_ROOT"
+
+echo "📁 Directorio de trabajo: $(pwd)"
+echo ""
+
+# Verificar que estamos en el directorio correcto
+if [ ! -d "namenode" ] || [ ! -d "registry" ] || [ ! -d "datanode" ] || [ ! -d "client" ] || [ ! -d "security" ]; then
+    echo "❌ Error: No se encontraron los directorios necesarios (namenode, registry, datanode, client, security)"
+    echo "   Asegúrate de ejecutar este script desde el directorio raíz del proyecto"
+    exit 1
+fi
+
 # Verificar si se debe forzar la reconstrucción
 FORCE_REBUILD=false
 if [ "$1" == "--rebuild" ] || [ "$1" == "-r" ]; then
@@ -19,6 +36,8 @@ build_if_needed() {
     
     if [ "$FORCE_REBUILD" = true ] || ! docker image inspect "$image_name" >/dev/null 2>&1; then
         echo "🔨 Construyendo imagen de $service_name..."
+        echo "   Dockerfile: $dockerfile_path"
+        echo "   Contexto: $(pwd)"
         docker build -t "$image_name" -f "$dockerfile_path" .
         echo "✅ Imagen $image_name construida"
     else

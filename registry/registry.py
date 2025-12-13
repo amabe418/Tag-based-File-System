@@ -36,7 +36,10 @@ cluster_state = {
     "term": 0,  # Término de liderazgo
     "last_heartbeat_time": 0,
     "last_election_time": 0,  # Timestamp de la última elección para evitar elecciones frecuentes
-    "peers": []  # Lista de otros nodos del cluster
+    "peers": [],  # Lista de otros nodos del cluster
+    # Fase 3: Tracking de conectividad para detección de reunificación
+    "peers_connectivity": {},  # {peer_id: {"ever_contacted": bool, "last_seen": float, "currently_connected": bool}}
+    "reconciliation_in_progress": False  # Flag para evitar reconciliaciones simultáneas
 }
 cluster_lock = threading.Lock()
 
@@ -50,7 +53,16 @@ REGISTRY_PORT = int(os.getenv("REGISTRY_PORT", "9000"))
 # Parsear lista de peers desde variable de entorno
 PEERS_ENV = os.getenv("PEERS", "")
 if PEERS_ENV:
-    cluster_state["peers"] = [p.strip() for p in PEERS_ENV.split(",") if p.strip()]
+    peers_list = [p.strip() for p in PEERS_ENV.split(",") if p.strip()]
+    cluster_state["peers"] = peers_list
+    # Fase 3: Inicializar tracking de conectividad para cada peer
+    for peer in peers_list:
+        if peer not in cluster_state["peers_connectivity"]:
+            cluster_state["peers_connectivity"][peer] = {
+                "ever_contacted": False,
+                "last_seen": 0.0,
+                "currently_connected": False
+            }
 
 
 class ServerRegistration(BaseModel):
@@ -122,6 +134,317 @@ def get_leader_url() -> Optional[str]:
         return None
 
 
+def update_peer_connectivity(peer_id: str, connected: bool):
+    """
+    Fase 3: Actualiza el estado de conectividad con un peer.
+    
+    Args:
+        peer_id: ID del peer
+        connected: True si el peer está conectado, False si no
+    """
+    with cluster_lock:
+        if peer_id not in cluster_state["peers_connectivity"]:
+            cluster_state["peers_connectivity"][peer_id] = {
+                "ever_contacted": False,
+                "last_seen": 0.0,
+                "currently_connected": False
+            }
+        
+        peer_info = cluster_state["peers_connectivity"][peer_id]
+        was_connected = peer_info["currently_connected"]
+        
+        if connected:
+            peer_info["ever_contacted"] = True
+            peer_info["last_seen"] = time.time()
+            peer_info["currently_connected"] = True
+        else:
+            peer_info["currently_connected"] = False
+        
+        # Detectar reunificación: peer que estaba desconectado ahora está conectado
+        if not was_connected and connected and peer_info["ever_contacted"]:
+            return True  # Indica que se detectó reunificación
+        
+        return False
+
+
+def check_peer_connectivity(peer_id: str, timeout: float = 2.0) -> bool:
+    """
+    Fase 3: Verifica si un peer está disponible.
+    
+    Args:
+        peer_id: ID del peer a verificar
+        timeout: Timeout para la verificación
+    
+    Returns:
+        True si el peer está disponible, False en caso contrario
+    """
+    try:
+        peer_url = get_peer_url(peer_id)
+        response = requests.get(f"{peer_url}/", timeout=timeout)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+def detect_network_reunification() -> List[str]:
+    """
+    Fase 3: Detecta si hay peers que han vuelto a estar disponibles (reunificación).
+    
+    Returns:
+        Lista de peer IDs que han vuelto a estar disponibles
+    """
+    reunited_peers = []
+    
+    with cluster_lock:
+        peers = cluster_state["peers"].copy()
+        peers_connectivity = cluster_state["peers_connectivity"].copy()
+    
+    for peer in peers:
+        if peer not in peers_connectivity:
+            continue
+        
+        peer_info = peers_connectivity[peer]
+        was_connected = peer_info.get("currently_connected", False)
+        ever_contacted = peer_info.get("ever_contacted", False)
+        
+        # Solo verificar peers que alguna vez fueron contactados
+        if not ever_contacted:
+            # Primera vez que intentamos contactar - verificar y marcar
+            is_connected = check_peer_connectivity(peer)
+            if is_connected:
+                update_peer_connectivity(peer, True)
+            continue
+        
+        # Verificar si el peer está disponible ahora
+        is_connected = check_peer_connectivity(peer)
+        
+        # Si estaba desconectado y ahora está conectado, es reunificación
+        if not was_connected and is_connected:
+            reunited = update_peer_connectivity(peer, True)
+            if reunited:
+                reunited_peers.append(peer)
+                print(f"[REGISTRY] FASE 3: ¡Peer {peer} ha vuelto a estar disponible! (Reunificación detectada)")
+        elif is_connected:
+            # Actualizar last_seen aunque ya estaba conectado
+            update_peer_connectivity(peer, True)
+        else:
+            # Peer no está disponible
+            update_peer_connectivity(peer, False)
+    
+    return reunited_peers
+
+
+def get_peer_servers(peer_id: str) -> Optional[Dict]:
+    """
+    Fase 4: Obtiene el estado de servidores de un peer.
+    
+    Args:
+        peer_id: ID del peer del cual obtener servidores
+    
+    Returns:
+        Dict con servidores o None si hay error
+    """
+    try:
+        peer_url = get_peer_url(peer_id)
+        
+        # Obtener token de servicio para autenticación
+        try:
+            from security.service_auth import generate_service_token
+            service_token = generate_service_token(cluster_state["node_id"], "service")
+        except Exception:
+            service_token = os.getenv("REGISTRY_SERVICE_TOKEN", "registry-service-token")
+        
+        response = requests.get(
+            f"{peer_url}/internal/servers",
+            headers={"Authorization": f"Bearer {service_token}"},
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            print(f"[REGISTRY] FASE 4: Error obteniendo servidores de {peer_id}: HTTP {response.status_code}")
+            return None
+        
+        data = response.json()
+        return data.get("servers", {})
+        
+    except Exception as e:
+        print(f"[REGISTRY] FASE 4: Error obteniendo servidores de {peer_id}: {e}")
+        return None
+
+
+def merge_servers(local_servers: Dict, peer_servers: Dict) -> Dict:
+    """
+    Fase 4: Hace merge inteligente de servidores de dos particiones.
+    
+    Estrategia:
+    - Si un servidor solo existe en una partición, agregarlo
+    - Si un servidor existe en ambas, mantener el que tiene heartbeat más reciente
+    
+    Args:
+        local_servers: Servidores locales
+        peer_servers: Servidores del peer
+    
+    Returns:
+        Dict con servidores mergeados
+    """
+    merged = local_servers.copy()
+    conflicts_resolved = 0
+    new_servers = 0
+    
+    for server_id, peer_info in peer_servers.items():
+        if server_id not in merged:
+            # Servidor nuevo de la otra partición, agregarlo
+            merged[server_id] = peer_info
+            new_servers += 1
+            print(f"[REGISTRY] FASE 4: Agregando servidor de otra partición: {server_id}")
+        else:
+            # Servidor existe en ambas particiones, resolver conflicto
+            local_info = merged[server_id]
+            local_heartbeat = local_info.get("last_heartbeat", 0)
+            peer_heartbeat = peer_info.get("last_heartbeat", 0)
+            
+            # Si el peer tiene heartbeat más reciente, actualizar
+            if peer_heartbeat > local_heartbeat:
+                # Verificar si la URL cambió (conflicto real)
+                if local_info.get("url") != peer_info.get("url"):
+                    print(f"[REGISTRY] FASE 4: Conflicto en {server_id}: URL cambió")
+                    print(f"[REGISTRY] FASE 4:   Local: {local_info.get('url')} (heartbeat: {local_heartbeat})")
+                    print(f"[REGISTRY] FASE 4:   Peer: {peer_info.get('url')} (heartbeat: {peer_heartbeat})")
+                    conflicts_resolved += 1
+                
+                # Usar versión con heartbeat más reciente (last-write-wins)
+                merged[server_id] = peer_info
+                print(f"[REGISTRY] FASE 4: Actualizando {server_id} con versión más reciente (heartbeat: {peer_heartbeat} > {local_heartbeat})")
+            else:
+                # Mantener versión local (más reciente)
+                print(f"[REGISTRY] FASE 4: Manteniendo versión local de {server_id} (heartbeat: {local_heartbeat} >= {peer_heartbeat})")
+    
+    print(f"[REGISTRY] FASE 4: Merge completado - Nuevos: {new_servers}, Conflictos resueltos: {conflicts_resolved}")
+    return merged
+
+
+def perform_registry_reconciliation(reunited_peers: List[str]):
+    """
+    Fase 4: Realiza reconciliación completa del registry después de particionamiento.
+    
+    Proceso:
+    1. Obtener servidores de todos los peers reunificados
+    2. Hacer merge inteligente (no sobrescribir, unir)
+    3. Resolver conflictos usando last_heartbeat (más reciente gana)
+    4. Actualizar estado local con servidores mergeados
+    5. Replicar estado mergeado a todos los peers
+    
+    Args:
+        reunited_peers: Lista de peer IDs que han vuelto a estar disponibles
+    """
+    print(f"[REGISTRY] FASE 4: Iniciando reconciliación completa con {len(reunited_peers)} peers")
+    
+    with cluster_lock:
+        if cluster_state["reconciliation_in_progress"]:
+            print(f"[REGISTRY] FASE 4: Reconciliación ya en progreso, ignorando nueva detección")
+            return
+        
+        cluster_state["reconciliation_in_progress"] = True
+    
+    try:
+        # Paso 1: Obtener servidores de todos los peers reunificados
+        peer_servers_dict = {}
+        for peer in reunited_peers:
+            print(f"[REGISTRY] FASE 4: Obteniendo servidores de {peer}...")
+            peer_servers = get_peer_servers(peer)
+            if peer_servers:
+                peer_servers_dict[peer] = peer_servers
+                print(f"[REGISTRY] FASE 4: Obtenidos {len(peer_servers)} servidores de {peer}")
+            else:
+                print(f"[REGISTRY] FASE 4: No se pudo obtener servidores de {peer}")
+        
+        if not peer_servers_dict:
+            print(f"[REGISTRY] FASE 4: No se pudieron obtener servidores de ningún peer, abortando reconciliación")
+            return
+        
+        # Paso 2: Obtener servidores locales
+        with servers_lock:
+            local_servers = servers.copy()
+        
+        print(f"[REGISTRY] FASE 4: Servidores locales: {len(local_servers)}")
+        
+        # Paso 3: Hacer merge con cada peer
+        merged_servers = local_servers.copy()
+        for peer, peer_servers in peer_servers_dict.items():
+            print(f"[REGISTRY] FASE 4: Haciendo merge con {peer}...")
+            merged_servers = merge_servers(merged_servers, peer_servers)
+        
+        # Paso 4: Actualizar estado local
+        with servers_lock:
+            servers.clear()
+            servers.update(merged_servers)
+        
+        print(f"[REGISTRY] FASE 4: Estado actualizado - Total servidores: {len(merged_servers)}")
+        
+        # Paso 5: Replicar estado mergeado a todos los peers
+        with cluster_lock:
+            term = cluster_state["term"]
+        
+        print(f"[REGISTRY] FASE 4: Replicando estado mergeado a todos los peers...")
+        replicate_to_peers(merged_servers, term)
+        
+        print(f"[REGISTRY] FASE 4: Reconciliación completa finalizada")
+        
+    finally:
+        with cluster_lock:
+            cluster_state["reconciliation_in_progress"] = False
+
+
+def trigger_registry_reconciliation(reunited_peers: List[str]):
+    """
+    Fase 3: Dispara el proceso de reconciliación del registry cuando se detecta reunificación.
+    
+    Args:
+        reunited_peers: Lista de peer IDs que han vuelto a estar disponibles
+    """
+    if not reunited_peers:
+        return
+    
+    print(f"[REGISTRY] FASE 3: Iniciando reconciliación con peers reunificados: {reunited_peers}")
+    print(f"[REGISTRY] FASE 3: Term actual: {cluster_state['term']}")
+    
+    # Fase 4: Implementar reconciliación completa
+    perform_registry_reconciliation(reunited_peers)
+
+
+def connectivity_monitor_loop():
+    """
+    Fase 3: Loop que monitorea la conectividad con peers y detecta reunificación.
+    Se ejecuta periódicamente para verificar si peers que estaban desconectados vuelven a estar disponibles.
+    """
+    # Esperar un poco al inicio para que el sistema se estabilice
+    time.sleep(10)
+    
+    while True:
+        try:
+            # Verificar conectividad cada 10 segundos
+            time.sleep(10)
+            
+            # Solo monitorear si hay peers configurados
+            with cluster_lock:
+                peers = cluster_state["peers"].copy()
+            
+            if not peers:
+                continue
+            
+            # Detectar reunificación
+            reunited_peers = detect_network_reunification()
+            
+            # Si se detectó reunificación, disparar reconciliación
+            if reunited_peers:
+                trigger_registry_reconciliation(reunited_peers)
+                
+        except Exception as e:
+            print(f"[REGISTRY] FASE 3: Error en monitoreo de conectividad: {e}")
+            import traceback
+            traceback.print_exc()
+
+
 def replicate_to_peers(servers_data: Dict, term: int):
     """Replica el estado a los peers del cluster"""
     with cluster_lock:
@@ -155,7 +478,14 @@ def replicate_to_peers(servers_data: Dict, term: int):
             )
             if response.status_code == 200:
                 success_count += 1
+                # Fase 3: Actualizar conectividad
+                update_peer_connectivity(peer, True)
+            else:
+                # Fase 3: Marcar como desconectado si no responde correctamente
+                update_peer_connectivity(peer, False)
         except Exception as e:
+            # Fase 3: Marcar como desconectado si hay excepción
+            update_peer_connectivity(peer, False)
             print(f"[REGISTRY] Error replicando a {peer}: {e}")
     
     # Se necesita mayoría (quorum): al menos 2 de 3 nodos
@@ -206,10 +536,17 @@ def request_vote(candidate_id: str, term: int) -> bool:
             )
             if response.status_code == 200:
                 successful_contacts += 1
+                # Fase 3: Actualizar conectividad
+                update_peer_connectivity(peer, True)
                 data = response.json()
                 if data.get("granted"):
                     votes += 1
+            else:
+                # Fase 3: Marcar como desconectado si no responde correctamente
+                update_peer_connectivity(peer, False)
         except Exception as e:
+            # Fase 3: Marcar como desconectado si hay excepción
+            update_peer_connectivity(peer, False)
             print(f"[REGISTRY] Error solicitando voto a {peer}: {e}")
     
     total_nodes = len(peers) + 1
@@ -425,6 +762,11 @@ async def lifespan(app: FastAPI):
     
     election_thread = threading.Thread(target=election_retry_loop, daemon=True)
     election_thread.start()
+    
+    # Fase 3: Iniciar monitoreo de conectividad para detectar reunificación
+    connectivity_thread = threading.Thread(target=connectivity_monitor_loop, daemon=True)
+    connectivity_thread.start()
+    print(f"[REGISTRY] FASE 3: Monitoreo de conectividad iniciado")
     
     # Intentar elección inicial después de un delay para que todos los nodos estén listos
     time.sleep(5)
@@ -785,3 +1127,37 @@ def internal_vote(
             return VoteResponse(granted=True, term=request.term)
         else:
             return VoteResponse(granted=False, term=cluster_state["term"])
+
+
+@app.get("/internal/servers")
+def get_servers_endpoint(
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """
+    Fase 4: Endpoint interno para obtener el estado de servidores.
+    Usado para reconciliación después de particionamiento.
+    """
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene de otro registry
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not service_id.startswith("registry-"):
+        raise HTTPException(status_code=403, detail="Solo registries pueden obtener servidores")
+    
+    # Obtener servidores
+    with servers_lock:
+        servers_copy = servers.copy()
+    
+    return {
+        "node_id": cluster_state["node_id"],
+        "term": cluster_state["term"],
+        "servers": servers_copy,
+        "total": len(servers_copy)
+    }

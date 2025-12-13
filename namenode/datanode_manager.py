@@ -241,7 +241,7 @@ def get_active_datanodes(node_id_db: str = None, exclude_draining: bool = True) 
 def assign_replicas(file_hash: str, file_size: int, node_id_db: str = None, 
                     exclude_datanodes: List[str] = None) -> Optional[List[str]]:
     """
-    Asigna 3 DataNodes para almacenar réplicas de un archivo.
+    Asigna DataNodes para almacenar réplicas de un archivo (idealmente 3, mínimo 1).
     Optimiza la selección considerando espacio disponible y excluyendo DataNodes en drenaje.
     
     Args:
@@ -250,7 +250,8 @@ def assign_replicas(file_hash: str, file_size: int, node_id_db: str = None,
         exclude_datanodes: Lista de DataNode IDs a excluir de la asignación
     
     Returns:
-        Lista de 3 DataNode IDs [primary, secondary, tertiary], o None si no hay suficientes DataNodes
+        Lista de DataNode IDs [primary, secondary, tertiary] (hasta 3, mínimo 1), 
+        o None si no hay DataNodes disponibles
     """
     if exclude_datanodes is None:
         exclude_datanodes = []
@@ -261,8 +262,8 @@ def assign_replicas(file_hash: str, file_size: int, node_id_db: str = None,
     # Excluir DataNodes específicos
     active_datanodes = [dn for dn in active_datanodes if dn["node_id"] not in exclude_datanodes]
     
-    if len(active_datanodes) < 3:
-        print(f"[DATANODE_MANAGER] No hay suficientes DataNodes activos ({len(active_datanodes)}/3)")
+    if len(active_datanodes) < 1:
+        print(f"[DATANODE_MANAGER] No hay DataNodes activos disponibles")
         return None
     
     # Filtrar DataNodes con espacio suficiente (con margen del 10% para seguridad)
@@ -272,8 +273,8 @@ def assign_replicas(file_hash: str, file_size: int, node_id_db: str = None,
         if dn["free_space"] >= required_space
     ]
     
-    if len(available_datanodes) < 3:
-        print(f"[DATANODE_MANAGER] No hay suficientes DataNodes con espacio disponible ({len(available_datanodes)}/3, requerido: {required_space} bytes)")
+    if len(available_datanodes) < 1:
+        print(f"[DATANODE_MANAGER] No hay DataNodes con espacio disponible (requerido: {required_space} bytes)")
         return None
     
     # Ordenar por espacio libre (descendente) para balancear carga
@@ -290,15 +291,21 @@ def assign_replicas(file_hash: str, file_size: int, node_id_db: str = None,
     # Seleccionar DataNode primario (del slot calculado)
     primary = available_datanodes[slot]
     
-    # Seleccionar 2 réplicas (diferentes al primario)
+    # Seleccionar réplicas adicionales (diferentes al primario)
+    # Intentar obtener hasta 2 réplicas más (para un total de 3), pero aceptar las disponibles
     replicas = [dn for dn in available_datanodes if dn["node_id"] != primary["node_id"]][:2]
     
-    if len(replicas) < 2:
-        print(f"[DATANODE_MANAGER] No se pudieron seleccionar suficientes réplicas")
-        return None
+    # Construir lista de asignados: primario + réplicas (hasta 3 en total)
+    assigned = [primary["node_id"]]
+    for replica in replicas:
+        assigned.append(replica["node_id"])
     
-    assigned = [primary["node_id"], replicas[0]["node_id"], replicas[1]["node_id"]]
-    print(f"[DATANODE_MANAGER] Réplicas asignadas para {file_hash[:16]}...: {assigned}")
+    replica_count = len(assigned)
+    ideal_count = 3
+    if replica_count < ideal_count:
+        print(f"[DATANODE_MANAGER] Réplicas asignadas para {file_hash[:16]}...: {assigned} ({replica_count}/{ideal_count} - modo degradado)")
+    else:
+        print(f"[DATANODE_MANAGER] Réplicas asignadas para {file_hash[:16]}...: {assigned}")
     
     return assigned
 
@@ -663,14 +670,17 @@ def rereplicate_file(file_id: int, file_hash: str, failed_datanode_id: str,
         
         print(f"[DATANODE_MANAGER] Archivo leído desde {source_replica['datanode_id']} ({file_size} bytes)")
         
-        # Asignar nuevo DataNode para la réplica
-        new_datanode_ids = assign_replicas(file_hash, file_size, node_id_db=node_id_db)
+        # Obtener lista de DataNodes a excluir (los que ya tienen réplicas y el que falló)
+        existing_datanode_ids = [r["datanode_id"] for r in replicas]
+        exclude_datanodes = existing_datanode_ids + [failed_datanode_id]
+        
+        # Asignar nuevo DataNode para la réplica (excluyendo los existentes)
+        new_datanode_ids = assign_replicas(file_hash, file_size, node_id_db=node_id_db, exclude_datanodes=exclude_datanodes)
         if not new_datanode_ids:
             print(f"[DATANODE_MANAGER] No se pudo asignar nuevo DataNode para re-replicación")
             return False
         
         # Seleccionar un DataNode que no sea el que falló ni los que ya tienen réplicas
-        existing_datanode_ids = [r["datanode_id"] for r in replicas]
         available_new_datanodes = [dn_id for dn_id in new_datanode_ids 
                                    if dn_id not in existing_datanode_ids and dn_id != failed_datanode_id]
         

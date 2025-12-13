@@ -148,7 +148,10 @@ cluster_state = {
     "term": 0,
     "last_heartbeat_time": 0,
     "last_election_time": 0,
-    "peers": []
+    "peers": [],
+    # Fase 3: Tracking de conectividad para detección de reunificación
+    "peers_connectivity": {},  # {peer_id: {"ever_contacted": bool, "last_seen": float, "currently_connected": bool}}
+    "reconciliation_in_progress": False  # Flag para evitar reconciliaciones simultáneas
 }
 cluster_lock = threading.Lock()
 
@@ -161,7 +164,16 @@ NAMENODE_PORT = int(os.getenv("NAMENODE_PORT", "8010"))
 # Parsear lista de peers desde variable de entorno
 PEERS_ENV = os.getenv("PEERS", "")
 if PEERS_ENV:
-    cluster_state["peers"] = [p.strip() for p in PEERS_ENV.split(",") if p.strip()]
+    peers_list = [p.strip() for p in PEERS_ENV.split(",") if p.strip()]
+    cluster_state["peers"] = peers_list
+    # Fase 3: Inicializar tracking de conectividad para cada peer
+    for peer in peers_list:
+        if peer not in cluster_state["peers_connectivity"]:
+            cluster_state["peers_connectivity"][peer] = {
+                "ever_contacted": False,
+                "last_seen": 0.0,
+                "currently_connected": False
+            }
 
 # Obtener node_id para la base de datos
 NODE_ID = cluster_state["node_id"]
@@ -211,6 +223,85 @@ log_lock = threading.Lock()
 commit_index = 0
 
 
+def save_operation_to_log(operation: OperationLog, node_id: str = None):
+    """
+    Guarda una operación en el log persistente (base de datos).
+    Fase 2: Log persistente para reconciliación después de particionamiento.
+    """
+    import json
+    from namenode.database import get_db_path, get_connection, close_connection, db_lock
+    
+    if node_id is None:
+        node_id = NODE_ID
+    
+    db_path = get_db_path(node_id)
+    
+    with db_lock:
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id)
+        try:
+            cursor.execute("""
+                INSERT INTO operation_log (operation, data, term, timestamp, node_id)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                operation.operation,
+                json.dumps(operation.data),
+                operation.term,
+                operation.timestamp,
+                node_id
+            ))
+            conn.commit()
+        except Exception as e:
+            print(f"[ERROR] Error guardando operación en log persistente: {e}")
+            conn.rollback()
+        finally:
+            close_connection(conn)
+
+
+def load_operation_log(node_id: str = None) -> List[OperationLog]:
+    """
+    Carga el log de operaciones desde la base de datos.
+    Fase 2: Cargar log al iniciar para reconstruir estado.
+    """
+    import json
+    from namenode.database import get_db_path, get_connection, close_connection, db_lock
+    
+    if node_id is None:
+        node_id = NODE_ID
+    
+    db_path = get_db_path(node_id)
+    operations = []
+    
+    with db_lock:
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id)
+        try:
+            cursor.execute("""
+                SELECT operation, data, term, timestamp, node_id
+                FROM operation_log
+                ORDER BY term, timestamp
+            """)
+            rows = cursor.fetchall()
+            
+            for row in rows:
+                try:
+                    operation_data = json.loads(row[1])  # data es JSON string
+                    operation = OperationLog(
+                        operation=row[0],
+                        data=operation_data,
+                        term=row[2],
+                        timestamp=row[3]
+                    )
+                    operations.append(operation)
+                except Exception as e:
+                    print(f"[WARNING] Error cargando operación del log: {e}")
+                    continue
+        except Exception as e:
+            print(f"[ERROR] Error cargando log de operaciones: {e}")
+        finally:
+            close_connection(conn)
+    
+    return operations
+
+
 def get_peer_url(peer: str) -> str:
     """Obtiene la URL completa de un peer"""
     if not peer.startswith("http"):
@@ -235,6 +326,710 @@ def get_leader_url() -> Optional[str]:
         if cluster_state["leader_id"]:
             return get_peer_url(cluster_state["leader_id"])
         return None
+
+
+def update_peer_connectivity(peer_id: str, connected: bool):
+    """
+    Fase 3: Actualiza el estado de conectividad con un peer.
+    
+    Args:
+        peer_id: ID del peer
+        connected: True si el peer está conectado, False si no
+    """
+    with cluster_lock:
+        if peer_id not in cluster_state["peers_connectivity"]:
+            cluster_state["peers_connectivity"][peer_id] = {
+                "ever_contacted": False,
+                "last_seen": 0.0,
+                "currently_connected": False
+            }
+        
+        peer_info = cluster_state["peers_connectivity"][peer_id]
+        was_connected = peer_info["currently_connected"]
+        
+        if connected:
+            peer_info["ever_contacted"] = True
+            peer_info["last_seen"] = time.time()
+            peer_info["currently_connected"] = True
+        else:
+            peer_info["currently_connected"] = False
+        
+        # Detectar reunificación: peer que estaba desconectado ahora está conectado
+        if not was_connected and connected and peer_info["ever_contacted"]:
+            return True  # Indica que se detectó reunificación
+        
+        return False
+
+
+def check_peer_connectivity(peer_id: str, timeout: float = 2.0) -> bool:
+    """
+    Fase 3: Verifica si un peer está disponible.
+    
+    Args:
+        peer_id: ID del peer a verificar
+        timeout: Timeout para la verificación
+    
+    Returns:
+        True si el peer está disponible, False en caso contrario
+    """
+    try:
+        peer_url = get_peer_url(peer_id)
+        response = requests.get(f"{peer_url}/", timeout=timeout)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+def detect_network_reunification() -> List[str]:
+    """
+    Fase 3: Detecta si hay peers que han vuelto a estar disponibles (reunificación).
+    
+    Returns:
+        Lista de peer IDs que han vuelto a estar disponibles
+    """
+    reunited_peers = []
+    
+    with cluster_lock:
+        peers = cluster_state["peers"].copy()
+        peers_connectivity = cluster_state["peers_connectivity"].copy()
+    
+    for peer in peers:
+        if peer not in peers_connectivity:
+            continue
+        
+        peer_info = peers_connectivity[peer]
+        was_connected = peer_info.get("currently_connected", False)
+        ever_contacted = peer_info.get("ever_contacted", False)
+        
+        # Solo verificar peers que alguna vez fueron contactados
+        if not ever_contacted:
+            # Primera vez que intentamos contactar - verificar y marcar
+            is_connected = check_peer_connectivity(peer)
+            if is_connected:
+                update_peer_connectivity(peer, True)
+            continue
+        
+        # Verificar si el peer está disponible ahora
+        is_connected = check_peer_connectivity(peer)
+        
+        # Si estaba desconectado y ahora está conectado, es reunificación
+        if not was_connected and is_connected:
+            reunited = update_peer_connectivity(peer, True)
+            if reunited:
+                reunited_peers.append(peer)
+                print(f"[NAMENODE] FASE 3: ¡Peer {peer} ha vuelto a estar disponible! (Reunificación detectada)")
+        elif is_connected:
+            # Actualizar last_seen aunque ya estaba conectado
+            update_peer_connectivity(peer, True)
+        else:
+            # Peer no está disponible
+            update_peer_connectivity(peer, False)
+    
+    return reunited_peers
+
+
+def trigger_reconciliation(reunited_peers: List[str]):
+    """
+    Fase 3: Dispara el proceso de reconciliación cuando se detecta reunificación.
+    
+    Esta función será implementada en la Fase 4, por ahora solo registra el evento.
+    
+    Args:
+        reunited_peers: Lista de peer IDs que han vuelto a estar disponibles
+    """
+    if not reunited_peers:
+        return
+    
+    with cluster_lock:
+        if cluster_state["reconciliation_in_progress"]:
+            print(f"[NAMENODE] FASE 3: Reconciliación ya en progreso, ignorando nueva detección")
+            return
+        
+        cluster_state["reconciliation_in_progress"] = True
+    
+    try:
+        print(f"[NAMENODE] FASE 3: Iniciando reconciliación con peers reunificados: {reunited_peers}")
+        print(f"[NAMENODE] FASE 3: Term actual: {cluster_state['term']}")
+        
+        # TODO Fase 4: Implementar reconciliación completa
+        # Por ahora, solo registramos el evento y comparamos términos
+        with cluster_lock:
+            current_term = cluster_state["term"]
+            current_node_id = cluster_state["node_id"]
+        
+        # Comparar términos con los peers reunificados
+        for peer in reunited_peers:
+            try:
+                peer_url = get_peer_url(peer)
+                response = requests.get(f"{peer_url}/", timeout=3)
+                if response.status_code == 200:
+                    peer_data = response.json()
+                    peer_term = peer_data.get("term", 0)
+                    peer_is_leader = peer_data.get("is_leader", False)
+                    
+                    print(f"[NAMENODE] FASE 3: Peer {peer} - Term: {peer_term}, Es líder: {peer_is_leader}")
+                    
+                    # Si el peer tiene un term mayor, debería ser el líder válido
+                    if peer_term > current_term:
+                        print(f"[NAMENODE] FASE 3: Peer {peer} tiene term mayor ({peer_term} > {current_term}), debería sincronizarse")
+                    elif peer_term < current_term:
+                        print(f"[NAMENODE] FASE 3: Este nodo tiene term mayor ({current_term} > {peer_term}), peer {peer} debería sincronizarse")
+                    else:
+                        print(f"[NAMENODE] FASE 3: Términos iguales ({current_term}), se requiere reconciliación detallada")
+            except Exception as e:
+                print(f"[NAMENODE] FASE 3: Error obteniendo información de peer {peer}: {e}")
+        
+        # Fase 4: Implementar reconciliación completa
+        perform_full_reconciliation(reunited_peers)
+        
+    finally:
+        with cluster_lock:
+            cluster_state["reconciliation_in_progress"] = False
+
+
+def get_peer_operation_log(peer_id: str) -> Optional[List[OperationLog]]:
+    """
+    Fase 4: Obtiene el log de operaciones de un peer.
+    
+    Args:
+        peer_id: ID del peer del cual obtener el log
+    
+    Returns:
+        Lista de operaciones o None si hay error
+    """
+    try:
+        peer_url = get_peer_url(peer_id)
+        
+        # Obtener token de servicio para autenticación
+        try:
+            service_token = generate_service_token(cluster_state["node_id"], "service")
+        except Exception:
+            service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+        
+        response = requests.get(
+            f"{peer_url}/internal/operation-log",
+            headers={"Authorization": f"Bearer {service_token}"},
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            print(f"[NAMENODE] FASE 4: Error obteniendo log de {peer_id}: HTTP {response.status_code}")
+            return None
+        
+        data = response.json()
+        operations_data = data.get("operations", [])
+        
+        operations = []
+        for op_data in operations_data:
+            operations.append(OperationLog(
+                operation=op_data["operation"],
+                data=op_data["data"],
+                term=op_data["term"],
+                timestamp=op_data["timestamp"]
+            ))
+        
+        return operations
+        
+    except Exception as e:
+        print(f"[NAMENODE] FASE 4: Error obteniendo log de {peer_id}: {e}")
+        return None
+
+
+def get_operation_key(operation: OperationLog) -> str:
+    """
+    Fase 4: Obtiene una clave única para una operación para comparación.
+    
+    Args:
+        operation: Operación a procesar
+    
+    Returns:
+        Clave única para la operación
+    """
+    if operation.operation == "add_file":
+        # Clave: nombre de archivo + user_id
+        return f"{operation.data.get('name', '')}:{operation.data.get('user_id', '')}"
+    elif operation.operation == "delete_file":
+        # Clave: file_id
+        return str(operation.data.get("file_id", ""))
+    elif operation.operation == "delete_files_by_tags":
+        # Clave: tags ordenadas + user_id
+        tags = sorted(operation.data.get("tags", []))
+        return f"{','.join(tags)}:{operation.data.get('user_id', '')}"
+    elif operation.operation in ["add_tags", "delete_tags"]:
+        # Clave: query_tags + user_id
+        query_tags = sorted(operation.data.get("query_tags", []))
+        return f"{','.join(query_tags)}:{operation.data.get('user_id', '')}"
+    elif operation.operation == "create_user":
+        # Clave: username
+        return operation.data.get("username", "")
+    elif operation.operation == "change_password":
+        # Clave: username
+        return operation.data.get("username", "")
+    else:
+        # Clave genérica: operación + datos serializados
+        return f"{operation.operation}:{str(operation.data)}"
+
+
+def compare_operation_logs(local_log: List[OperationLog], peer_log: List[OperationLog]) -> Dict:
+    """
+    Fase 4: Compara dos logs de operaciones para encontrar diferencias.
+    
+    Returns:
+        Dict con:
+        - missing_in_local: operaciones del peer que no están en local
+        - missing_in_peer: operaciones locales que no están en peer
+        - conflicts: operaciones que existen en ambos pero con diferencias
+    """
+    # Crear índices por (operation, data_key) para búsqueda rápida
+    local_index = {}
+    for op in local_log:
+        key = (op.operation, get_operation_key(op))
+        if key not in local_index:
+            local_index[key] = []
+        local_index[key].append(op)
+    
+    peer_index = {}
+    for op in peer_log:
+        key = (op.operation, get_operation_key(op))
+        if key not in peer_index:
+            peer_index[key] = []
+        peer_index[key].append(op)
+    
+    missing_in_local = []
+    missing_in_peer = []
+    conflicts = []
+    
+    # Encontrar operaciones en peer que no están en local
+    for key, peer_ops in peer_index.items():
+        if key not in local_index:
+            missing_in_local.extend(peer_ops)
+        else:
+            # Verificar si hay diferencias (conflictos)
+            local_ops = local_index[key]
+            for peer_op in peer_ops:
+                # Buscar operación equivalente en local
+                found_match = False
+                for local_op in local_ops:
+                    if (local_op.term == peer_op.term and 
+                        abs(local_op.timestamp - peer_op.timestamp) < 1.0):
+                        # Misma operación (mismo term y timestamp similar)
+                        found_match = True
+                        break
+                
+                if not found_match:
+                    # Misma operación pero diferente term/timestamp = conflicto potencial
+                    conflicts.append({
+                        "local": local_ops[0] if local_ops else None,
+                        "peer": peer_op
+                    })
+    
+    # Encontrar operaciones en local que no están en peer
+    for key, local_ops in local_index.items():
+        if key not in peer_index:
+            missing_in_peer.extend(local_ops)
+    
+    return {
+        "missing_in_local": missing_in_local,
+        "missing_in_peer": missing_in_peer,
+        "conflicts": conflicts
+    }
+
+
+def apply_operation_safely(operation: OperationLog, node_id: str = None):
+    """
+    Fase 4: Aplica una operación de forma segura, verificando que no cause conflictos.
+    
+    Args:
+        operation: Operación a aplicar
+        node_id: ID del nodo (opcional)
+    """
+    if node_id is None:
+        node_id = NODE_ID
+    
+    try:
+        operation_data = operation.data
+        
+        if operation.operation == "add_file":
+            # Verificar si el archivo ya existe
+            from namenode.manager import get_file_by_id, query_files
+            existing_files = query_files(
+                query_tags=operation_data.get("tags", []),
+                node_id=node_id,
+                user_id=operation_data.get("user_id", "system")
+            )
+            
+            # Buscar archivo con mismo nombre y usuario
+            file_exists = False
+            for file_id, name, _ in existing_files:
+                file_info = get_file_by_id(file_id, node_id=node_id)
+                if file_info and file_info.get("name") == operation_data.get("name"):
+                    file_exists = True
+                    # Verificar si es conflicto (diferente hash)
+                    if file_info.get("hash") != operation_data.get("hash"):
+                        print(f"[NAMENODE] FASE 4: Conflicto detectado - archivo {operation_data.get('name')} tiene diferentes hashes")
+                        # Resolver conflicto: last-write-wins
+                        file_version = file_info.get("version", 1)
+                        file_timestamp = file_info.get("last_modified_timestamp", 0)
+                        if operation.timestamp > file_timestamp:
+                            print(f"[NAMENODE] FASE 4: Aplicando versión más reciente (timestamp: {operation.timestamp} > {file_timestamp})")
+                            # Actualizar archivo existente
+                            add_file_metadata(
+                                name=operation_data["name"],
+                                tags=operation_data["tags"],
+                                size=operation_data.get("size"),
+                                hash_value=operation_data.get("hash"),
+                                node_id=node_id,
+                                user_id=operation_data.get("user_id", "system"),
+                                term=operation.term
+                            )
+                    break
+            
+            if not file_exists:
+                # Archivo no existe, agregarlo
+                file_id = add_file_metadata(
+                    name=operation_data["name"],
+                    tags=operation_data["tags"],
+                    size=operation_data.get("size"),
+                    hash_value=operation_data.get("hash"),
+                    node_id=node_id,
+                    user_id=operation_data.get("user_id", "system"),
+                    term=operation.term
+                )
+                # Guardar réplicas si están en los datos
+                if file_id and "datanode_ids" in operation_data:
+                    from namenode.datanode_manager import save_file_replicas
+                    save_file_replicas(file_id, operation_data["datanode_ids"], node_id_db=node_id)
+        
+        elif operation.operation == "delete_file":
+            delete_file_metadata(
+                operation_data["file_id"],
+                node_id=node_id,
+                term=operation.term
+            )
+        
+        elif operation.operation == "delete_files_by_tags":
+            delete_files_by_tags(
+                operation_data["tags"],
+                node_id=node_id,
+                user_id=operation_data.get("user_id", "system")
+            )
+        
+        elif operation.operation == "add_tags":
+            add_tags_to_files(
+                operation_data["query_tags"],
+                operation_data["new_tags"],
+                node_id=node_id,
+                user_id=operation_data.get("user_id", "system"),
+                term=operation.term
+            )
+        
+        elif operation.operation == "delete_tags":
+            delete_tags_from_files(
+                operation_data["query_tags"],
+                operation_data["del_tags"],
+                node_id=node_id,
+                user_id=operation_data.get("user_id", "system"),
+                term=operation.term
+            )
+        
+        elif operation.operation == "create_user":
+            # Replicar creación de usuario
+            from security.auth import get_users_db_path
+            db_path = get_users_db_path(node_id)
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            try:
+                cursor.execute("SELECT username FROM users WHERE username = ?", (operation_data["username"],))
+                if not cursor.fetchone():
+                    cursor.execute("""
+                        INSERT INTO users (username, password_hash, role, is_active)
+                        VALUES (?, ?, ?, ?)
+                    """, (
+                        operation_data["username"],
+                        operation_data["password_hash"],
+                        operation_data["role"],
+                        1 if operation_data.get("is_active", True) else 0
+                    ))
+                    conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print(f"[NAMENODE] FASE 4: Error aplicando create_user: {e}")
+            finally:
+                conn.close()
+        
+        elif operation.operation == "change_password":
+            # Replicar cambio de contraseña
+            from security.auth import get_users_db_path
+            db_path = get_users_db_path(node_id)
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            try:
+                cursor.execute("""
+                    UPDATE users 
+                    SET password_hash = ?
+                    WHERE username = ?
+                """, (operation_data["new_password_hash"], operation_data["username"]))
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print(f"[NAMENODE] FASE 4: Error aplicando change_password: {e}")
+            finally:
+                conn.close()
+        
+        print(f"[NAMENODE] FASE 4: Operación {operation.operation} aplicada correctamente")
+        
+    except Exception as e:
+        print(f"[NAMENODE] FASE 4: Error aplicando operación {operation.operation}: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def perform_full_reconciliation(reunited_peers: List[str]):
+    """
+    Fase 4: Realiza reconciliación completa después de particionamiento.
+    
+    Proceso:
+    1. Obtener logs de operaciones de todos los peers reunificados
+    2. Comparar logs para encontrar operaciones faltantes
+    3. Aplicar operaciones faltantes en orden (por term y timestamp)
+    4. Detectar y resolver conflictos (last-write-wins)
+    5. Verificar integridad de datos físicos
+    6. Re-replicar archivos faltantes
+    
+    Args:
+        reunited_peers: Lista de peer IDs que han vuelto a estar disponibles
+    """
+    print(f"[NAMENODE] FASE 4: Iniciando reconciliación completa con {len(reunited_peers)} peers")
+    
+    with cluster_lock:
+        current_term = cluster_state["term"]
+        current_node_id = cluster_state["node_id"]
+    
+    # Paso 1: Obtener logs de todos los peers reunificados
+    peer_logs = {}
+    for peer in reunited_peers:
+        print(f"[NAMENODE] FASE 4: Obteniendo log de operaciones de {peer}...")
+        peer_log = get_peer_operation_log(peer)
+        if peer_log:
+            peer_logs[peer] = peer_log
+            print(f"[NAMENODE] FASE 4: Obtenidas {len(peer_log)} operaciones de {peer}")
+        else:
+            print(f"[NAMENODE] FASE 4: No se pudo obtener log de {peer}")
+    
+    if not peer_logs:
+        print(f"[NAMENODE] FASE 4: No se pudieron obtener logs de ningún peer, abortando reconciliación")
+        return
+    
+    # Paso 2: Cargar log local
+    local_log = load_operation_log(NODE_ID)
+    print(f"[NAMENODE] FASE 4: Log local tiene {len(local_log)} operaciones")
+    
+    # Paso 3: Determinar líder válido (mayor term)
+    max_term = current_term
+    leader_peer = None
+    
+    for peer, log in peer_logs.items():
+        if log:
+            # Obtener el term máximo del log del peer
+            peer_max_term = max((op.term for op in log), default=0)
+            try:
+                peer_url = get_peer_url(peer)
+                response = requests.get(f"{peer_url}/", timeout=3)
+                if response.status_code == 200:
+                    peer_data = response.json()
+                    peer_current_term = peer_data.get("term", 0)
+                    peer_max_term = max(peer_max_term, peer_current_term)
+            except:
+                pass
+            
+            if peer_max_term > max_term:
+                max_term = peer_max_term
+                leader_peer = peer
+    
+    print(f"[NAMENODE] FASE 4: Term máximo encontrado: {max_term} (líder: {leader_peer or current_node_id})")
+    
+    # Paso 4: Si hay un líder con term mayor, sincronizar desde él
+    if leader_peer and max_term > current_term:
+        print(f"[NAMENODE] FASE 4: Sincronizando desde líder {leader_peer} (term {max_term} > {current_term})")
+        leader_log = peer_logs[leader_peer]
+        
+        # Aplicar todas las operaciones del líder que no están en local
+        # Ordenar por term y timestamp
+        leader_log_sorted = sorted(leader_log, key=lambda op: (op.term, op.timestamp))
+        
+        applied_count = 0
+        for operation in leader_log_sorted:
+            # Verificar si la operación ya está en local
+            already_applied = False
+            for local_op in local_log:
+                if (local_op.operation == operation.operation and
+                    local_op.term == operation.term and
+                    abs(local_op.timestamp - operation.timestamp) < 1.0):
+                    already_applied = True
+                    break
+            
+            if not already_applied:
+                print(f"[NAMENODE] FASE 4: Aplicando operación faltante: {operation.operation} (term {operation.term})")
+                apply_operation_safely(operation, NODE_ID)
+                applied_count += 1
+        
+        print(f"[NAMENODE] FASE 4: Aplicadas {applied_count} operaciones del líder")
+        
+        # Actualizar term local
+        with cluster_lock:
+            if max_term > cluster_state["term"]:
+                cluster_state["term"] = max_term
+                cluster_state["leader_id"] = leader_peer
+                cluster_state["is_leader"] = False
+                print(f"[NAMENODE] FASE 4: Term actualizado a {max_term}")
+    
+    # Paso 5: Comparar con otros peers y aplicar operaciones faltantes
+    for peer, peer_log in peer_logs.items():
+        if peer == leader_peer:
+            continue  # Ya procesamos el líder
+        
+        print(f"[NAMENODE] FASE 4: Comparando con peer {peer}...")
+        comparison = compare_operation_logs(local_log, peer_log)
+        
+        missing_count = len(comparison["missing_in_local"])
+        conflicts_count = len(comparison["conflicts"])
+        
+        print(f"[NAMENODE] FASE 4: Peer {peer} - Faltantes: {missing_count}, Conflictos: {conflicts_count}")
+        
+        # Aplicar operaciones faltantes (ordenadas por term y timestamp)
+        missing_ops = sorted(comparison["missing_in_local"], key=lambda op: (op.term, op.timestamp))
+        for operation in missing_ops:
+            print(f"[NAMENODE] FASE 4: Aplicando operación faltante de {peer}: {operation.operation} (term {operation.term})")
+            apply_operation_safely(operation, NODE_ID)
+        
+        # Resolver conflictos (last-write-wins)
+        for conflict in comparison["conflicts"]:
+            local_op = conflict.get("local")
+            peer_op = conflict.get("peer")
+            
+            if local_op and peer_op:
+                # Usar timestamp para decidir (last-write-wins)
+                if peer_op.timestamp > local_op.timestamp:
+                    print(f"[NAMENODE] FASE 4: Resolviendo conflicto - aplicando versión de peer (timestamp: {peer_op.timestamp} > {local_op.timestamp})")
+                    apply_operation_safely(peer_op, NODE_ID)
+                else:
+                    print(f"[NAMENODE] FASE 4: Resolviendo conflicto - manteniendo versión local (timestamp: {local_op.timestamp} >= {peer_op.timestamp})")
+    
+    # Paso 6: Verificar integridad de datos físicos y re-replicar si es necesario
+    print(f"[NAMENODE] FASE 4: Verificando integridad de réplicas...")
+    verify_and_rereplicate_files(NODE_ID)
+    
+    print(f"[NAMENODE] FASE 4: Reconciliación completa finalizada")
+
+
+def verify_and_rereplicate_files(node_id: str = None):
+    """
+    Fase 4: Verifica que todos los archivos tengan suficientes réplicas y re-replica si es necesario.
+    
+    Args:
+        node_id: ID del nodo
+    """
+    if node_id is None:
+        node_id = NODE_ID
+    
+    from namenode.datanode_manager import get_file_replicas, get_active_datanodes, assign_replicas, save_file_replicas
+    from namenode.manager import query_files, get_file_by_id
+    from namenode.database import get_db_path, get_connection, close_connection, db_lock
+    
+    db_path = get_db_path(node_id)
+    
+    with db_lock:
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id)
+        try:
+            # Obtener todos los archivos
+            cursor.execute("SELECT id FROM files")
+            file_ids = [row[0] for row in cursor.fetchall()]
+        finally:
+            close_connection(conn)
+    
+    active_datanodes = get_active_datanodes(node_id_db=node_id)
+    if len(active_datanodes) < 2:
+        print(f"[NAMENODE] FASE 4: No hay suficientes DataNodes activos para verificar réplicas")
+        return
+    
+    rereplicated_count = 0
+    for file_id in file_ids:
+        replicas = get_file_replicas(file_id, node_id_db=node_id)
+        
+        # Verificar que haya al menos 2 réplicas (o 1 si solo hay 1 DataNode)
+        min_replicas = min(2, len(active_datanodes))
+        
+        if len(replicas) < min_replicas:
+            print(f"[NAMENODE] FASE 4: Archivo {file_id} tiene solo {len(replicas)} réplicas, necesita {min_replicas}")
+            
+            # Obtener información del archivo
+            file_info = get_file_by_id(file_id, node_id=node_id)
+            if not file_info:
+                continue
+            
+            file_hash = file_info.get("hash", "")
+            if file_hash.startswith("sha256:"):
+                file_hash = file_hash[7:]
+            
+            file_size = file_info.get("size", 0)
+            
+            # Obtener DataNodes que ya tienen el archivo
+            existing_datanodes = [r["datanode_id"] for r in replicas]
+            
+            # Asignar nuevas réplicas
+            new_datanode_ids = assign_replicas(
+                file_hash,
+                file_size,
+                node_id_db=node_id,
+                exclude_datanodes=existing_datanodes
+            )
+            
+            if new_datanode_ids:
+                # Actualizar réplicas en la base de datos
+                for dn_id in new_datanode_ids:
+                    if dn_id not in existing_datanodes:
+                        # Agregar nueva réplica
+                        save_file_replicas(file_id, [dn_id], node_id_db=node_id)
+                        print(f"[NAMENODE] FASE 4: Réplica asignada para archivo {file_id} en {dn_id}")
+                        rereplicated_count += 1
+    
+    if rereplicated_count > 0:
+        print(f"[NAMENODE] FASE 4: Re-replicación completada: {rereplicated_count} réplicas asignadas")
+    else:
+        print(f"[NAMENODE] FASE 4: Todas las réplicas están correctas")
+
+
+def connectivity_monitor_loop():
+    """
+    Fase 3: Loop que monitorea la conectividad con peers y detecta reunificación.
+    Se ejecuta periódicamente para verificar si peers que estaban desconectados vuelven a estar disponibles.
+    """
+    # Esperar un poco al inicio para que el sistema se estabilice
+    time.sleep(10)
+    
+    while True:
+        try:
+            # Verificar conectividad cada 10 segundos
+            time.sleep(10)
+            
+            # Solo monitorear si hay peers configurados
+            with cluster_lock:
+                peers = cluster_state["peers"].copy()
+            
+            if not peers:
+                continue
+            
+            # Detectar reunificación
+            reunited_peers = detect_network_reunification()
+            
+            # Si se detectó reunificación, disparar reconciliación
+            if reunited_peers:
+                trigger_reconciliation(reunited_peers)
+                
+        except Exception as e:
+            print(f"[NAMENODE] FASE 3: Error en monitoreo de conectividad: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 def replicate_to_peers(operation: OperationLog):
@@ -271,7 +1066,14 @@ def replicate_to_peers(operation: OperationLog):
             )
             if response.status_code == 200:
                 success_count += 1
+                # Fase 3: Actualizar conectividad
+                update_peer_connectivity(peer, True)
+            else:
+                # Fase 3: Marcar como desconectado si no responde correctamente
+                update_peer_connectivity(peer, False)
         except Exception as e:
+            # Fase 3: Marcar como desconectado si hay excepción
+            update_peer_connectivity(peer, False)
             print(f"[NAMENODE] Error replicando a {peer}: {e}")
     
     # Se necesita mayoría (quorum): al menos 2 de 3 nodos
@@ -313,10 +1115,17 @@ def request_vote(candidate_id: str, term: int) -> bool:
             )
             if response.status_code == 200:
                 successful_contacts += 1
+                # Fase 3: Actualizar conectividad
+                update_peer_connectivity(peer, True)
                 data = response.json()
                 if data.get("granted"):
                     votes += 1
+            else:
+                # Fase 3: Marcar como desconectado si no responde correctamente
+                update_peer_connectivity(peer, False)
         except Exception as e:
+            # Fase 3: Marcar como desconectado si hay excepción
+            update_peer_connectivity(peer, False)
             print(f"[NAMENODE] Error solicitando voto a {peer}: {e}")
     
     total_nodes = len(peers) + 1
@@ -396,13 +1205,20 @@ def leader_heartbeat_loop():
         for peer in peers:
             try:
                 peer_url = get_peer_url(peer)
-                requests.post(
+                response = requests.post(
                     f"{peer_url}/internal/heartbeat",
                     json={"term": term, "leader_id": leader_id},
                     headers={"Authorization": f"Bearer {service_token}"},
                     timeout=2
                 )
+                # Fase 3: Actualizar conectividad si el heartbeat fue exitoso
+                if response.status_code == 200:
+                    update_peer_connectivity(peer, True)
+                else:
+                    update_peer_connectivity(peer, False)
             except Exception as e:
+                # Fase 3: Marcar peer como desconectado
+                update_peer_connectivity(peer, False)
                 pass  # Silenciar errores de heartbeat
         
         with cluster_lock:
@@ -482,6 +1298,13 @@ async def lifespan(app: FastAPI):
     from security.auth import init_users_db
     init_users_db(node_id=cluster_state["node_id"])
     
+    # Fase 2: Cargar log de operaciones persistente al iniciar
+    print(f"[NAMENODE] Cargando log de operaciones persistente...")
+    loaded_operations = load_operation_log(cluster_state["node_id"])
+    with log_lock:
+        operation_log.extend(loaded_operations)
+    print(f"[NAMENODE] Cargadas {len(loaded_operations)} operaciones del log persistente")
+    
     # Iniciar registro en el registry
     registry_client.start()
     
@@ -494,6 +1317,11 @@ async def lifespan(app: FastAPI):
     
     election_thread = threading.Thread(target=election_retry_loop, daemon=True)
     election_thread.start()
+    
+    # Fase 3: Iniciar monitoreo de conectividad para detectar reunificación
+    connectivity_thread = threading.Thread(target=connectivity_monitor_loop, daemon=True)
+    connectivity_thread.start()
+    print(f"[NAMENODE] FASE 3: Monitoreo de conectividad iniciado")
     
     # Hilo para monitorear DataNodes inactivos y re-replicar archivos (solo en el líder)
     def datanode_monitor_loop():
@@ -655,8 +1483,50 @@ def login(credentials: UserLogin):
 @app.post("/auth/register")
 def register(user_data: UserCreate, current_user: User = Depends(require_role([Role.ADMIN]))):
     """Endpoint para registrar nuevos usuarios (solo admin) - crea usuario en la base de datos del namenode"""
+    # Solo el líder puede crear usuarios (para evitar inconsistencias)
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            headers = {}
+            # Redirigir al líder con el token de autenticación del admin
+            response = requests.post(
+                f"{leader_url}/auth/register",
+                json=user_data.dict(),
+                headers=headers,
+                timeout=5
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
     try:
         new_user = create_user(user_data, node_id=_get_node_id())
+        
+        # Replicar creación de usuario a otros namenodes
+        operation = OperationLog(
+            operation="create_user",
+            data={
+                "username": new_user.username,
+                "password_hash": new_user.password_hash,
+                "role": new_user.role.value,
+                "is_active": new_user.is_active
+            },
+            term=cluster_state["term"],
+            timestamp=time.time()
+        )
+        
+        with log_lock:
+            operation_log.append(operation)
+        
+        # Guardar en log persistente (Fase 2)
+        save_operation_to_log(operation, NODE_ID)
+        
+        replicate_to_peers(operation)
+        
         return {
             "success": True,
             "message": f"Usuario {new_user.username} creado exitosamente",
@@ -704,6 +1574,28 @@ def signup(user_data: UserSignup):
         # Forzar rol USER
         user_create = UserCreate(username=user_data.username, password=user_data.password, role=Role.USER)
         new_user = create_user(user_create, node_id=_get_node_id())
+        
+        # Replicar creación de usuario a otros namenodes
+        operation = OperationLog(
+            operation="create_user",
+            data={
+                "username": new_user.username,
+                "password_hash": new_user.password_hash,
+                "role": new_user.role.value,
+                "is_active": new_user.is_active
+            },
+            term=cluster_state["term"],
+            timestamp=time.time()
+        )
+        
+        with log_lock:
+            operation_log.append(operation)
+        
+        # Guardar en log persistente (Fase 2)
+        save_operation_to_log(operation, NODE_ID)
+        
+        replicate_to_peers(operation)
+        
         # Emitir token
         access_token = create_access_token(
             data={"sub": new_user.username, "role": new_user.role.value}
@@ -802,6 +1694,9 @@ def change_user_password(
     
     with log_lock:
         operation_log.append(operation)
+    
+    # Guardar en log persistente (Fase 2)
+    save_operation_to_log(operation, NODE_ID)
     
     replicate_to_peers(operation)
     
@@ -1289,13 +2184,18 @@ async def add_file_compat(
     print(f"[NAMENODE] Agregando metadatos: name={file.filename}, tags={tag_list}, hash={hash_value[:16]}...")
     
     # Agregar metadatos primero (asociado al usuario actual)
+    # Obtener term actual para versionado
+    with cluster_lock:
+        current_term = cluster_state["term"]
+    
     file_id = add_file_metadata(
         name=file.filename,
         tags=tag_list,
         size=file_size,
         hash_value=hash_value,
         node_id=NODE_ID,
-        user_id=current_user.username
+        user_id=current_user.username,
+        term=current_term
     )
     
     if not file_id:
@@ -1324,8 +2224,12 @@ async def add_file_compat(
     successful_datanodes = []
     failed_datanodes = []
     
+    # Determinar número mínimo de réplicas requeridas
+    # Idealmente 2, pero aceptar 1 si solo hay 1 DataNode disponible
+    min_required_replicas = min(2, len(datanode_ids)) if datanode_ids else 1
+    
     for attempt in range(max_attempts):
-        if success_count >= 2:
+        if success_count >= min_required_replicas:
             # Ya tenemos suficientes réplicas, salir
             break
         
@@ -1333,22 +2237,26 @@ async def add_file_compat(
             print(f"[NAMENODE] Reintento {attempt + 1}/{max_attempts} para almacenar archivo...")
             # Reasignar réplicas excluyendo los DataNodes que ya fallaron
             remaining_datanodes = [dn_id for dn_id in final_datanode_ids if dn_id not in failed_datanodes]
-            if len(remaining_datanodes) < 3:
+            if len(remaining_datanodes) < len(datanode_ids):
                 # Necesitamos más DataNodes, reasignar completamente
-                new_datanode_ids = assign_replicas(file_hash, file_size, node_id_db=NODE_ID)
+                new_datanode_ids = assign_replicas(file_hash, file_size, node_id_db=NODE_ID, exclude_datanodes=failed_datanodes)
                 if new_datanode_ids:
                     # Excluir los que ya fallaron
                     available_datanodes = [dn_id for dn_id in new_datanode_ids if dn_id not in failed_datanodes]
-                    if len(available_datanodes) >= 2:
+                    if len(available_datanodes) >= 1:
                         final_datanode_ids = available_datanodes[:3] if len(available_datanodes) >= 3 else available_datanodes
+                        # Actualizar mínimo requerido basado en los disponibles
+                        min_required_replicas = min(2, len(final_datanode_ids))
                     else:
                         final_datanode_ids = new_datanode_ids
+                        min_required_replicas = min(2, len(final_datanode_ids))
                 else:
                     print(f"[NAMENODE] No hay más DataNodes disponibles para reasignar")
                     break
             else:
                 # Usar los DataNodes restantes
-                final_datanode_ids = remaining_datanodes[:3]
+                final_datanode_ids = remaining_datanodes[:3] if len(remaining_datanodes) >= 3 else remaining_datanodes
+                min_required_replicas = min(2, len(final_datanode_ids))
         
         # Obtener URLs de los DataNodes
         from namenode.datanode_manager import get_datanode
@@ -1399,9 +2307,13 @@ async def add_file_compat(
                 if dn_id not in failed_datanodes:
                     failed_datanodes.append(dn_id)
     
-    # Verificar que al menos 2 de 3 réplicas se guardaron (tolerancia a fallos)
-    if success_count < 2:
-        print(f"[NAMENODE] Error: Solo {success_count}/3 réplicas se guardaron después de {max_attempts} intentos. Eliminando metadatos...")
+    # Verificar que se guardó al menos 1 réplica (o 2 si hay múltiples DataNodes disponibles)
+    # Si solo hay 1 DataNode disponible, aceptar 1 réplica; si hay más, preferir al menos 2
+    expected_replicas = len(datanode_ids) if datanode_ids else 1
+    min_acceptable = min_required_replicas
+    
+    if success_count < min_acceptable:
+        print(f"[NAMENODE] Error: Solo {success_count}/{expected_replicas} réplicas se guardaron después de {max_attempts} intentos (mínimo requerido: {min_acceptable}). Eliminando metadatos...")
         # Intentar eliminar de los DataNodes que sí recibieron el archivo
         for dn_id in successful_datanodes:
             dn_info = get_datanode(dn_id, node_id_db=NODE_ID)
@@ -1426,7 +2338,7 @@ async def add_file_compat(
         delete_file_metadata(file_id, node_id=NODE_ID)
         raise HTTPException(
             status_code=507,
-            detail=f"No se pudo almacenar el archivo en suficientes DataNodes después de {max_attempts} intentos ({success_count}/3)"
+            detail=f"No se pudo almacenar el archivo en suficientes DataNodes después de {max_attempts} intentos ({success_count}/{expected_replicas}, mínimo requerido: {min_acceptable})"
         )
     
     # Guardar asignación de réplicas con los DataNodes exitosos
@@ -1452,6 +2364,9 @@ async def add_file_compat(
     
     with log_lock:
         operation_log.append(operation)
+    
+    # Guardar en log persistente (Fase 2)
+    save_operation_to_log(operation, NODE_ID)
     
     replicate_to_peers(operation)
     
@@ -1538,7 +2453,12 @@ def delete_files_compat(
         raise HTTPException(status_code=503, detail="No hay líder disponible")
     
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
-    deleted = delete_files_by_tags(tag_list, node_id=NODE_ID, user_id=current_user.username)
+    
+    # Obtener term actual para versionado
+    with cluster_lock:
+        current_term = cluster_state["term"]
+    
+    deleted = delete_files_by_tags(tag_list, node_id=NODE_ID, user_id=current_user.username, term=current_term)
     
     if deleted:
         operation = OperationLog(
@@ -1549,6 +2469,8 @@ def delete_files_compat(
         )
         with log_lock:
             operation_log.append(operation)
+        # Guardar en log persistente (Fase 2)
+        save_operation_to_log(operation, NODE_ID)
         replicate_to_peers(operation)
     
     return {
@@ -1582,7 +2504,11 @@ def add_tags_compat(
     query_tags = [t.strip() for t in query.split(",") if t.strip()]
     new_tags_list = [t.strip() for t in new_tags.split(",") if t.strip()]
     
-    ok = add_tags_to_files(query_tags, new_tags_list, node_id=NODE_ID, user_id=current_user.username)
+    # Obtener term actual para versionado
+    with cluster_lock:
+        current_term = cluster_state["term"]
+    
+    ok = add_tags_to_files(query_tags, new_tags_list, node_id=NODE_ID, user_id=current_user.username, term=current_term)
     
     if ok:
         operation = OperationLog(
@@ -1593,6 +2519,8 @@ def add_tags_compat(
         )
         with log_lock:
             operation_log.append(operation)
+        # Guardar en log persistente (Fase 2)
+        save_operation_to_log(operation, NODE_ID)
         replicate_to_peers(operation)
     
     return {"success": ok}
@@ -1623,7 +2551,11 @@ def delete_tags_compat(
     query_tags = [t.strip() for t in query.split(",") if t.strip()]
     del_tags_list = [t.strip() for t in del_tags.split(",") if t.strip()]
     
-    ok = delete_tags_from_files(query_tags, del_tags_list, node_id=NODE_ID, user_id=current_user.username)
+    # Obtener term actual para versionado
+    with cluster_lock:
+        current_term = cluster_state["term"]
+    
+    ok = delete_tags_from_files(query_tags, del_tags_list, node_id=NODE_ID, user_id=current_user.username, term=current_term)
     
     if ok:
         operation = OperationLog(
@@ -1634,6 +2566,8 @@ def delete_tags_compat(
         )
         with log_lock:
             operation_log.append(operation)
+        # Guardar en log persistente (Fase 2)
+        save_operation_to_log(operation, NODE_ID)
         replicate_to_peers(operation)
     
     return {"success": ok}
@@ -1642,7 +2576,8 @@ def delete_tags_compat(
 @app.get("/download/{file_name}")
 def download_file_compat(
     file_name: str,
-    current_user: User = Depends(require_permission(Permission.READ_FILES))
+    current_user: User = Depends(require_permission(Permission.READ_FILES)),
+    authorization: Optional[str] = Header(None, alias="Authorization")
 ):
     """
     Endpoint de compatibilidad: descarga de archivo desde DataNodes.
@@ -1656,14 +2591,35 @@ def download_file_compat(
         leader_url = get_leader_url()
         if leader_url:
             print(f"[NAMENODE] Redirigiendo descarga a líder: {leader_url}/download/{file_name}")
-            return RedirectResponse(
-                url=f"{leader_url}/download/{file_name}",
-                status_code=307
-            )
+            # Pasar el token de autenticación al líder
+            headers = {}
+            if authorization:
+                headers["Authorization"] = authorization
+            try:
+                response = requests.get(
+                    f"{leader_url}/download/{file_name}",
+                    headers=headers,
+                    timeout=30,
+                    allow_redirects=True  # Seguir redirecciones automáticamente
+                )
+                response.raise_for_status()
+                # Retornar el archivo directamente
+                from fastapi.responses import Response
+                return Response(
+                    content=response.content,
+                    media_type=response.headers.get("Content-Type", "application/octet-stream"),
+                    headers={
+                        "Content-Disposition": response.headers.get("Content-Disposition", f'attachment; filename="{file_name}"'),
+                        "Content-Length": response.headers.get("Content-Length", str(len(response.content)))
+                    }
+                )
+            except requests.RequestException as e:
+                print(f"[NAMENODE] Error redirigiendo descarga a líder: {e}")
+                raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
         else:
             # No hay líder disponible
-            print(f"[NAMENODE] ERROR: No hay líder disponible para redirigir")
-            raise HTTPException(status_code=503, detail="No hay líder disponible")
+            print(f"[NAMENODE] ERROR: No hay líder disponible para procesar descarga")
+            raise HTTPException(status_code=503, detail="No hay líder disponible. Intenta de nuevo en unos momentos.")
     
     # Buscar archivo por nombre en metadatos (solo del usuario actual)
     files = query_files(query_tags=None, node_id=NODE_ID, user_id=current_user.username)
@@ -1802,7 +2758,8 @@ def internal_replicate(
                 size=operation_data.get("size"),
                 hash_value=operation_data.get("hash"),
                 node_id=NODE_ID,
-                user_id=operation_data.get("user_id", "system")  # Para replicación
+                user_id=operation_data.get("user_id", "system"),  # Para replicación
+                term=term  # Usar el term de la operación replicada
             )
             # También guardar las réplicas si están en los datos de la operación
             if file_id and "datanode_ids" in operation_data:
@@ -1812,24 +2769,54 @@ def internal_replicate(
                     save_file_replicas(file_id, datanode_ids, node_id_db=NODE_ID)
                     print(f"[NAMENODE] Réplicas replicadas para file_id={file_id}: {datanode_ids}")
         elif operation == "delete_file":
-            delete_file_metadata(operation_data["file_id"], node_id=NODE_ID)
+            delete_file_metadata(operation_data["file_id"], node_id=NODE_ID, term=term)
         elif operation == "delete_files_by_tags":
             delete_files_by_tags(operation_data["tags"], node_id=NODE_ID, 
-                                user_id=operation_data.get("user_id", "system"))
+                                user_id=operation_data.get("user_id", "system"), term=term)
         elif operation == "add_tags":
             add_tags_to_files(
                 operation_data["query_tags"],
                 operation_data["new_tags"],
                 node_id=NODE_ID,
-                user_id=operation_data.get("user_id", "system")
+                user_id=operation_data.get("user_id", "system"),
+                term=term
             )
         elif operation == "delete_tags":
             delete_tags_from_files(
                 operation_data["query_tags"],
                 operation_data["del_tags"],
                 node_id=NODE_ID,
-                user_id=operation_data.get("user_id", "system")
+                user_id=operation_data.get("user_id", "system"),
+                term=term
             )
+        elif operation == "create_user":
+            # Replicar creación de usuario
+            from security.auth import get_users_db_path, get_password_hash
+            db_path = get_users_db_path(NODE_ID)
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            try:
+                # Verificar si el usuario ya existe
+                cursor.execute("SELECT username FROM users WHERE username = ?", (operation_data["username"],))
+                if cursor.fetchone():
+                    print(f"[NAMENODE] Usuario {operation_data['username']} ya existe, saltando replicación")
+                else:
+                    cursor.execute("""
+                        INSERT INTO users (username, password_hash, role, is_active)
+                        VALUES (?, ?, ?, ?)
+                    """, (
+                        operation_data["username"],
+                        operation_data["password_hash"],
+                        operation_data["role"],
+                        1 if operation_data.get("is_active", True) else 0
+                    ))
+                    conn.commit()
+                    print(f"[NAMENODE] Usuario {operation_data['username']} replicado")
+            except Exception as e:
+                conn.rollback()
+                print(f"[NAMENODE] Error replicando usuario: {e}")
+            finally:
+                conn.close()
         elif operation == "change_password":
             # Replicar cambio de contraseña
             from security.auth import get_users_db_path
@@ -1919,4 +2906,47 @@ def internal_heartbeat(
             cluster_state["last_heartbeat_time"] = time.time()
     
     return {"success": True}
+
+
+@app.get("/internal/operation-log")
+def get_operation_log_endpoint(
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """
+    Fase 4: Endpoint interno para obtener el log de operaciones.
+    Usado para reconciliación después de particionamiento.
+    """
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene de otro namenode
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not service_id.startswith("namenode-"):
+        raise HTTPException(status_code=403, detail="Solo namenodes pueden obtener logs")
+    
+    # Cargar log desde la base de datos
+    operations = load_operation_log(NODE_ID)
+    
+    # Convertir a formato JSON serializable
+    operations_data = []
+    for op in operations:
+        operations_data.append({
+            "operation": op.operation,
+            "data": op.data,
+            "term": op.term,
+            "timestamp": op.timestamp
+        })
+    
+    return {
+        "node_id": NODE_ID,
+        "term": cluster_state["term"],
+        "operations": operations_data,
+        "total": len(operations_data)
+    }
 

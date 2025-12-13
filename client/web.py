@@ -536,9 +536,12 @@ def refresh_list(tags=None):
         # No mostrar error aquí, ya se muestra en el expander de conexión
         return []
 
-# --- Función para obtener contenido de archivo ---
+# --- Función para obtener contenido de archivo y guardarlo en downloads ---
 def get_file_content(file_name):
-    """Obtiene el contenido de un archivo para descarga"""
+    """
+    Obtiene el contenido de un archivo y lo guarda en la carpeta downloads/.
+    Retorna la ruta del archivo guardado y None si hay error.
+    """
     server_url, _ = get_server_url()
     if not server_url:
         return None, "No hay servidor disponible"
@@ -558,14 +561,31 @@ def get_file_content(file_name):
             allow_redirects=True  # Seguir redirecciones HTTP 307 automáticamente
         )
         r.raise_for_status()
-        return r.content, None
+        
+        # Guardar el archivo en la carpeta downloads/
+        file_path = os.path.join(DOWNLOAD_DIR, file_name)
+        # Asegurar que el directorio existe
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        
+        # Guardar el contenido del archivo
+        with open(file_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        print(f"[CLIENT] Archivo guardado en: {file_path}")
+        return file_path, None
+        
     except requests.HTTPError as e:
         # Si es un error 503, puede ser que el namenode no sea el líder
         if e.response and e.response.status_code == 503:
             return None, f"Servicio no disponible. El namenode puede no ser el líder. Intenta de nuevo."
         return None, str(e)
     except requests.RequestException as e:
-        return None, str(e)
+        return None, f"Error de conexión: {str(e)}"
+    except IOError as e:
+        return None, f"Error guardando archivo: {str(e)}"
+    except Exception as e:
+        return None, f"Error inesperado: {str(e)}"
 
 # --- Mostrar lista ---
 st.subheader("📖 Archivos disponibles")
@@ -762,28 +782,39 @@ if files:
         st.markdown("### 📥 Descargar archivos seleccionados")
         files_to_remove = []
         for file_name in st.session_state.files_to_download:
-            file_content, error = get_file_content(file_name)
-            if file_content:
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.download_button(
-                        label=f"📥 Descargar {file_name}",
-                        data=file_content,
-                        file_name=file_name,
-                        mime="application/octet-stream",
-                        key=f"download_{file_name}_{page_idx}",
-                        use_container_width=True
-                    )
-                with col2:
-                    if st.button("❌", key=f"remove_{file_name}_{page_idx}", help="Quitar de la lista"):
-                        files_to_remove.append(file_name)
+            file_path, error = get_file_content(file_name)
+            if file_path and os.path.exists(file_path):
+                # Leer el archivo desde la carpeta downloads/
+                try:
+                    with open(file_path, 'rb') as f:
+                        file_content = f.read()
+                    
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.download_button(
+                            label=f"📥 Descargar {file_name}",
+                            data=file_content,
+                            file_name=file_name,
+                            mime="application/octet-stream",
+                            key=f"download_{file_name}_{page_idx}",
+                            use_container_width=True
+                        )
+                        # Mostrar ruta donde se guardó
+                        st.caption(f"💾 Guardado en: {file_path}")
+                    with col2:
+                        if st.button("❌", key=f"remove_{file_name}_{page_idx}", help="Quitar de la lista"):
+                            files_to_remove.append(file_name)
+                except IOError as e:
+                    st.error(f"❌ Error leyendo archivo guardado '{file_name}': {e}")
+                    files_to_remove.append(file_name)
             else:
                 st.error(f"❌ Error al obtener '{file_name}': {error}")
                 files_to_remove.append(file_name)
         
         # Remover archivos de la lista
         for file_name in files_to_remove:
-            st.session_state.files_to_download.remove(file_name)
+            if file_name in st.session_state.files_to_download:
+                st.session_state.files_to_download.remove(file_name)
         
         if st.button("🗑️ Limpiar lista de descargas", key="clear_downloads"):
             st.session_state.files_to_download = []

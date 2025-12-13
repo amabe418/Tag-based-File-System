@@ -5,6 +5,7 @@ No almacena rutas físicas de archivos (eso lo manejan los DataNodes)
 import sqlite3
 import os
 import threading
+import time
 
 # Lock para operaciones concurrentes en la base de datos
 db_lock = threading.Lock()
@@ -58,19 +59,109 @@ def init_db(db_path: str = None, node_id: str = None):
         hash TEXT,
         user_id TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        version INTEGER DEFAULT 1,
+        last_modified_term INTEGER DEFAULT 0,
+        last_modified_timestamp REAL,
         UNIQUE(user_id, name)
     )
     """)
     
     # Migración: agregar user_id a files si no existe (para bases de datos existentes)
     try:
-        cursor.execute("ALTER TABLE files ADD COLUMN user_id TEXT")
+        # Verificar si la columna user_id existe
+        cursor.execute("PRAGMA table_info(files)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        if 'user_id' not in columns:
+            cursor.execute("ALTER TABLE files ADD COLUMN user_id TEXT")
+            cursor.execute("UPDATE files SET user_id = 'system' WHERE user_id IS NULL")
+            print("[DATABASE] Columna user_id agregada a tabla files")
+    except sqlite3.OperationalError as e:
+        # La columna ya existe, continuar
+        print(f"[DATABASE] user_id ya existe o error: {e}")
+        pass
+    
+    # Migración: agregar campos de versionado si no existen
+    try:
+        cursor.execute("PRAGMA table_info(files)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        migration_needed = False
+        
+        if 'version' not in columns:
+            cursor.execute("ALTER TABLE files ADD COLUMN version INTEGER DEFAULT 1")
+            cursor.execute("UPDATE files SET version = 1 WHERE version IS NULL")
+            print("[DATABASE] Columna version agregada a tabla files")
+            migration_needed = True
+        
+        if 'last_modified_term' not in columns:
+            cursor.execute("ALTER TABLE files ADD COLUMN last_modified_term INTEGER DEFAULT 0")
+            cursor.execute("UPDATE files SET last_modified_term = 0 WHERE last_modified_term IS NULL")
+            print("[DATABASE] Columna last_modified_term agregada a tabla files")
+            migration_needed = True
+        
+        if 'last_modified_timestamp' not in columns:
+            cursor.execute("ALTER TABLE files ADD COLUMN last_modified_timestamp REAL")
+            # Usar time.time() para establecer valores por defecto en lugar de julianday
+            cursor.execute("UPDATE files SET last_modified_timestamp = ? WHERE last_modified_timestamp IS NULL", (time.time(),))
+            print("[DATABASE] Columna last_modified_timestamp agregada a tabla files")
+            migration_needed = True
+        
+        # Hacer commit de las migraciones si se realizaron cambios
+        if migration_needed:
+            conn.commit()
+            print("[DATABASE] Migraciones de campos de versionado completadas y guardadas")
+    except sqlite3.OperationalError as e:
+        print(f"[DATABASE] Error en migración de campos de versionado: {e}")
+        # Intentar hacer rollback si hay un error
+        try:
+            conn.rollback()
+        except:
+            pass
+        # Re-verificar que las columnas existen después del error
+        try:
+            cursor.execute("PRAGMA table_info(files)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if 'last_modified_timestamp' not in columns:
+                print("[DATABASE] ERROR CRÍTICO: Columna last_modified_timestamp no existe y no se pudo agregar")
+                # Intentar agregar la columna de nuevo con un enfoque más simple
+                try:
+                    cursor.execute("ALTER TABLE files ADD COLUMN last_modified_timestamp REAL")
+                    cursor.execute("UPDATE files SET last_modified_timestamp = ? WHERE last_modified_timestamp IS NULL", (time.time(),))
+                    conn.commit()
+                    print("[DATABASE] Columna last_modified_timestamp agregada con método alternativo")
+                except Exception as e2:
+                    print(f"[DATABASE] Error crítico agregando last_modified_timestamp: {e2}")
+        except Exception as e3:
+            print(f"[DATABASE] Error verificando columnas después de fallo de migración: {e3}")
+    
+    # Asegurar que user_id no sea NULL
+    try:
         cursor.execute("UPDATE files SET user_id = 'system' WHERE user_id IS NULL")
-        # Recrear índice único con user_id
+    except sqlite3.OperationalError:
+        pass
+    
+    # Eliminar cualquier restricción UNIQUE antigua solo en 'name'
+    # SQLite no permite eliminar restricciones UNIQUE directamente, pero podemos
+    # verificar si hay duplicados y manejarlos, o recrear la tabla si es necesario
+    try:
+        # Verificar si hay archivos sin user_id o con user_id NULL
+        cursor.execute("SELECT COUNT(*) FROM files WHERE user_id IS NULL")
+        null_count = cursor.fetchone()[0]
+        if null_count > 0:
+            cursor.execute("UPDATE files SET user_id = 'system' WHERE user_id IS NULL")
+            print(f"[DATABASE] Actualizados {null_count} archivos con user_id='system'")
+    except Exception as e:
+        print(f"[DATABASE] Error verificando user_id: {e}")
+    
+    # Crear índice único correcto con user_id y name
+    # Esto permite que diferentes usuarios tengan archivos con el mismo nombre
+    try:
         cursor.execute("DROP INDEX IF EXISTS idx_files_user_name")
         cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_user_name ON files(user_id, name)")
-    except sqlite3.OperationalError:
-        # La columna ya existe o el índice ya existe, continuar
+        print("[DATABASE] Índice único (user_id, name) creado/verificado")
+    except sqlite3.OperationalError as e:
+        print(f"[DATABASE] Error creando índice único: {e}")
         pass
     
     # Migración: inicializar usuario admin si no existe
@@ -91,24 +182,92 @@ def init_db(db_path: str = None, node_id: str = None):
         print(f"[DATABASE] No se pudo crear usuario admin: {e}")
         pass
     
-    # Tabla de etiquetas (pueden ser globales o por usuario)
+    # Tabla de etiquetas - cada etiqueta pertenece a un usuario (aislamiento estricto)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS tags (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tag TEXT NOT NULL,
-            user_id TEXT,  -- NULL para tags globales, username para tags privadas
+            user_id TEXT NOT NULL,  -- OBLIGATORIO: cada etiqueta pertenece a un usuario
             UNIQUE(user_id, tag)
         )
     """)
     
-    # Migración: agregar user_id a tags si no existe
+    # Migración: agregar user_id a tags si no existe y migrar datos existentes
     try:
-        cursor.execute("ALTER TABLE tags ADD COLUMN user_id TEXT")
-        # Actualizar índice único
+        # Verificar si la columna user_id existe
+        cursor.execute("PRAGMA table_info(tags)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        if 'user_id' not in columns:
+            # Agregar columna user_id
+            cursor.execute("ALTER TABLE tags ADD COLUMN user_id TEXT")
+            print("[DATABASE] Columna user_id agregada a tabla tags")
+        
+        # Migrar datos existentes: asignar user_id a etiquetas basándose en archivos asociados
+        try:
+            cursor.execute("""
+                UPDATE tags 
+                SET user_id = (
+                    SELECT DISTINCT f.user_id 
+                    FROM files f
+                    JOIN file_tags ft ON f.id = ft.file_id
+                    WHERE ft.tag_id = tags.id AND f.user_id IS NOT NULL
+                    LIMIT 1
+                )
+                WHERE user_id IS NULL AND id IN (
+                    SELECT DISTINCT ft.tag_id 
+                    FROM file_tags ft
+                    JOIN files f ON ft.file_id = f.id
+                    WHERE f.user_id IS NOT NULL
+                )
+            """)
+            migrated_count = cursor.rowcount
+            if migrated_count > 0:
+                print(f"[DATABASE] Migradas {migrated_count} etiquetas con user_id basado en archivos asociados")
+            
+            # Asignar 'system' a etiquetas que aún no tienen user_id pero tienen archivos
+            cursor.execute("""
+                UPDATE tags 
+                SET user_id = 'system'
+                WHERE user_id IS NULL AND id IN (
+                    SELECT DISTINCT tag_id FROM file_tags
+                )
+            """)
+            system_count = cursor.rowcount
+            if system_count > 0:
+                print(f"[DATABASE] Asignadas {system_count} etiquetas legacy a user_id='system'")
+            
+            # Eliminar etiquetas sin archivos asociados y sin user_id
+            cursor.execute("""
+                DELETE FROM tags 
+                WHERE user_id IS NULL 
+                AND id NOT IN (SELECT DISTINCT tag_id FROM file_tags)
+            """)
+            deleted_count = cursor.rowcount
+            if deleted_count > 0:
+                print(f"[DATABASE] Eliminadas {deleted_count} etiquetas huérfanas sin user_id")
+            
+            conn.commit()
+        except Exception as e:
+            print(f"[DATABASE] Error en migración de etiquetas: {e}")
+            conn.rollback()
+        
+        # Asegurar que todas las etiquetas tengan user_id
+        try:
+            cursor.execute("UPDATE tags SET user_id = 'system' WHERE user_id IS NULL")
+            if cursor.rowcount > 0:
+                print(f"[DATABASE] Asignadas {cursor.rowcount} etiquetas restantes a user_id='system'")
+                conn.commit()
+        except Exception as e:
+            print(f"[DATABASE] Error asignando user_id a etiquetas: {e}")
+        
+        # Crear índice único correcto
         cursor.execute("DROP INDEX IF EXISTS idx_tags_user_tag")
         cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_user_tag ON tags(user_id, tag)")
-    except sqlite3.OperationalError:
+        print("[DATABASE] Índice único (user_id, tag) creado/verificado")
+    except sqlite3.OperationalError as e:
         # La columna ya existe o el índice ya existe, continuar
+        print(f"[DATABASE] user_id ya existe o error en migración: {e}")
         pass
     
     # Tabla intermedia archivo-etiqueta
@@ -161,6 +320,22 @@ def init_db(db_path: str = None, node_id: str = None):
             email TEXT
         )
     """)
+    
+    # Tabla para log persistente de operaciones (Fase 2)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS operation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation TEXT NOT NULL,
+            data TEXT NOT NULL,  -- JSON string
+            term INTEGER NOT NULL,
+            timestamp REAL NOT NULL,
+            node_id TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_log_term ON operation_log(term)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_log_timestamp ON operation_log(timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_log_node_id ON operation_log(node_id)")
     
     # Índices para mejorar rendimiento
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_user_id ON files(user_id)")

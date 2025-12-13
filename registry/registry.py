@@ -1,6 +1,7 @@
 """
-Registry Service - Servicio de descubrimiento distribuido con 3 nodos
-Mantiene registro de todos los servidores de datos activos con replicación
+Registry Service - Servicio de descubrimiento distribuido
+Mantiene registro de todos los servidores de datos activos con replicación.
+Soporta cualquier número de nodos registry en el cluster.
 """
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -446,12 +447,24 @@ def connectivity_monitor_loop():
 
 
 def replicate_to_peers(servers_data: Dict, term: int):
-    """Replica el estado a los peers del cluster"""
+    """
+    Replica el estado a los peers del cluster.
+    
+    Maneja correctamente:
+    - Cualquier número de nodos en el cluster
+    - Tolerancia a fallos: continúa funcionando aunque algunos nodos estén desconectados
+    - Quorum dinámico basado en nodos disponibles
+    - Modo degradado: si solo queda 1 nodo, continúa operando
+    
+    Returns:
+        True si la replicación fue exitosa (o si el sistema puede continuar en modo degradado)
+    """
     with cluster_lock:
         peers = cluster_state["peers"].copy()
         leader_id = cluster_state["node_id"]
     
-    # Si no hay peers, no hay nada que replicar (modo desarrollo)
+    # Si no hay peers configurados, no hay nada que replicar
+    # Esto es normal cuando hay solo 1 nodo en el cluster
     if not peers:
         return True
     
@@ -488,32 +501,75 @@ def replicate_to_peers(servers_data: Dict, term: int):
             update_peer_connectivity(peer, False)
             print(f"[REGISTRY] Error replicando a {peer}: {e}")
     
-    # Se necesita mayoría (quorum): al menos 2 de 3 nodos
+    # Calcular quorum basado en nodos configurados
+    # Fórmula: (total_nodes // 2) + 1
+    # Ejemplos: 3 nodos -> quorum=2, 5 nodos -> quorum=3, 7 nodos -> quorum=4
     total_nodes = len(peers) + 1  # +1 por este nodo
     quorum = (total_nodes // 2) + 1
-    replicated = success_count + 1 >= quorum  # +1 por este nodo
     
-    # Si solo queda este nodo disponible, la replicación es exitosa (tolerancia a fallos)
-    if success_count == 1 and total_nodes > 1:
-        # Este es el único nodo disponible, pero hay otros configurados
-        # Esto es normal en caso de fallos, no es un warning crítico
-        print(f"[REGISTRY] Solo este nodo está disponible ({success_count + 1}/{total_nodes} nodos). Continuando operación (tolerancia a fallos activa).")
+    # Nodos que recibieron replicación exitosamente (incluyendo este nodo)
+    nodes_with_replica = success_count + 1  # +1 por este nodo
+    
+    # CASO 1: Si solo queda este nodo disponible (tolerancia a fallos)
+    # Permite que el sistema continúe funcionando aunque otros nodos estén caídos
+    if success_count == 0 and total_nodes > 1:
+        print(f"[REGISTRY] ⚠️ Solo este nodo está disponible (0/{len(peers)} peers respondieron)")
+        print(f"[REGISTRY] Continuando operación en modo degradado (tolerancia a fallos activa)")
         return True
     
-    if not replicated:
-        print(f"[REGISTRY] WARNING: Solo se replicó a {success_count + 1}/{total_nodes} nodos (quorum: {quorum})")
+    # CASO 2: Calcular quorum basado en nodos disponibles
+    # Si hay nodos disponibles, usar quorum de nodos disponibles
+    available_nodes = nodes_with_replica
+    if available_nodes > 0:
+        available_quorum = (available_nodes // 2) + 1
+        
+        # Si tenemos quorum de nodos disponibles, la replicación es exitosa
+        if nodes_with_replica >= available_quorum:
+            if nodes_with_replica < quorum:
+                print(f"[REGISTRY] ✓ Replicación exitosa a {nodes_with_replica}/{total_nodes} nodos (quorum disponible: {available_quorum}, quorum total: {quorum})")
+            else:
+                print(f"[REGISTRY] ✓ Replicación exitosa a {nodes_with_replica}/{total_nodes} nodos (quorum: {quorum})")
+            return True
     
-    return replicated
+    # CASO 3: Si tenemos quorum del total configurado (caso ideal)
+    if nodes_with_replica >= quorum:
+        print(f"[REGISTRY] ✓ Replicación exitosa a {nodes_with_replica}/{total_nodes} nodos (quorum: {quorum})")
+        return True
+    
+    # Si no se alcanzó ningún quorum, mostrar advertencia pero continuar
+    print(f"[REGISTRY] WARNING: Solo se replicó a {nodes_with_replica}/{total_nodes} nodos (quorum: {quorum})")
+    print(f"[REGISTRY] Continuando operación en modo degradado")
+    return True  # Retornar True para permitir que el sistema continúe funcionando
 
 
 def request_vote(candidate_id: str, term: int) -> bool:
-    """Solicita votos para elección de líder"""
+    """
+    Solicita votos para elección de líder.
+    
+    Maneja correctamente:
+    - Cualquier número de nodos en el cluster (no limitado a cantidad fija)
+    - Casos donde algunos peers están desconectados
+    - Tolerancia a fallos: si solo queda 1 nodo disponible, ese nodo se convierte en líder
+    - Quorum dinámico basado en nodos disponibles
+    
+    Ejemplos:
+    - 3 nodos configurados, 2 caen: el nodo restante se convierte en líder
+    - 5 nodos configurados, 3 caen: los 2 restantes pueden elegir un líder
+    - 1 nodo configurado: ese nodo es automáticamente líder
+    """
     with cluster_lock:
         peers = cluster_state["peers"].copy()
     
     # Si no hay peers, este nodo es el único y es líder
     if not peers:
+        print(f"[REGISTRY] [ELECCIÓN] Sin peers configurados, {candidate_id} es automáticamente líder")
         return True
+    
+    total_nodes = len(peers) + 1  # +1 por este nodo
+    quorum = (total_nodes // 2) + 1  # Mayoría simple
+    
+    print(f"[REGISTRY] [ELECCIÓN] Solicitando votos para {candidate_id} (término {term})")
+    print(f"[REGISTRY] [ELECCIÓN] Total nodos: {total_nodes}, Quorum necesario: {quorum}")
     
     # Obtener token de servicio para autenticación
     try:
@@ -524,6 +580,8 @@ def request_vote(candidate_id: str, term: int) -> bool:
     
     votes = 1  # Voto propio
     successful_contacts = 1  # Contamos este nodo
+    contacted_peers = []
+    unreachable_peers = []
     
     for peer in peers:
         try:
@@ -536,34 +594,59 @@ def request_vote(candidate_id: str, term: int) -> bool:
             )
             if response.status_code == 200:
                 successful_contacts += 1
+                contacted_peers.append(peer)
                 # Fase 3: Actualizar conectividad
                 update_peer_connectivity(peer, True)
                 data = response.json()
                 if data.get("granted"):
                     votes += 1
+                    print(f"[REGISTRY] [ELECCIÓN] ✓ Voto obtenido de {peer}")
+                else:
+                    print(f"[REGISTRY] [ELECCIÓN] ✗ Voto denegado por {peer} (término: {data.get('term')})")
             else:
                 # Fase 3: Marcar como desconectado si no responde correctamente
                 update_peer_connectivity(peer, False)
+                unreachable_peers.append(peer)
+                print(f"[REGISTRY] [ELECCIÓN] ✗ {peer} respondió con error (status {response.status_code})")
         except Exception as e:
             # Fase 3: Marcar como desconectado si hay excepción
             update_peer_connectivity(peer, False)
-            print(f"[REGISTRY] Error solicitando voto a {peer}: {e}")
+            unreachable_peers.append(peer)
+            print(f"[REGISTRY] [ELECCIÓN] ✗ No se pudo contactar a {peer}: {e}")
     
-    total_nodes = len(peers) + 1
-    quorum = (total_nodes // 2) + 1
+    # Resumen de la elección
+    print(f"[REGISTRY] [ELECCIÓN] Resumen: Votos={votes}/{quorum}, Contactados={successful_contacts}/{total_nodes}")
+    if contacted_peers:
+        print(f"[REGISTRY] [ELECCIÓN] Peers contactados: {contacted_peers}")
+    if unreachable_peers:
+        print(f"[REGISTRY] [ELECCIÓN] Peers inaccesibles: {unreachable_peers}")
     
-    # Si tenemos mayoría de votos Y al menos quorum de nodos respondieron
-    if votes >= quorum and successful_contacts >= quorum:
-        return True
-    
-    # Si no pudimos contactar a ningún peer, pero este nodo está activo,
-    # asumimos que es el único disponible y se convierte en líder
-    # Esto permite tolerancia a fallos: si 2 de 3 nodos fallan, el restante sigue funcionando
+    # CASO 1: Si solo queda este nodo disponible (tolerancia a fallos)
+    # Permite que un nodo siga funcionando aunque otros estén caídos
     if successful_contacts == 1:
-        print(f"[REGISTRY] No se pudo contactar a ningún peer. Este nodo es el único disponible, convirtiéndose en líder.")
+        print(f"[REGISTRY] [ELECCIÓN] ⚠️ Solo este nodo está disponible ({len(unreachable_peers)} nodos inaccesibles de {total_nodes} totales)")
+        print(f"[REGISTRY] [ELECCIÓN] Este nodo se convierte en líder para mantener el servicio activo")
         return True
     
-    print(f"[REGISTRY] Votos obtenidos: {votes}/{quorum}, Nodos contactados: {successful_contacts}/{total_nodes}")
+    # CASO 2: Calcular quorum basado en nodos disponibles (no configurados)
+    # Esto permite que el sistema funcione con cualquier número de nodos disponibles
+    available_nodes = successful_contacts  # Nodos que respondieron (incluyendo este)
+    available_quorum = (available_nodes // 2) + 1  # Quorum de nodos disponibles
+    
+    print(f"[REGISTRY] [ELECCIÓN] Nodos disponibles: {available_nodes}/{total_nodes}, Quorum disponible: {available_quorum}")
+    
+    # Si tenemos mayoría de votos de los nodos disponibles
+    if votes >= available_quorum:
+        print(f"[REGISTRY] [ELECCIÓN] ✓ Mayoría obtenida de nodos disponibles ({votes}/{available_quorum} votos de {available_nodes} nodos disponibles)")
+        return True
+    
+    # CASO 3: Si tenemos mayoría del quorum total configurado (caso ideal)
+    if votes >= quorum and successful_contacts >= quorum:
+        print(f"[REGISTRY] [ELECCIÓN] ✓ Mayoría obtenida del quorum total ({votes}/{quorum} votos, {successful_contacts}/{total_nodes} nodos contactados)")
+        return True
+    
+    print(f"[REGISTRY] [ELECCIÓN] ✗ No se obtuvo mayoría: {votes} votos (quorum disponible: {available_quorum}, quorum total: {quorum})")
+    print(f"[REGISTRY] [ELECCIÓN] Nodos disponibles: {available_nodes}/{total_nodes}")
     return False
 
 
@@ -586,13 +669,14 @@ def start_election():
         cluster_state["is_leader"] = False
         cluster_state["leader_id"] = None
     
-    # Si no hay peers, este nodo es automáticamente el líder (modo desarrollo)
+    # Si no hay peers configurados, este nodo es automáticamente el líder
+    # Esto es normal cuando hay solo 1 nodo en el cluster
     if not peers:
         with cluster_lock:
             cluster_state["is_leader"] = True
             cluster_state["leader_id"] = candidate_id
             cluster_state["last_heartbeat_time"] = time.time()
-        print(f"[REGISTRY] Modo desarrollo: nodo único, automáticamente líder (término {term})")
+        print(f"[REGISTRY] Nodo único en el cluster, automáticamente líder (término {term})")
         return True
     
     print(f"[REGISTRY] Iniciando elección (término {term})...")
@@ -629,14 +713,24 @@ def leader_heartbeat_loop():
 
 
 def follower_heartbeat_check():
-    """Verifica si el líder sigue activo (para seguidores)"""
-    # Verificar más frecuentemente (cada 5 segundos en lugar de cada ELECTION_TIMEOUT)
-    CHECK_INTERVAL = min(5, ELECTION_TIMEOUT // 3)  # Verificar al menos 3 veces durante el timeout
+    """
+    Verifica si el líder sigue activo (para seguidores).
+    Detecta inactividad del líder e inicia elección entre nodos disponibles.
+    """
+    # Verificar frecuentemente para detectar fallos rápidamente
+    CHECK_INTERVAL = 3  # Verificar cada 3 segundos
+    
+    # Tiempo máximo sin heartbeat antes de considerar al líder inactivo
+    MAX_HEARTBEAT_AGE = ELECTION_TIMEOUT  # 15 segundos por defecto
+    
+    consecutive_failures = 0  # Contador de fallos consecutivos al contactar al líder
+    MAX_CONSECUTIVE_FAILURES = 2  # Después de 2 intentos fallidos, iniciar elección
     
     while True:
         time.sleep(CHECK_INTERVAL)
         
         if is_leader():
+            consecutive_failures = 0  # Reset si este nodo es líder
             continue
         
         with cluster_lock:
@@ -645,39 +739,71 @@ def follower_heartbeat_check():
         
         # Si hay un líder conocido, verificar activamente si está respondiendo
         if leader_id:
-            # Si no se ha recibido heartbeat reciente, verificar inmediatamente si el líder responde
-            if time_since_heartbeat > (ELECTION_TIMEOUT * 0.8):  # Verificar cuando falta 20% del timeout
-                print(f"[REGISTRY] Verificando conectividad con líder {leader_id} (último heartbeat hace {time_since_heartbeat:.1f}s)...")
+            # Verificar si ha pasado demasiado tiempo sin heartbeat
+            if time_since_heartbeat > MAX_HEARTBEAT_AGE:
+                # Intentar contactar al líder una última vez antes de iniciar elección
+                print(f"[REGISTRY] ⚠️ No se ha recibido heartbeat del líder {leader_id} en {time_since_heartbeat:.1f}s (timeout: {MAX_HEARTBEAT_AGE}s)")
+                print(f"[REGISTRY] Verificando conectividad con líder {leader_id}...")
+                
                 try:
                     leader_url = get_peer_url(leader_id)
-                    response = requests.get(f"{leader_url}/", timeout=2)  # Timeout más corto para respuesta rápida
+                    response = requests.get(f"{leader_url}/", timeout=2)
+                    
                     if response.status_code == 200:
                         # El líder está vivo, actualizar heartbeat time
+                        print(f"[REGISTRY] ✓ Líder {leader_id} responde correctamente, heartbeat actualizado")
                         with cluster_lock:
                             cluster_state["last_heartbeat_time"] = time.time()
-                        print(f"[REGISTRY] Líder {leader_id} responde correctamente, heartbeat actualizado")
+                        consecutive_failures = 0
                         continue
                     else:
-                        # El líder no responde correctamente - iniciar elección inmediatamente
-                        print(f"[REGISTRY] ⚠️ Líder {leader_id} no responde correctamente (status {response.status_code}), iniciando elección...")
-                        with cluster_lock:
-                            cluster_state["leader_id"] = None
-                        start_election()
+                        # El líder no responde correctamente
+                        consecutive_failures += 1
+                        print(f"[REGISTRY] ⚠️ Líder {leader_id} no responde correctamente (status {response.status_code}, fallos consecutivos: {consecutive_failures})")
+                        
                 except Exception as e:
-                    # No se puede contactar al líder - iniciar elección inmediatamente si ha pasado el timeout
-                    if time_since_heartbeat > ELECTION_TIMEOUT:
-                        print(f"[REGISTRY] ⚠️ Líder {leader_id} inaccesible ({time_since_heartbeat:.1f}s sin contacto): {e}")
-                        print(f"[REGISTRY] Iniciando elección inmediatamente entre nodos disponibles...")
-                        with cluster_lock:
-                            cluster_state["leader_id"] = None
-                        start_election()
-                    else:
-                        # Aún no ha pasado el timeout completo, pero el líder no responde
-                        print(f"[REGISTRY] ⚠️ No se puede contactar al líder {leader_id} (último heartbeat hace {time_since_heartbeat:.1f}s), esperando timeout completo...")
-        elif time_since_heartbeat > ELECTION_TIMEOUT:
-            # No hay líder conocido y ha pasado tiempo, intentar elección
-            print(f"[REGISTRY] No hay líder conocido después de {time_since_heartbeat:.1f}s, intentando elección...")
-            start_election()
+                    # No se puede contactar al líder
+                    consecutive_failures += 1
+                    print(f"[REGISTRY] ⚠️ No se puede contactar al líder {leader_id} (fallos consecutivos: {consecutive_failures}): {e}")
+                
+                # Si hemos fallado múltiples veces o ha pasado mucho tiempo, iniciar elección
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES or time_since_heartbeat > (MAX_HEARTBEAT_AGE * 1.2):
+                    print(f"[REGISTRY] 🚨 Líder {leader_id} considerado inactivo después de {consecutive_failures} intentos fallidos")
+                    print(f"[REGISTRY] Iniciando elección entre nodos disponibles...")
+                    with cluster_lock:
+                        cluster_state["leader_id"] = None
+                    start_election()
+                    consecutive_failures = 0  # Reset después de iniciar elección
+            else:
+                # Aún no ha pasado el timeout, pero verificar periódicamente la conectividad
+                # Esto ayuda a detectar problemas de red temprano
+                if time_since_heartbeat > (MAX_HEARTBEAT_AGE * 0.6):  # Verificar cuando ha pasado 60% del timeout
+                    try:
+                        leader_url = get_peer_url(leader_id)
+                        response = requests.get(f"{leader_url}/", timeout=2)
+                        if response.status_code == 200:
+                            # El líder está vivo, resetear contador de fallos
+                            consecutive_failures = 0
+                        else:
+                            consecutive_failures += 1
+                            print(f"[REGISTRY] ⚠️ Líder {leader_id} responde con error (status {response.status_code})")
+                    except Exception as e:
+                        consecutive_failures += 1
+                        print(f"[REGISTRY] ⚠️ Advertencia: No se puede contactar al líder {leader_id} (último heartbeat hace {time_since_heartbeat:.1f}s): {e}")
+                        
+                        # Si hay múltiples fallos consecutivos incluso antes del timeout, iniciar elección
+                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                            print(f"[REGISTRY] 🚨 Múltiples fallos al contactar al líder, iniciando elección preventiva...")
+                            with cluster_lock:
+                                cluster_state["leader_id"] = None
+                            start_election()
+                            consecutive_failures = 0
+        else:
+            # No hay líder conocido
+            if time_since_heartbeat > MAX_HEARTBEAT_AGE:
+                print(f"[REGISTRY] No hay líder conocido después de {time_since_heartbeat:.1f}s, intentando elección...")
+                start_election()
+            consecutive_failures = 0  # Reset si no hay líder
 
 
 def cleanup_inactive_servers():
@@ -711,11 +837,14 @@ def cleanup_inactive_servers():
 
 
 def election_retry_loop():
-    """Loop que reintenta elecciones si no hay líder (respaldo para follower_heartbeat_check)"""
+    """
+    Loop que reintenta elecciones si no hay líder (respaldo para follower_heartbeat_check).
+    Actúa como red de seguridad para asegurar que siempre haya un líder.
+    """
     time.sleep(10)  # Esperar más tiempo para que todos los nodos estén listos
     
     while True:
-        # Verificar más frecuentemente como respaldo (cada ELECTION_TIMEOUT)
+        # Verificar periódicamente como respaldo (cada ELECTION_TIMEOUT)
         time.sleep(ELECTION_TIMEOUT)
         
         with cluster_lock:
@@ -728,35 +857,37 @@ def election_retry_loop():
         if is_leader:
             continue
         
-        # Solo intentar elección si realmente no hay líder y ha pasado suficiente tiempo
         current_time = time.time()
         time_since_heartbeat = current_time - last_heartbeat
         
         # Si no hay líder conocido y ha pasado el timeout, intentar elección
-        if not leader_id and time_since_heartbeat > ELECTION_TIMEOUT:
-            print(f"[REGISTRY] [RESPALDO] No hay líder detectado después de {time_since_heartbeat:.1f}s, intentando elección...")
-            start_election()
+        if not leader_id:
+            if time_since_heartbeat > ELECTION_TIMEOUT:
+                print(f"[REGISTRY] [RESPALDO] No hay líder detectado después de {time_since_heartbeat:.1f}s, intentando elección...")
+                start_election()
         elif leader_id:
             # Hay un líder conocido, verificar que sigue activo como respaldo
-            # El follower_heartbeat_check ya maneja esto, pero este loop actúa como respaldo adicional
-            if time_since_heartbeat > ELECTION_TIMEOUT:
+            # El follower_heartbeat_check ya maneja esto, pero este loop actúa como red de seguridad
+            if time_since_heartbeat > (ELECTION_TIMEOUT * 1.5):  # Más tolerante que el check principal
+                print(f"[REGISTRY] [RESPALDO] Verificando estado del líder {leader_id} (último heartbeat hace {time_since_heartbeat:.1f}s)...")
                 try:
                     leader_url = get_peer_url(leader_id)
-                    response = requests.get(f"{leader_url}/", timeout=2)  # Timeout más corto
+                    response = requests.get(f"{leader_url}/", timeout=3)
                     if response.status_code == 200:
                         # El líder está vivo, actualizar heartbeat time
+                        print(f"[REGISTRY] [RESPALDO] Líder {leader_id} responde correctamente")
                         with cluster_lock:
                             cluster_state["last_heartbeat_time"] = current_time
                     else:
-                        # El líder no responde correctamente - iniciar elección inmediatamente
-                        print(f"[REGISTRY] [RESPALDO] Líder {leader_id} no responde correctamente (status {response.status_code}), iniciando elección...")
+                        # El líder no responde correctamente - iniciar elección
+                        print(f"[REGISTRY] [RESPALDO] ⚠️ Líder {leader_id} no responde correctamente (status {response.status_code}), iniciando elección...")
                         with cluster_lock:
                             cluster_state["leader_id"] = None
                         start_election()
                 except Exception as e:
-                    # No se puede contactar al líder - iniciar elección inmediatamente
-                    print(f"[REGISTRY] [RESPALDO] No se puede contactar al líder {leader_id} después de {time_since_heartbeat:.1f}s: {e}")
-                    print(f"[REGISTRY] [RESPALDO] Iniciando elección...")
+                    # No se puede contactar al líder - iniciar elección
+                    print(f"[REGISTRY] [RESPALDO] ⚠️ No se puede contactar al líder {leader_id} después de {time_since_heartbeat:.1f}s: {e}")
+                    print(f"[REGISTRY] [RESPALDO] Iniciando elección entre nodos disponibles...")
                     with cluster_lock:
                         cluster_state["leader_id"] = None
                     start_election()

@@ -630,8 +630,11 @@ def leader_heartbeat_loop():
 
 def follower_heartbeat_check():
     """Verifica si el líder sigue activo (para seguidores)"""
+    # Verificar más frecuentemente (cada 5 segundos en lugar de cada ELECTION_TIMEOUT)
+    CHECK_INTERVAL = min(5, ELECTION_TIMEOUT // 3)  # Verificar al menos 3 veces durante el timeout
+    
     while True:
-        time.sleep(ELECTION_TIMEOUT)
+        time.sleep(CHECK_INTERVAL)
         
         if is_leader():
             continue
@@ -642,30 +645,35 @@ def follower_heartbeat_check():
         
         # Si hay un líder conocido, verificar activamente si está respondiendo
         if leader_id:
-            # Si no se ha recibido heartbeat reciente, verificar si el líder responde
-            if time_since_heartbeat > ELECTION_TIMEOUT:
+            # Si no se ha recibido heartbeat reciente, verificar inmediatamente si el líder responde
+            if time_since_heartbeat > (ELECTION_TIMEOUT * 0.8):  # Verificar cuando falta 20% del timeout
+                print(f"[REGISTRY] Verificando conectividad con líder {leader_id} (último heartbeat hace {time_since_heartbeat:.1f}s)...")
                 try:
                     leader_url = get_peer_url(leader_id)
-                    response = requests.get(f"{leader_url}/", timeout=3)
+                    response = requests.get(f"{leader_url}/", timeout=2)  # Timeout más corto para respuesta rápida
                     if response.status_code == 200:
                         # El líder está vivo, actualizar heartbeat time
                         with cluster_lock:
                             cluster_state["last_heartbeat_time"] = time.time()
+                        print(f"[REGISTRY] Líder {leader_id} responde correctamente, heartbeat actualizado")
                         continue
                     else:
-                        # El líder no responde correctamente
-                        print(f"[REGISTRY] Líder {leader_id} no responde correctamente (status {response.status_code}), iniciando elección...")
+                        # El líder no responde correctamente - iniciar elección inmediatamente
+                        print(f"[REGISTRY] ⚠️ Líder {leader_id} no responde correctamente (status {response.status_code}), iniciando elección...")
                         with cluster_lock:
                             cluster_state["leader_id"] = None
                         start_election()
                 except Exception as e:
-                    # No se puede contactar al líder
-                    if time_since_heartbeat > (ELECTION_TIMEOUT * 1.5):
-                        print(f"[REGISTRY] Líder {leader_id} inaccesible ({time_since_heartbeat:.1f}s sin contacto): {e}")
-                        print(f"[REGISTRY] Iniciando elección...")
+                    # No se puede contactar al líder - iniciar elección inmediatamente si ha pasado el timeout
+                    if time_since_heartbeat > ELECTION_TIMEOUT:
+                        print(f"[REGISTRY] ⚠️ Líder {leader_id} inaccesible ({time_since_heartbeat:.1f}s sin contacto): {e}")
+                        print(f"[REGISTRY] Iniciando elección inmediatamente entre nodos disponibles...")
                         with cluster_lock:
                             cluster_state["leader_id"] = None
                         start_election()
+                    else:
+                        # Aún no ha pasado el timeout completo, pero el líder no responde
+                        print(f"[REGISTRY] ⚠️ No se puede contactar al líder {leader_id} (último heartbeat hace {time_since_heartbeat:.1f}s), esperando timeout completo...")
         elif time_since_heartbeat > ELECTION_TIMEOUT:
             # No hay líder conocido y ha pasado tiempo, intentar elección
             print(f"[REGISTRY] No hay líder conocido después de {time_since_heartbeat:.1f}s, intentando elección...")
@@ -703,11 +711,12 @@ def cleanup_inactive_servers():
 
 
 def election_retry_loop():
-    """Loop que reintenta elecciones si no hay líder (solo como último recurso)"""
+    """Loop que reintenta elecciones si no hay líder (respaldo para follower_heartbeat_check)"""
     time.sleep(10)  # Esperar más tiempo para que todos los nodos estén listos
     
     while True:
-        time.sleep(ELECTION_TIMEOUT * 2)  # Verificar menos frecuentemente (cada 30s en lugar de 15s)
+        # Verificar más frecuentemente como respaldo (cada ELECTION_TIMEOUT)
+        time.sleep(ELECTION_TIMEOUT)
         
         with cluster_lock:
             is_leader = cluster_state["is_leader"]
@@ -715,33 +724,42 @@ def election_retry_loop():
             peers = cluster_state["peers"].copy()
             last_heartbeat = cluster_state["last_heartbeat_time"]
         
+        # Solo verificar si no somos líder
+        if is_leader:
+            continue
+        
         # Solo intentar elección si realmente no hay líder y ha pasado suficiente tiempo
         current_time = time.time()
         time_since_heartbeat = current_time - last_heartbeat
         
-        # Si no hay líder conocido y ha pasado mucho tiempo sin heartbeat
-        if not is_leader and not leader_id and time_since_heartbeat > (ELECTION_TIMEOUT * 3):
-            print(f"[REGISTRY] No hay líder detectado después de {time_since_heartbeat:.1f}s, intentando elección...")
+        # Si no hay líder conocido y ha pasado el timeout, intentar elección
+        if not leader_id and time_since_heartbeat > ELECTION_TIMEOUT:
+            print(f"[REGISTRY] [RESPALDO] No hay líder detectado después de {time_since_heartbeat:.1f}s, intentando elección...")
             start_election()
-        elif not is_leader and leader_id:
-            # Hay un líder conocido, verificar que sigue activo solo si no se ha recibido heartbeat reciente
-            # El follower_heartbeat_check ya maneja esto, así que este loop solo actúa como respaldo
-            if time_since_heartbeat > (ELECTION_TIMEOUT * 3):
+        elif leader_id:
+            # Hay un líder conocido, verificar que sigue activo como respaldo
+            # El follower_heartbeat_check ya maneja esto, pero este loop actúa como respaldo adicional
+            if time_since_heartbeat > ELECTION_TIMEOUT:
                 try:
                     leader_url = get_peer_url(leader_id)
-                    response = requests.get(f"{leader_url}/", timeout=5)  # Timeout más largo
+                    response = requests.get(f"{leader_url}/", timeout=2)  # Timeout más corto
                     if response.status_code == 200:
                         # El líder está vivo, actualizar heartbeat time
                         with cluster_lock:
                             cluster_state["last_heartbeat_time"] = current_time
                     else:
-                        print(f"[REGISTRY] Líder {leader_id} no responde correctamente (status {response.status_code}), iniciando elección...")
+                        # El líder no responde correctamente - iniciar elección inmediatamente
+                        print(f"[REGISTRY] [RESPALDO] Líder {leader_id} no responde correctamente (status {response.status_code}), iniciando elección...")
+                        with cluster_lock:
+                            cluster_state["leader_id"] = None
                         start_election()
                 except Exception as e:
-                    # Solo iniciar elección si realmente no se puede contactar después de mucho tiempo
-                    if time_since_heartbeat > (ELECTION_TIMEOUT * 4):
-                        print(f"[REGISTRY] No se puede contactar al líder {leader_id} después de {time_since_heartbeat:.1f}s, iniciando elección...")
-                        start_election()
+                    # No se puede contactar al líder - iniciar elección inmediatamente
+                    print(f"[REGISTRY] [RESPALDO] No se puede contactar al líder {leader_id} después de {time_since_heartbeat:.1f}s: {e}")
+                    print(f"[REGISTRY] [RESPALDO] Iniciando elección...")
+                    with cluster_lock:
+                        cluster_state["leader_id"] = None
+                    start_election()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

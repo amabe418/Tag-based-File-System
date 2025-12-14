@@ -36,8 +36,15 @@ def get_server_url():
             server = random.choice(servers)
             server_url = server.get("url")
             print(f"[CLIENT] URL del servidor seleccionado: {server_url}")
+            
+            # Validar que server_url no sea None
+            if not server_url:
+                error_msg = f"El servidor seleccionado no tiene URL válida. Datos del servidor: {server}"
+                print(f"[CLIENT] ERROR: {error_msg}")
+                return None, error_msg
+            
             # Verificar formato de URL
-            if server_url and not server_url.startswith("http"):
+            if not server_url.startswith("http"):
                 if ":" not in server_url:
                     server_url = f"http://{server_url}:8010"
                 else:

@@ -64,12 +64,28 @@ def get_namenode_leader_url() -> Optional[str]:
     """
     registry_urls = [url.strip() for url in REGISTRY_URL.split(",") if url.strip()]
     
+    datanode_id = generate_datanode_id()
     for registry_url in registry_urls:
         try:
             # Obtener lista de servidores activos del registry
-            response = requests.get(f"{registry_url}/servers/active", timeout=5)
+            # Usar autenticación de servicio para esta petición
+            try:
+                token = generate_service_token(datanode_id, "service")
+            except Exception as e:
+                print(f"[REGISTRY_CLIENT] Error generando token para consulta registry: {e}")
+                token = os.getenv("DATANODE_SERVICE_TOKEN", "datanode-service-token")
+            
+            headers = {"Authorization": f"Bearer {token}"}
+            url = f"{registry_url}/servers/active"
+            print(f"[REGISTRY_CLIENT] Consultando registry: {url}")
+            response = requests.get(url, headers=headers, timeout=5)
+            
+            if response.status_code == 401 or response.status_code == 403:
+                print(f"[REGISTRY_CLIENT] ❌ Error de autenticación consultando registry {registry_url}/servers/active: status={response.status_code}, response={response.text}")
+            
             response.raise_for_status()
             servers = response.json()
+            print(f"[REGISTRY_CLIENT] ✓ Servidores obtenidos del registry: {len(servers)} servidores")
             
             # Buscar un MetaNameNode activo (server_id contiene "namenode")
             for server in servers:
@@ -84,7 +100,12 @@ def get_namenode_leader_url() -> Optional[str]:
                     
                     # Consultar el endpoint / del namenode para obtener el líder
                     try:
+                        print(f"[REGISTRY_CLIENT] Consultando namenode: {server_url}/")
                         namenode_response = requests.get(f"{server_url}/", timeout=5)
+                        
+                        if namenode_response.status_code == 401 or namenode_response.status_code == 403:
+                            print(f"[REGISTRY_CLIENT] ❌ Error de autenticación consultando namenode {server_url}/: status={namenode_response.status_code}, response={namenode_response.text}")
+                        
                         namenode_response.raise_for_status()
                         namenode_data = namenode_response.json()
                         

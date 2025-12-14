@@ -447,9 +447,15 @@ def discover_file_replicas(file_hash: str, file_id: int, node_id_db: str = None)
     Returns:
         Lista de diccionarios con información de réplicas encontradas
     """
-    print(f"[DATANODE_MANAGER] Descubriendo réplicas para file_id={file_id} consultando DataNodes...")
+    print(f"[DATANODE_MANAGER] Descubriendo réplicas para file_id={file_id} (hash={file_hash[:16]}...) consultando DataNodes...")
     
     active_datanodes = get_active_datanodes(node_id_db=node_id_db, exclude_draining=True)
+    print(f"[DATANODE_MANAGER] DataNodes activos encontrados: {len(active_datanodes)}")
+    
+    if not active_datanodes:
+        print(f"[DATANODE_MANAGER] ⚠️  No hay DataNodes activos para descubrir réplicas")
+        return []
+    
     discovered_replicas = []
     
     for datanode in active_datanodes:
@@ -461,20 +467,23 @@ def discover_file_replicas(file_hash: str, file_id: int, node_id_db: str = None)
         try:
             # Obtener token de servicio para autenticación con DataNode
             import os
+            node_id = os.getenv("NODE_ID", "namenode-1")
             try:
                 from security.service_auth import generate_service_token
-                service_token = generate_service_token(os.getenv("NODE_ID", "namenode-1"), "service")
-            except Exception:
+                service_token = generate_service_token(node_id, "service")
+            except Exception as token_error:
+                print(f"[DATANODE_MANAGER] Error generando token: {token_error}, usando token pre-compartido")
                 service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
             
             # Intentar leer el archivo desde este DataNode
+            print(f"[DATANODE_MANAGER] Consultando {datanode_id} ({url}/retrieve/{file_hash[:16]}...)")
             response = requests.get(
                 f"{url}/retrieve/{file_hash}",
                 headers={"Authorization": f"Bearer {service_token}"},
                 timeout=5
             )
             if response.status_code == 200:
-                print(f"[DATANODE_MANAGER] Archivo encontrado en {datanode_id}")
+                print(f"[DATANODE_MANAGER] ✓ Archivo encontrado en {datanode_id}")
                 discovered_replicas.append({
                     "datanode_id": datanode_id,
                     "url": url,
@@ -482,9 +491,18 @@ def discover_file_replicas(file_hash: str, file_id: int, node_id_db: str = None)
                     "replica_type": "discovered",  # Tipo temporal hasta que se asigne
                     "status": "active"
                 })
+            else:
+                print(f"[DATANODE_MANAGER] ⚠️  {datanode_id} respondió con status {response.status_code}: {response.text[:100]}")
+        except requests.HTTPError as e:
+            if e.response.status_code == 403:
+                print(f"[DATANODE_MANAGER] ❌ Error 403 Forbidden consultando {datanode_id}: {e.response.text[:100] if hasattr(e, 'response') else str(e)}")
+            elif e.response.status_code == 404:
+                print(f"[DATANODE_MANAGER] Archivo no encontrado en {datanode_id} (404)")
+            else:
+                print(f"[DATANODE_MANAGER] ⚠️  Error HTTP {e.response.status_code} consultando {datanode_id}: {e}")
         except Exception as e:
             # El archivo no está en este DataNode o hay un error
-            pass
+            print(f"[DATANODE_MANAGER] ⚠️  Error consultando {datanode_id}: {e}")
     
     # Si se encontraron réplicas, guardarlas en la base de datos
     if discovered_replicas:

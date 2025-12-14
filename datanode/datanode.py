@@ -192,9 +192,10 @@ def retrieve(
     
     # Verificar que viene del MetaNameNode
     service_id = payload.get("service_id") or payload.get("sub", "")
-    if not service_id.startswith("namenode-"):
+    if "namenode" not in service_id.lower():
+        print(f"[DATANODE] ❌ Acceso denegado a /retrieve: service_id={service_id} no es un namenode")
         raise HTTPException(status_code=403, detail="Solo MetaNameNode puede leer archivos")
-    print(f"[DATANODE] GET /retrieve/{file_id}")
+    print(f"[DATANODE] GET /retrieve/{file_id} (service_id={service_id})")
     
     file_content = retrieve_file(file_id)
     

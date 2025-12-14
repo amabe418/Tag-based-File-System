@@ -311,15 +311,20 @@ def login(username: str, password: str):
         token = data.get("access_token")
         user = data.get("user", {}).get("username")
         
+        # Validar que tanto token como user sean no-None
+        if not token or not user:
+            error_msg = "La respuesta del servidor no contiene token o usuario válido"
+            print(f"[CLIENT] ❌ {error_msg}")
+            return False, error_msg
+        
         # Guardar en session_state
         st.session_state.auth_token = token
         st.session_state.logged_in_user = user
         
         # Guardar en storage para persistencia (hacer esto ANTES del rerun)
-        if token and user:
-            save_to_storage(COOKIE_TOKEN_KEY, token)
-            save_to_storage(COOKIE_USER_KEY, user)
-            print(f"[CLIENT] Token y usuario guardados en storage: user={user}")
+        save_to_storage(COOKIE_TOKEN_KEY, token)
+        save_to_storage(COOKIE_USER_KEY, user)
+        print(f"[CLIENT] Token y usuario guardados en storage: user={user}")
         
         return True, None
     except requests.RequestException as e:

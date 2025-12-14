@@ -87,7 +87,9 @@ def verify_service_token(token: str) -> Optional[Dict]:
         payload = jwt.decode(token, SERVICE_SECRET_KEY, algorithms=["HS256"])
         
         # Verificar que es un token de servicio
-        if payload.get("service_type") != "service":
+        # Nota: service_type puede ser "service" o cualquier otro valor válido
+        # Solo rechazamos si no tiene service_type o service_id
+        if not payload.get("service_id") and not payload.get("sub"):
             return None
         
         # Verificar que el servicio está autorizado

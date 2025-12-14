@@ -20,6 +20,7 @@ from security.service_auth import generate_service_token
 
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://registry:9000")
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "10"))  # segundos
+REGISTRY_DISCOVERY_INTERVAL = int(os.getenv("REGISTRY_DISCOVERY_INTERVAL", "30"))  # Intervalo para descubrir nuevos registries (segundos)
 NAMENODE_PORT = int(os.getenv("NAMENODE_PORT", "8010"))
 NAMENODE_ID = os.getenv("NODE_ID", None)  # Usar el mismo NODE_ID del namenode
 
@@ -65,6 +66,8 @@ class RegistryClient:
             self.registry_urls = [url.strip() for url in registry_url.split(",") if url.strip()]
         else:
             self.registry_urls = [registry_url]
+        # Lista de registries conocidos (se actualiza dinámicamente)
+        self._known_registry_urls = set(self.registry_urls)
         self.server_port = NAMENODE_PORT
         # Usar el NODE_ID para construir el nombre del servicio Docker
         # Si NODE_ID es "namenode-1", el nombre del servicio será "tbfs-namenode-1"
@@ -74,10 +77,12 @@ class RegistryClient:
             self.server_url = get_hostname()  # Fallback al hostname
         self.server_ip = get_server_ip()
         self.heartbeat_thread = None
+        self.discovery_thread = None
         self.running = False
         self.registered = False
         self._last_error_time = {}
         self._error_cooldown = 60
+        self._registry_urls_lock = threading.Lock()
     
     def _get_service_token(self) -> str:
         """Obtiene un token de servicio para autenticación"""
@@ -88,9 +93,87 @@ class RegistryClient:
             # Fallback: usar token pre-compartido si está disponible
             return os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
     
+    def _update_registry_urls(self):
+        """Actualiza la lista de registry URLs con los registries conocidos"""
+        with self._registry_urls_lock:
+            # Usar la lista actualizada de registries conocidos
+            self.registry_urls = list(self._known_registry_urls)
+    
+    def discover_registries(self):
+        """
+        Descubre todos los registries conocidos consultando a los registries disponibles.
+        Actualiza la lista de registry URLs para incluir todos los registries descubiertos.
+        """
+        print(f"[REGISTRY_CLIENT] 🔍 Iniciando descubrimiento de registries...")
+        try:
+            # Intentar con cualquiera de los registries conocidos
+            urls_to_try = list(self._known_registry_urls)
+            random.shuffle(urls_to_try)
+            
+            discovered_registries = set()
+            successful_registry = None
+            
+            for registry_url in urls_to_try:
+                try:
+                    print(f"[REGISTRY_CLIENT] Consultando registry: {registry_url}/registries")
+                    response = requests.get(
+                        f"{registry_url}/registries",
+                        headers={"Authorization": f"Bearer {self._get_service_token()}"},
+                        timeout=5
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    successful_registry = registry_url
+                    
+                    # Agregar todos los registries descubiertos
+                    registry_count = 0
+                    for registry_info in data.get("registries", []):
+                        registry_url_from_info = registry_info.get("url")
+                        if registry_url_from_info:
+                            discovered_registries.add(registry_url_from_info)
+                            registry_count += 1
+                    
+                    print(f"[REGISTRY_CLIENT] ✓ Respuesta recibida de {registry_url}: {registry_count} registries encontrados")
+                    
+                    # Si obtuvimos información, actualizar y salir
+                    if discovered_registries:
+                        with self._registry_urls_lock:
+                            old_count = len(self._known_registry_urls)
+                            old_urls = sorted(self._known_registry_urls.copy())
+                            self._known_registry_urls.update(discovered_registries)
+                            new_count = len(self._known_registry_urls)
+                            new_urls = sorted(self._known_registry_urls)
+                            
+                            if new_count > old_count:
+                                self.registry_urls = list(self._known_registry_urls)
+                                print(f"[REGISTRY_CLIENT] ✨ Descubiertos {new_count - old_count} nuevos registries. Total: {new_count}")
+                                print(f"[REGISTRY_CLIENT] Registries conocidos: {new_urls}")
+                            elif new_urls != old_urls:
+                                # Aunque el conteo sea igual, los URLs pueden haber cambiado
+                                self.registry_urls = list(self._known_registry_urls)
+                                print(f"[REGISTRY_CLIENT] 📋 Lista de registries actualizada: {new_urls}")
+                            else:
+                                print(f"[REGISTRY_CLIENT] ✓ Lista de registries se mantiene actualizada ({new_count} registries)")
+                        break
+                except requests.RequestException as e:
+                    print(f"[REGISTRY_CLIENT] ⚠️  Error consultando {registry_url}: {e}")
+                    # Intentar con el siguiente registry
+                    continue
+            
+            # Si no descubrimos nada, mantener los registries conocidos actuales
+            if not discovered_registries:
+                print(f"[REGISTRY_CLIENT] ⚠️  No se pudieron descubrir nuevos registries desde ningún registry conocido")
+            elif successful_registry:
+                print(f"[REGISTRY_CLIENT] ✅ Descubrimiento completado exitosamente desde {successful_registry}")
+                
+        except Exception as e:
+            print(f"[REGISTRY_CLIENT] ❌ Error en descubrimiento de registries: {e}")
+    
     def _try_registry_request(self, method: str, endpoint: str, **kwargs) -> requests.Response:
         """Intenta hacer una petición a cualquiera de los nodos del registry disponibles"""
-        urls = self.registry_urls.copy()
+        # Asegurarse de que tenemos la lista actualizada
+        with self._registry_urls_lock:
+            urls = self.registry_urls.copy()
         random.shuffle(urls)
         
         # Agregar token de servicio a los headers
@@ -186,27 +269,113 @@ class RegistryClient:
             
             time.sleep(HEARTBEAT_INTERVAL)
     
-    def start(self):
-        """Inicia el cliente del registry (registro + heartbeats)"""
+    def _discovery_loop(self, is_leader_func=None):
+        """
+        Loop que descubre nuevos registries periódicamente.
+        Solo se ejecuta si este nodo es el líder.
+        
+        Args:
+            is_leader_func: Función que retorna True si este nodo es el líder
+        """
+        # Esperar un poco al inicio para que el registro inicial funcione
+        print(f"[REGISTRY_CLIENT] 🔄 Discovery loop iniciado (solo para líder, intervalo: {REGISTRY_DISCOVERY_INTERVAL}s)")
+        time.sleep(10)
+        
+        cycle = 0
+        while self.running:
+            cycle += 1
+            # Solo descubrir si somos el líder
+            if is_leader_func and is_leader_func():
+                try:
+                    print(f"[REGISTRY_CLIENT] 🔄 Ciclo de descubrimiento #{cycle} (cada {REGISTRY_DISCOVERY_INTERVAL}s) - LÍDER")
+                    self.discover_registries()
+                except Exception as e:
+                    print(f"[REGISTRY_CLIENT] ❌ Error en discovery loop (ciclo #{cycle}): {e}")
+            else:
+                # Si no somos líder, esperar sin descubrir
+                if cycle % 10 == 0:  # Log cada 10 ciclos para no saturar
+                    print(f"[REGISTRY_CLIENT] ⏸️  Discovery loop pausado (no soy líder) - ciclo #{cycle}")
+            
+            if self.running:
+                if is_leader_func and is_leader_func():
+                    print(f"[REGISTRY_CLIENT] ⏳ Esperando {REGISTRY_DISCOVERY_INTERVAL}s hasta el próximo descubrimiento...")
+                time.sleep(REGISTRY_DISCOVERY_INTERVAL)
+    
+    def get_known_registries(self):
+        """
+        Obtiene la lista de registries conocidos.
+        Útil para que el líder comparta esta información con los seguidores.
+        """
+        with self._registry_urls_lock:
+            return sorted(list(self._known_registry_urls))
+    
+    def update_registries_from_leader(self, registry_urls: list):
+        """
+        Actualiza la lista de registries conocidos con la información del líder.
+        
+        Args:
+            registry_urls: Lista de URLs de registries proporcionada por el líder
+        """
+        if not registry_urls:
+            return
+        
+        with self._registry_urls_lock:
+            old_count = len(self._known_registry_urls)
+            old_urls = sorted(list(self._known_registry_urls))
+            
+            # Actualizar con los registries del líder
+            self._known_registry_urls.update(registry_urls)
+            self.registry_urls = list(self._known_registry_urls)
+            
+            new_count = len(self._known_registry_urls)
+            new_urls = sorted(list(self._known_registry_urls))
+            
+            if new_urls != old_urls:
+                print(f"[REGISTRY_CLIENT] 📥 Registries actualizados desde líder: {old_count} -> {new_count}")
+                print(f"[REGISTRY_CLIENT] Registries conocidos: {new_urls}")
+    
+    def start(self, is_leader_func=None):
+        """
+        Inicia el cliente del registry (registro + heartbeats + discovery)
+        
+        Args:
+            is_leader_func: Función que retorna True si este nodo es el líder.
+                          Si se proporciona, solo el líder ejecutará el discovery loop.
+        """
         if self.running:
             return
         
         print(f"[REGISTRY_CLIENT] Iniciando cliente del registry para MetaNameNode...")
-        print(f"[REGISTRY_CLIENT] Registry URLs: {self.registry_urls}")
+        print(f"[REGISTRY_CLIENT] Registry URLs iniciales: {self.registry_urls}")
         print(f"[REGISTRY_CLIENT] MetaNameNode ID: {self.server_id}")
+        
+        # Descubrir registries disponibles al inicio (solo si es líder o no hay función de verificación)
+        if not is_leader_func or is_leader_func():
+            self.discover_registries()
         
         self.register()
         
         self.running = True
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self.heartbeat_thread.start()
-        print(f"[REGISTRY_CLIENT] Cliente iniciado. Heartbeat cada {HEARTBEAT_INTERVAL}s")
+        
+        # Pasar la función de verificación de líder al discovery loop
+        self.discovery_thread = threading.Thread(
+            target=lambda: self._discovery_loop(is_leader_func=is_leader_func), 
+            daemon=True
+        )
+        self.discovery_thread.start()
+        
+        discovery_mode = "solo para líder" if is_leader_func else "siempre activo"
+        print(f"[REGISTRY_CLIENT] Cliente iniciado. Heartbeat cada {HEARTBEAT_INTERVAL}s, Discovery {discovery_mode} cada {REGISTRY_DISCOVERY_INTERVAL}s")
     
     def stop(self):
         """Detiene el cliente del registry"""
         self.running = False
         if self.heartbeat_thread:
             self.heartbeat_thread.join(timeout=2)
+        if self.discovery_thread:
+            self.discovery_thread.join(timeout=2)
         print(f"[REGISTRY_CLIENT] Cliente detenido")
 
 

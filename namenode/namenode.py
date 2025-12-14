@@ -1202,12 +1202,19 @@ def leader_heartbeat_loop():
         except Exception:
             service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
         
+        # Obtener lista de registries conocidos del registry_client para compartir con seguidores
+        known_registries = registry_client.get_known_registries()
+        
         for peer in peers:
             try:
                 peer_url = get_peer_url(peer)
                 response = requests.post(
                     f"{peer_url}/internal/heartbeat",
-                    json={"term": term, "leader_id": leader_id},
+                    json={
+                        "term": term, 
+                        "leader_id": leader_id,
+                        "registry_urls": known_registries  # Compartir lista de registries
+                    },
                     headers={"Authorization": f"Bearer {service_token}"},
                     timeout=2
                 )
@@ -1305,8 +1312,8 @@ async def lifespan(app: FastAPI):
         operation_log.extend(loaded_operations)
     print(f"[NAMENODE] Cargadas {len(loaded_operations)} operaciones del log persistente")
     
-    # Iniciar registro en el registry
-    registry_client.start()
+    # Iniciar registro en el registry (solo el líder ejecutará discovery)
+    registry_client.start(is_leader_func=is_leader)
     
     # Iniciar hilos
     heartbeat_thread = threading.Thread(target=leader_heartbeat_loop, daemon=True)
@@ -1807,8 +1814,21 @@ def datanode_heartbeat_endpoint(
         raise HTTPException(status_code=401, detail="Se requiere token de servicio")
     
     token = authorization.split(" ")[1]
+    
+    # Logging para diagnóstico
+    from security.service_auth import verify_service_token
+    payload = verify_service_token(token)
+    if payload:
+        token_service_id = payload.get("service_id") or payload.get("sub")
+        print(f"[NAMENODE] Heartbeat auth: node_id={node_id}, token_service_id={token_service_id}, match={token_service_id == node_id}")
+    else:
+        print(f"[NAMENODE] Heartbeat auth: node_id={node_id}, token JWT inválido, intentando token pre-compartido")
+    
     if not validate_service_request(node_id, token):
+        print(f"[NAMENODE] ❌ Heartbeat rechazado: node_id={node_id}, token no válido")
         raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    print(f"[NAMENODE] ✓ Heartbeat autenticado correctamente: node_id={node_id}")
     leader_url = get_leader_url()
     if leader_url:
         try:
@@ -2893,10 +2913,11 @@ def internal_heartbeat(
     
     # Verificar que viene de otro namenode
     service_id = payload.get("service_id") or payload.get("sub", "")
-    if not service_id.startswith("namenode-"):
+    if "namenode" not in service_id.lower():
         raise HTTPException(status_code=403, detail="Solo namenodes pueden enviar heartbeats")
     term = data.get("term")
     leader_id = data.get("leader_id")
+    registry_urls = data.get("registry_urls", [])
     
     with cluster_lock:
         if term >= cluster_state["term"]:
@@ -2904,6 +2925,13 @@ def internal_heartbeat(
             cluster_state["leader_id"] = leader_id
             cluster_state["is_leader"] = False
             cluster_state["last_heartbeat_time"] = time.time()
+    
+    # Actualizar lista de registries desde el líder
+    if registry_urls:
+        try:
+            registry_client.update_registries_from_leader(registry_urls)
+        except Exception as e:
+            print(f"[NAMENODE] Error actualizando registries desde líder: {e}")
     
     return {"success": True}
 

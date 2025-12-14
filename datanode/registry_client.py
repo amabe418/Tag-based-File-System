@@ -112,6 +112,7 @@ class DataNodeRegistryClient:
     
     def __init__(self, registry_url: str = REGISTRY_URL):
         self.datanode_id = generate_datanode_id()
+        print(f"[REGISTRY_CLIENT] DataNode ID generado: {self.datanode_id}")
         self.registry_urls = [url.strip() for url in registry_url.split(",") if url.strip()]
         self.datanode_port = DATANODE_PORT
         self.datanode_url = os.getenv("NODE_ID", get_hostname())  # Nombre del servicio Docker
@@ -217,8 +218,11 @@ class DataNodeRegistryClient:
             
             # Enviar heartbeat con token de servicio
             token = self._get_service_token()
+            url = f"{self.namenode_url}/datanodes/{self.datanode_id}/heartbeat"
+            print(f"[REGISTRY_CLIENT] Enviando heartbeat: datanode_id={self.datanode_id}, url={url}")
+            
             response = requests.post(
-                f"{self.namenode_url}/datanodes/{self.datanode_id}/heartbeat",
+                url,
                 json={
                     "free_space": storage_info["free_space"],
                     "total_space": storage_info["total_space"]
@@ -226,11 +230,18 @@ class DataNodeRegistryClient:
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=5
             )
+            
+            if response.status_code == 401 or response.status_code == 403:
+                print(f"[REGISTRY_CLIENT] ❌ Error de autenticación en heartbeat: status={response.status_code}, response={response.text}")
+            
             response.raise_for_status()
+            print(f"[REGISTRY_CLIENT] ✓ Heartbeat enviado exitosamente")
             return True
             
         except requests.RequestException as e:
-            print(f"[REGISTRY_CLIENT] Error enviando heartbeat: {e}")
+            status_code = getattr(e.response, 'status_code', None) if hasattr(e, 'response') else None
+            error_detail = getattr(e.response, 'text', str(e)) if hasattr(e, 'response') else str(e)
+            print(f"[REGISTRY_CLIENT] ❌ Error enviando heartbeat: status={status_code}, error={error_detail}, datanode_id={self.datanode_id}")
             # Si falla, intentar re-registrarse
             self.registered = False
             self.namenode_url = None

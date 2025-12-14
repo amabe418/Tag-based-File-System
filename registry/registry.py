@@ -695,6 +695,70 @@ def get_server(server_id: str):
         )
 
 
+@app.get("/registries")
+def list_registries(
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """
+    Lista todos los registries conocidos en el cluster.
+    Útil para que los MetaNameNodes descubran todos los registries disponibles.
+    Requiere autenticación de servicio.
+    """
+    # Verificar autenticación de servicio (similar a otros endpoints)
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    if not payload:
+        # Intentar validación con token pre-compartido
+        from security.service_auth import get_service_token_for_service
+        valid_token = False
+        # Intentar con diferentes tipos de servicios
+        for service_type in ["namenode", "datanode", "client", "registry"]:
+            expected_token = get_service_token_for_service(service_type)
+            if expected_token and token == expected_token:
+                valid_token = True
+                break
+        
+        if not valid_token:
+            raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    with cluster_lock:
+        # Obtener todos los registries conocidos (incluyendo este nodo)
+        all_registries = set(cluster_state["peers"] + [cluster_state["node_id"]])
+        registries_info = []
+        
+        for registry_id in sorted(all_registries):
+            # Obtener estado del registry
+            status = "unknown"
+            last_seen = None
+            if registry_id in cluster_state["peer_status"]:
+                status = cluster_state["peer_status"][registry_id]["status"]
+                last_seen = cluster_state["peer_status"][registry_id]["last_seen"]
+            elif registry_id == cluster_state["node_id"]:
+                # Este nodo siempre está vivo
+                status = "alive"
+                last_seen = time.time()
+            
+            # Construir URL del registry
+            registry_url = get_peer_url(registry_id)
+            
+            registries_info.append({
+                "registry_id": registry_id,
+                "url": registry_url,
+                "status": status,
+                "last_seen": datetime.fromtimestamp(last_seen).isoformat() if last_seen else None,
+                "is_local": registry_id == cluster_state["node_id"]
+            })
+        
+        return {
+            "registries": registries_info,
+            "total": len(registries_info),
+            "node_id": cluster_state["node_id"]
+        }
+
+
 # Endpoint interno para Gossip
 
 @app.post("/internal/gossip")

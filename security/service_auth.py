@@ -38,16 +38,28 @@ def generate_service_token(service_id: str, service_type: str = "service") -> st
     Genera un token de servicio para comunicación inter-servicio
     
     Args:
-        service_id: Identificador del servicio (ej: "namenode-1", "datanode-3")
+        service_id: Identificador del servicio (ej: "namenode-1", "datanode-3", "tbfs-registry-1")
         service_type: Tipo de servicio (default: "service")
     
     Returns:
         Token JWT firmado
     """
     # Verificar que el servicio está autorizado
-    service_base = service_id.split("-")[0] if "-" in service_id else service_id
-    if service_base not in AUTHORIZED_SERVICES:
-        raise ValueError(f"Servicio no autorizado: {service_id}")
+    # Intentar encontrar el tipo de servicio en el ID
+    service_base = None
+    service_id_lower = service_id.lower()
+    
+    # Buscar el tipo de servicio en el ID (puede estar en cualquier parte)
+    for service_type_key in AUTHORIZED_SERVICES.keys():
+        if service_type_key in service_id_lower:
+            service_base = service_type_key
+            break
+    
+    # Si no se encuentra, intentar el primer elemento del split (compatibilidad)
+    if not service_base:
+        service_base = service_id.split("-")[0] if "-" in service_id else service_id
+        if service_base not in AUTHORIZED_SERVICES:
+            raise ValueError(f"Servicio no autorizado: {service_id}")
     
     payload = {
         "sub": service_id,
@@ -81,9 +93,20 @@ def verify_service_token(token: str) -> Optional[Dict]:
         # Verificar que el servicio está autorizado
         service_id = payload.get("service_id") or payload.get("sub")
         if service_id:
-            service_base = service_id.split("-")[0] if "-" in service_id else service_id
-            if service_base not in AUTHORIZED_SERVICES:
-                return None
+            # Buscar el tipo de servicio en el ID (puede estar en cualquier parte)
+            service_base = None
+            service_id_lower = service_id.lower()
+            
+            for service_type_key in AUTHORIZED_SERVICES.keys():
+                if service_type_key in service_id_lower:
+                    service_base = service_type_key
+                    break
+            
+            # Si no se encuentra, intentar el primer elemento del split (compatibilidad)
+            if not service_base:
+                service_base = service_id.split("-")[0] if "-" in service_id else service_id
+                if service_base not in AUTHORIZED_SERVICES:
+                    return None
         
         return payload
     except jwt.JWTError:
@@ -95,6 +118,13 @@ def get_service_token_for_service(service_id: str) -> Optional[str]:
     Obtiene el token pre-compartido para un servicio específico
     En producción, esto debería consultar un sistema de gestión de secretos
     """
+    # Buscar el tipo de servicio en el ID (puede estar en cualquier parte)
+    service_id_lower = service_id.lower()
+    for service_type_key in AUTHORIZED_SERVICES.keys():
+        if service_type_key in service_id_lower:
+            return AUTHORIZED_SERVICES.get(service_type_key)
+    
+    # Si no se encuentra, intentar el primer elemento del split (compatibilidad)
     service_base = service_id.split("-")[0] if "-" in service_id else service_id
     return AUTHORIZED_SERVICES.get(service_base)
 

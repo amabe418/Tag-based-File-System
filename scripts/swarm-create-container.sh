@@ -64,18 +64,28 @@ echo ""
 case $TYPE in
     registry)
         PORT=$((9000 + NUM - 1))
+        # Construir lista de peers: incluir todos los nodos desde 1 hasta NUM-1
+        PEERS=""
+        for i in $(seq 1 $((NUM - 1))); do
+            if [ -n "$PEERS" ]; then
+                PEERS="${PEERS},"
+            fi
+            PEERS="${PEERS}tbfs-registry-${i}"
+        done
+        # Si NUM es 1, PEERS estará vacío (nodo único), lo cual es válido
         docker run -d \
             --name "$CONTAINER_NAME" \
             --network tbfs_net \
             --hostname "$CONTAINER_NAME" \
             -p "${PORT}:9000" \
-            -e NODE_ID="registry-${NUM}" \
-            -e PEERS="tbfs-registry-1,tbfs-registry-2,tbfs-registry-3" \
+            -e NODE_ID="tbfs-registry-${NUM}" \
+            -e PEERS="$PEERS" \
             -e REGISTRY_PORT=9000 \
             -e HEARTBEAT_TIMEOUT=30 \
             -e CLEANUP_INTERVAL=10 \
-            -e LEADER_HEARTBEAT_INTERVAL=5 \
-            -e ELECTION_TIMEOUT=15 \
+            -e GOSSIP_INTERVAL=3 \
+            -e GOSSIP_FANOUT=2 \
+            -e PEER_FAILURE_TIMEOUT=30 \
             "${EXTRA_ARGS[@]}" \
             tbfs-registry:latest
         ;;
@@ -100,7 +110,7 @@ case $TYPE in
             --hostname "$CONTAINER_NAME" \
             -p "${PORT}:8010" \
             -v "tbfs-namenode-${NUM}-data:/app/namenode/data" \
-            -e NODE_ID="namenode-${NUM}" \
+            -e NODE_ID="tbfs-namenode-${NUM}" \
             -e PEERS="$PEERS" \
             -e NAMENODE_PORT=8010 \
             -e HEARTBEAT_TIMEOUT=15 \
@@ -120,7 +130,7 @@ case $TYPE in
             --hostname "$CONTAINER_NAME" \
             -p "${PORT}:${PORT}" \
             -v "tbfs-datanode-${NUM}-storage:/app/storage" \
-            -e DATANODE_ID="datanode-${NUM}" \
+            -e DATANODE_ID="tbfs-datanode-${NUM}" \
             -e NODE_ID="$CONTAINER_NAME" \
             -e DATANODE_PORT="$PORT" \
             -e REGISTRY_URL="$REGISTRY_URLS" \

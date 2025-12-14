@@ -60,38 +60,41 @@ docker rm tbfs-registry-1 tbfs-registry-2 tbfs-registry-3 \
   tbfs-datanode-1 tbfs-datanode-2 tbfs-datanode-3 tbfs-datanode-4 tbfs-datanode-5 \
   tbfs-frontend 2>/dev/null || true
 
-# Ejecutar 3 nodos del Registry Service
+# Ejecutar 3 nodos del Registry Service (Protocolo Gossip)
 echo "Iniciando Registry Service - Nodo 1..."
 docker run -d --name tbfs-registry-1 --network tbfs_net -p 9000:9000 \
-  -e NODE_ID=registry-1 \
+  -e NODE_ID=tbfs-registry-1 \
   -e PEERS=tbfs-registry-2,tbfs-registry-3 \
   -e REGISTRY_PORT=9000 \
   -e HEARTBEAT_TIMEOUT=30 \
   -e CLEANUP_INTERVAL=10 \
-  -e LEADER_HEARTBEAT_INTERVAL=5 \
-  -e ELECTION_TIMEOUT=15 \
+  -e GOSSIP_INTERVAL=3 \
+  -e GOSSIP_FANOUT=2 \
+  -e PEER_FAILURE_TIMEOUT=30 \
   tbfs-registry
 
 echo "Iniciando Registry Service - Nodo 2..."
 docker run -d --name tbfs-registry-2 --network tbfs_net -p 9001:9000 \
-  -e NODE_ID=registry-2 \
+  -e NODE_ID=tbfs-registry-2 \
   -e PEERS=tbfs-registry-1,tbfs-registry-3 \
   -e REGISTRY_PORT=9000 \
   -e HEARTBEAT_TIMEOUT=30 \
   -e CLEANUP_INTERVAL=10 \
-  -e LEADER_HEARTBEAT_INTERVAL=5 \
-  -e ELECTION_TIMEOUT=15 \
+  -e GOSSIP_INTERVAL=3 \
+  -e GOSSIP_FANOUT=2 \
+  -e PEER_FAILURE_TIMEOUT=30 \
   tbfs-registry
 
 echo "Iniciando Registry Service - Nodo 3..."
 docker run -d --name tbfs-registry-3 --network tbfs_net -p 9002:9000 \
-  -e NODE_ID=registry-3 \
+  -e NODE_ID=tbfs-registry-3 \
   -e PEERS=tbfs-registry-1,tbfs-registry-2 \
   -e REGISTRY_PORT=9000 \
   -e HEARTBEAT_TIMEOUT=30 \
   -e CLEANUP_INTERVAL=10 \
-  -e LEADER_HEARTBEAT_INTERVAL=5 \
-  -e ELECTION_TIMEOUT=15 \
+  -e GOSSIP_INTERVAL=3 \
+  -e GOSSIP_FANOUT=2 \
+  -e PEER_FAILURE_TIMEOUT=30 \
   tbfs-registry
 
 # Esperar un momento para que los registries se estabilicen

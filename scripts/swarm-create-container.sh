@@ -92,18 +92,16 @@ case $TYPE in
     
     namenode)
         PORT=$((8010 + NUM - 1))
-        # Obtener peers (todos los namenodes existentes excepto este)
+        # Construir lista de peers: incluir todos los nodos desde 1 hasta NUM-1
+        # No verificamos si están corriendo porque pueden estar en otra computadora
         PEERS=""
-        for i in {1..10}; do
-            if [ "$i" -ne "$NUM" ]; then
-                if docker ps -a --format "{{.Names}}" | grep -q "tbfs-namenode-${i}"; then
-                    if [ -n "$PEERS" ]; then
-                        PEERS="${PEERS},"
-                    fi
-                    PEERS="${PEERS}tbfs-namenode-${i}"
-                fi
+        for i in $(seq 1 $((NUM - 1))); do
+            if [ -n "$PEERS" ]; then
+                PEERS="${PEERS},"
             fi
+            PEERS="${PEERS}tbfs-namenode-${i}"
         done
+        # Si NUM es 1, PEERS estará vacío (nodo único), lo cual es válido
         docker run -d \
             --name "$CONTAINER_NAME" \
             --network tbfs_net \

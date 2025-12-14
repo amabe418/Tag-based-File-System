@@ -71,8 +71,12 @@ class RegistryClient:
         self.server_port = NAMENODE_PORT
         # Usar el NODE_ID para construir el nombre del servicio Docker
         # Si NODE_ID es "namenode-1", el nombre del servicio será "tbfs-namenode-1"
+        # Si NODE_ID ya es "tbfs-namenode-1", usarlo directamente
         if NAMENODE_ID:
-            self.server_url = f"tbfs-{NAMENODE_ID}"  # tbfs-namenode-1, tbfs-namenode-2, etc.
+            if NAMENODE_ID.startswith("tbfs-"):
+                self.server_url = NAMENODE_ID  # Ya tiene el prefijo
+            else:
+                self.server_url = f"tbfs-{NAMENODE_ID}"  # Agregar prefijo si no lo tiene
         else:
             self.server_url = get_hostname()  # Fallback al hostname
         self.server_ip = get_server_ip()

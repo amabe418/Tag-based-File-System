@@ -305,9 +305,16 @@ def load_operation_log(node_id: str = None) -> List[OperationLog]:
 def get_peer_url(peer: str) -> str:
     """Obtiene la URL completa de un peer"""
     if not peer.startswith("http"):
-        # Si el peer es "namenode-1", construir "tbfs-namenode-1" (nombre del servicio Docker)
-        if peer.startswith("namenode-"):
-            peer = f"tbfs-{peer}"
+        # Si el peer ya tiene el prefijo "tbfs-", usarlo directamente
+        # Si el peer es "namenode-1" o "tbfs-namenode-1", construir "tbfs-namenode-1"
+        if not peer.startswith("tbfs-"):
+            if peer.startswith("namenode-"):
+                peer = f"tbfs-{peer}"
+            # Si no empieza con "namenode-" ni "tbfs-", asumir que necesita el prefijo
+            elif "namenode" in peer.lower():
+                # Si contiene "namenode" pero no tiene prefijo, agregarlo
+                if not peer.startswith("tbfs-"):
+                    peer = f"tbfs-{peer}"
         return f"http://{peer}:{NAMENODE_PORT}"
     return peer
 
@@ -1421,7 +1428,12 @@ def root():
     if is_leader_flag:
         # Si este nodo es el líder, devolver su propia URL
         # Construir la URL usando el nombre del servicio Docker
-        node_service_name = f"tbfs-{cluster_state['node_id']}"
+        # Verificar si node_id ya tiene el prefijo "tbfs-"
+        node_id = cluster_state['node_id']
+        if not node_id.startswith("tbfs-"):
+            node_service_name = f"tbfs-{node_id}"
+        else:
+            node_service_name = node_id
         leader_url = f"http://{node_service_name}:{NAMENODE_PORT}"
         print(f"[NAMENODE] Endpoint /: Este nodo es el líder. leader_url={leader_url}")
     elif leader_id:

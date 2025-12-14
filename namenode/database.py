@@ -183,14 +183,23 @@ def init_db(db_path: str = None, node_id: str = None):
         pass
     
     # Tabla de etiquetas - cada etiqueta pertenece a un usuario (aislamiento estricto)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS tags (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tag TEXT NOT NULL,
-            user_id TEXT NOT NULL,  -- OBLIGATORIO: cada etiqueta pertenece a un usuario
-            UNIQUE(user_id, tag)
-        )
-    """)
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tag TEXT NOT NULL,
+                user_id TEXT NOT NULL,  -- OBLIGATORIO: cada etiqueta pertenece a un usuario
+                UNIQUE(user_id, tag)
+            )
+        """)
+        conn.commit()  # Asegurar que la tabla se crea antes de continuar
+        print("[DATABASE] Tabla 'tags' creada/verificada")
+    except sqlite3.OperationalError as e:
+        print(f"[DATABASE] Error creando tabla tags: {e}")
+        # Intentar verificar si la tabla existe de otra manera
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tags'")
+        if not cursor.fetchone():
+            raise  # Re-lanzar el error si la tabla realmente no existe
     
     # Migración: agregar user_id a tags si no existe y migrar datos existentes
     try:
@@ -338,9 +347,20 @@ def init_db(db_path: str = None, node_id: str = None):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_log_node_id ON operation_log(node_id)")
     
     # Índices para mejorar rendimiento
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_user_id ON files(user_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tags_user_id ON tags(user_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+    # Verificar que las tablas existen antes de crear índices
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='files'")
+    if cursor.fetchone():
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_user_id ON files(user_id)")
+    
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tags'")
+    if cursor.fetchone():
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tags_user_id ON tags(user_id)")
+    else:
+        print("[DATABASE] Advertencia: tabla 'tags' no existe, no se puede crear índice idx_tags_user_id")
+    
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+    if cursor.fetchone():
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
     
     conn.commit()
     conn.close()

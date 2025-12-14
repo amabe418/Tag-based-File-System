@@ -119,9 +119,10 @@ async def store(
     
     # Verificar que viene del MetaNameNode
     service_id = payload.get("service_id") or payload.get("sub", "")
-    if not service_id.startswith("namenode-"):
+    if "namenode" not in service_id.lower():
+        print(f"[DATANODE] ❌ Acceso denegado a /store: service_id={service_id} no es un namenode")
         raise HTTPException(status_code=403, detail="Solo MetaNameNode puede almacenar archivos")
-    print(f"[DATANODE] POST /store recibido: file_id={file_id}, filename={file.filename}")
+    print(f"[DATANODE] POST /store recibido: file_id={file_id}, filename={file.filename}, service_id={service_id}")
     
     # Validar que file_id no esté vacío
     if not file_id or not file_id.strip():
@@ -238,7 +239,8 @@ def delete(
     
     # Verificar que viene del MetaNameNode
     service_id = payload.get("service_id") or payload.get("sub", "")
-    if not service_id.startswith("namenode-"):
+    if "namenode" not in service_id.lower():
+        print(f"[DATANODE] ❌ Acceso denegado a /delete: service_id={service_id} no es un namenode")
         raise HTTPException(status_code=403, detail="Solo MetaNameNode puede eliminar archivos")
     
     print(f"[DATANODE] DELETE /delete/{file_id}")

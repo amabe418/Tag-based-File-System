@@ -2315,14 +2315,18 @@ async def add_file_compat(
             
             try:
                 # Obtener token de servicio para autenticación con DataNode
+                node_id = cluster_state["node_id"]
                 try:
-                    service_token = generate_service_token(cluster_state["node_id"], "service")
-                except Exception:
+                    service_token = generate_service_token(node_id, "service")
+                    print(f"[NAMENODE] Token generado para node_id={node_id}")
+                except Exception as token_error:
+                    print(f"[NAMENODE] Error generando token para node_id={node_id}: {token_error}, usando token pre-compartido")
                     service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
                 
                 files = {"file": (file.filename, file_content)}
                 data = {"file_id": file_hash}
                 
+                print(f"[NAMENODE] Enviando archivo a {dn_id} ({dn_url}/store) con node_id={node_id}")
                 response = requests.post(
                     f"{dn_url}/store",
                     files=files,
@@ -2331,11 +2335,21 @@ async def add_file_compat(
                     timeout=30
                 )
                 response.raise_for_status()
-                print(f"[NAMENODE] Archivo almacenado en {dn_id} ({dn_url})")
+                print(f"[NAMENODE] ✓ Archivo almacenado exitosamente en {dn_id} ({dn_url})")
                 success_count += 1
                 successful_datanodes.append(dn_id)
+            except requests.HTTPError as e:
+                if e.response.status_code == 403:
+                    print(f"[NAMENODE] ❌ Error 403 Forbidden almacenando en {dn_id} ({dn_url}): {e}")
+                    print(f"[NAMENODE] Detalles de respuesta: {e.response.text if hasattr(e, 'response') else 'N/A'}")
+                else:
+                    print(f"[NAMENODE] Error HTTP {e.response.status_code} almacenando en {dn_id} ({dn_url}): {e}")
+                if dn_id not in failed_datanodes:
+                    failed_datanodes.append(dn_id)
             except Exception as e:
                 print(f"[NAMENODE] Error almacenando en {dn_id} ({dn_url}): {e}")
+                if dn_id not in failed_datanodes:
+                    failed_datanodes.append(dn_id)
                 if dn_id not in failed_datanodes:
                     failed_datanodes.append(dn_id)
     

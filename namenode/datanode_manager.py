@@ -317,10 +317,19 @@ def save_file_replicas(file_id: int, datanode_ids: List[str], node_id_db: str = 
     Args:
         file_id: ID del archivo en la base de datos
         datanode_ids: Lista de 3 DataNode IDs [primary, secondary, tertiary]
+        node_id_db: ID del nodo para la base de datos. Si es None, se usa NODE_ID del contenedor actual.
+                    IMPORTANTE: Siempre debe ser el NODE_ID del contenedor actual (ej: "tbfs-namenode-3"),
+                    no el node_id de otro contenedor (ej: "namenode-1").
     
     Returns:
         True si se guardó correctamente, False en caso de error
     """
+    # Si no se proporciona node_id_db, usar el NODE_ID del contenedor actual desde la variable de entorno
+    # Esto asegura que las réplicas siempre se guarden en la base de datos correcta del contenedor actual
+    if node_id_db is None:
+        import os
+        node_id_db = os.getenv("NODE_ID", "namenode-1")
+    
     db_path = get_db_path(node_id_db)
     
     with db_lock:
@@ -511,7 +520,11 @@ def discover_file_replicas(file_hash: str, file_id: int, node_id_db: str = None)
         replica_types = ["primary", "secondary", "tertiary"]
         datanode_ids = [r["datanode_id"] for r in discovered_replicas[:3]]  # Máximo 3
         
-        if save_file_replicas(file_id, datanode_ids, node_id_db=node_id_db):
+        # IMPORTANTE: Usar NODE_ID del contenedor actual, no el node_id_db pasado como parámetro
+        # para asegurar que las réplicas se guarden en la base de datos correcta
+        import os
+        current_node_id = os.getenv("NODE_ID", node_id_db if node_id_db else "namenode-1")
+        if save_file_replicas(file_id, datanode_ids, node_id_db=current_node_id):
             # Actualizar la lista con los tipos correctos
             for i, replica in enumerate(discovered_replicas[:3]):
                 if i < len(replica_types):

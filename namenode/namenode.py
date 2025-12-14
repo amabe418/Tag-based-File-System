@@ -703,9 +703,11 @@ def apply_operation_safely(operation: OperationLog, node_id: str = None):
                     term=operation.term
                 )
                 # Guardar réplicas si están en los datos
+                # IMPORTANTE: Siempre usar NODE_ID del contenedor actual, no el node_id del parámetro
+                # para asegurar que las réplicas se guarden en la base de datos correcta
                 if file_id and "datanode_ids" in operation_data:
                     from namenode.datanode_manager import save_file_replicas
-                    save_file_replicas(file_id, operation_data["datanode_ids"], node_id_db=node_id)
+                    save_file_replicas(file_id, operation_data["datanode_ids"], node_id_db=NODE_ID)
         
         elif operation.operation == "delete_file":
             delete_file_metadata(
@@ -765,9 +767,9 @@ def apply_operation_safely(operation: OperationLog, node_id: str = None):
                 conn.close()
         
         elif operation.operation == "change_password":
-            # Replicar cambio de contraseña
+            # Replicar cambio de contraseña - SIEMPRE usar write_node_id (NODE_ID)
             from security.auth import get_users_db_path
-            db_path = get_users_db_path(node_id)
+            db_path = get_users_db_path(write_node_id)  # Usar NODE_ID del contenedor actual
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
             try:
@@ -993,10 +995,11 @@ def verify_and_rereplicate_files(node_id: str = None):
             
             if new_datanode_ids:
                 # Actualizar réplicas en la base de datos
+                # IMPORTANTE: Siempre usar NODE_ID del contenedor actual
                 for dn_id in new_datanode_ids:
                     if dn_id not in existing_datanodes:
                         # Agregar nueva réplica
-                        save_file_replicas(file_id, [dn_id], node_id_db=node_id)
+                        save_file_replicas(file_id, [dn_id], node_id_db=NODE_ID)
                         print(f"[NAMENODE] FASE 4: Réplica asignada para archivo {file_id} en {dn_id}")
                         rereplicated_count += 1
     

@@ -545,9 +545,24 @@ def gossip_exchange(peer_id: str) -> bool:
             print(f"[NAMENODE] [GOSSIP] Error en intercambio con {peer_id}: HTTP {response.status_code}")
             return False
             
+    except requests.exceptions.ConnectionError as e:
+        # Errores de conexión (DNS, red, etc.) - esperados cuando el peer no está disponible
+        update_peer_status(peer_id, False)
+        error_msg = str(e)
+        if "Failed to resolve" in error_msg or "name resolution" in error_msg.lower():
+            print(f"[NAMENODE] [GOSSIP] ⚠️  Peer {peer_id} no disponible (no se puede resolver DNS)")
+        elif "Connection refused" in error_msg or "refused" in error_msg.lower():
+            print(f"[NAMENODE] [GOSSIP] ⚠️  Peer {peer_id} no disponible (conexión rechazada)")
+        else:
+            print(f"[NAMENODE] [GOSSIP] ⚠️  Peer {peer_id} no disponible: {type(e).__name__}")
+        return False
+    except requests.exceptions.Timeout:
+        update_peer_status(peer_id, False)
+        print(f"[NAMENODE] [GOSSIP] ⚠️  Peer {peer_id} no responde (timeout)")
+        return False
     except Exception as e:
         update_peer_status(peer_id, False)
-        print(f"[NAMENODE] [GOSSIP] Error en intercambio con {peer_id}: {e}")
+        print(f"[NAMENODE] [GOSSIP] ⚠️  Error en intercambio con {peer_id}: {type(e).__name__}: {e}")
         return False
 
 
@@ -608,11 +623,34 @@ def gossip_loop():
                 # Ejecutar en un hilo separado para no bloquear
                 thread = threading.Thread(target=gossip_exchange, args=(peer,), daemon=True)
                 thread.start()
+            
+            # Verificar si el líder está desconectado basado en el estado de gossip
+            # (solo si no somos el líder)
+            if not is_leader():
+                with cluster_lock:
+                    leader_id = cluster_state.get("leader_id")
+                    if leader_id:
+                        # Verificar estado del líder en peer_status
+                        if leader_id in cluster_state.get("peer_status", {}):
+                            leader_status = cluster_state["peer_status"][leader_id].get("status")
+                            time_since_seen = time.time() - cluster_state["peer_status"][leader_id].get("last_seen", 0)
+                            
+                            # Si el líder está marcado como "dead" o ha estado "suspected" por mucho tiempo
+                            if leader_status == "dead":
+                                print(f"[NAMENODE] [GOSSIP] 🗳️  Líder {leader_id} detectado como dead mediante gossip, iniciando elección...")
+                                cluster_state["leader_id"] = None
+                                cluster_state["last_heartbeat_time"] = 0
+                                # Iniciar elección en un hilo separado para no bloquear gossip
+                                threading.Thread(target=start_election, daemon=True).start()
+                            elif leader_status == "suspected" and time_since_seen > (ELECTION_TIMEOUT * 1.5):
+                                print(f"[NAMENODE] [GOSSIP] 🗳️  Líder {leader_id} suspected por {time_since_seen:.1f}s, iniciando elección...")
+                                cluster_state["leader_id"] = None
+                                cluster_state["last_heartbeat_time"] = 0
+                                threading.Thread(target=start_election, daemon=True).start()
                 
         except Exception as e:
-            print(f"[NAMENODE] [GOSSIP] Error en gossip loop: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[NAMENODE] [GOSSIP] ⚠️  Error en gossip loop: {type(e).__name__}: {e}")
+            # No imprimir traceback completo para errores esperados
 
 
 def trigger_reconciliation(reunited_peers: List[str]):
@@ -1257,8 +1295,22 @@ def request_vote(candidate_id: str, term: int) -> bool:
     # Obtener token de servicio para autenticación
     try:
         service_token = generate_service_token(candidate_id, "service")
-    except Exception:
+        print(f"[NAMENODE] 🗳️  [VOTE] Token generado para candidato {candidate_id}")
+    except Exception as e:
+        print(f"[NAMENODE] 🗳️  [VOTE] Error generando token para {candidate_id}: {e}, usando token pre-compartido")
         service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+    
+    # Verificar que el token se puede decodificar (para diagnóstico)
+    try:
+        from security.service_auth import verify_service_token
+        test_payload = verify_service_token(service_token)
+        if test_payload:
+            test_service_id = test_payload.get("service_id") or test_payload.get("sub", "")
+            print(f"[NAMENODE] 🗳️  [VOTE] Token verificado localmente: service_id={test_service_id}")
+        else:
+            print(f"[NAMENODE] 🗳️  [VOTE] ⚠️  Token no se puede verificar localmente, usando token pre-compartido")
+    except Exception as e:
+        print(f"[NAMENODE] 🗳️  [VOTE] ⚠️  Error verificando token localmente: {e}")
     
     votes = 1  # Voto propio
     successful_contacts = 1
@@ -1266,6 +1318,9 @@ def request_vote(candidate_id: str, term: int) -> bool:
     for peer in peers:
         try:
             peer_url = get_peer_url(peer)
+            print(f"[NAMENODE] 🗳️  [VOTE] Solicitando voto a {peer} ({peer_url}/internal/vote)")
+            print(f"[NAMENODE] 🗳️  [VOTE] Candidato: {candidate_id}, Term: {term}")
+            print(f"[NAMENODE] 🗳️  [VOTE] Token usado: {service_token[:20]}... (primeros 20 caracteres)")
             response = requests.post(
                 f"{peer_url}/internal/vote",
                 json={"candidate_id": candidate_id, "term": term},
@@ -1279,28 +1334,45 @@ def request_vote(candidate_id: str, term: int) -> bool:
                 data = response.json()
                 if data.get("granted"):
                     votes += 1
+                    print(f"[NAMENODE] 🗳️  [VOTE] ✅ Voto concedido por {peer}")
+                else:
+                    print(f"[NAMENODE] 🗳️  [VOTE] ❌ Voto denegado por {peer}: {data}")
             else:
                 update_peer_status(peer, False)
-        except Exception as e:
+                print(f"[NAMENODE] 🗳️  [VOTE] ❌ Error HTTP {response.status_code} de {peer}: {response.text[:200] if hasattr(response, 'text') else 'N/A'}")
+        except requests.exceptions.ConnectionError as e:
+            # Errores de conexión (DNS, red, etc.) - esperados cuando el peer no está disponible
             update_peer_status(peer, False)
-            print(f"[NAMENODE] Error solicitando voto a {peer}: {e}")
+            error_msg = str(e)
+            if "Failed to resolve" in error_msg or "name resolution" in error_msg.lower():
+                print(f"[NAMENODE] 🗳️  [VOTE] ⚠️  Peer {peer} no disponible (no se puede resolver DNS)")
+            elif "Connection refused" in error_msg or "refused" in error_msg.lower():
+                print(f"[NAMENODE] 🗳️  [VOTE] ⚠️  Peer {peer} no disponible (conexión rechazada)")
+            else:
+                print(f"[NAMENODE] 🗳️  [VOTE] ⚠️  Peer {peer} no disponible: {type(e).__name__}")
+        except requests.exceptions.Timeout:
+            update_peer_status(peer, False)
+            print(f"[NAMENODE] 🗳️  [VOTE] ⚠️  Peer {peer} no responde (timeout)")
+        except Exception as e:
+            # Otros errores inesperados - solo loguear sin traceback completo
+            update_peer_status(peer, False)
+            print(f"[NAMENODE] 🗳️  [VOTE] ⚠️  Error solicitando voto a {peer}: {type(e).__name__}: {e}")
     
     total_nodes = len(peers) + 1
     quorum = (total_nodes // 2) + 1
     
+    # Si no se pudo contactar a ningún peer, autoelegirse como líder
+    # Esto permite que nodos aislados o únicos funcionen correctamente
+    if successful_contacts == 1:
+        print(f"[NAMENODE] ⚠️  No se pudo contactar a ningún peer de {len(peers)} peers conocidos: {sorted(peers)}")
+        print(f"[NAMENODE] ✅ Autoelegiéndose como líder (nodo aislado o único)")
+        return True
+    
     # Solo permitir convertirse en líder si se obtiene mayoría real de votos
-    # NO permitir que un nodo se convierta en líder solo porque no puede contactar a otros peers
     if votes >= quorum and successful_contacts >= quorum:
         print(f"[NAMENODE] ✅ Mayoría obtenida: {votes}/{quorum} votos, {successful_contacts}/{total_nodes} nodos contactados")
         print(f"[NAMENODE] 📋 Peers contactados exitosamente: {successful_contacts - 1} de {len(peers)}")
         return True
-    
-    # Si no se pudo contactar a ningún peer, NO convertirse en líder automáticamente
-    # Esto previene que nodos nuevos se conviertan en líder incorrectamente
-    if successful_contacts == 1:
-        print(f"[NAMENODE] ⚠️  No se pudo contactar a ningún peer de {len(peers)} peers conocidos: {sorted(peers)}")
-        print(f"[NAMENODE] ⚠️  No se convertirá en líder sin mayoría. Esperando a recibir información del líder o contactar con otros peers...")
-        return False
     
     print(f"[NAMENODE] ❌ Votos insuficientes: {votes}/{quorum} votos, {successful_contacts}/{total_nodes} nodos contactados")
     print(f"[NAMENODE] 📋 Peers contactados: {successful_contacts - 1} de {len(peers)}")
@@ -1309,23 +1381,47 @@ def request_vote(candidate_id: str, term: int) -> bool:
 
 def check_existing_leader(peers: List[str]) -> Optional[str]:
     """
-    Verifica si hay un líder activo consultando los peers conocidos.
-    Esto previene que nodos nuevos inicien elecciones innecesarias.
+    Verifica si hay un líder activo intentando comunicarse directamente con él.
+    Si el líder conocido no responde, retorna None para iniciar una votación.
+    Solo si no hay líder conocido, consulta a los peers.
     
     Returns:
-        ID del líder si se encuentra uno activo, None en caso contrario
+        ID del líder si se encuentra uno activo y responde, None en caso contrario
     """
+    with cluster_lock:
+        known_leader_id = cluster_state.get("leader_id")
+    
+    # PRIMERO: Intentar comunicarse directamente con el líder conocido (si existe)
+    if known_leader_id:
+        print(f"[NAMENODE] 🔍 Verificando líder conocido directamente: {known_leader_id}")
+        try:
+            leader_url = get_peer_url(known_leader_id)
+            response = requests.get(f"{leader_url}/", timeout=3)
+            if response.status_code == 200:
+                data = response.json()
+                # Verificar que realmente es el líder
+                if data.get("is_leader") and (data.get("leader_id") == known_leader_id or data.get("node_id") == known_leader_id):
+                    print(f"[NAMENODE] ✅ Líder conocido {known_leader_id} está activo y responde correctamente")
+                    # Actualizar estado del líder en gossip
+                    update_peer_status(known_leader_id, True)
+                    return known_leader_id
+                else:
+                    print(f"[NAMENODE] ⚠️  Líder conocido {known_leader_id} no es líder activo según su respuesta")
+                    # El líder conocido no es realmente el líder, iniciar votación
+                    return None
+        except Exception as e:
+            print(f"[NAMENODE] ❌ Líder conocido {known_leader_id} no responde: {e}")
+            print(f"[NAMENODE] 🗳️  Se iniciará votación porque el líder conocido no está disponible")
+            # Actualizar estado del líder en gossip como no disponible
+            update_peer_status(known_leader_id, False)
+            return None
+    
+    # SEGUNDO: Si no hay líder conocido, consultar a los peers para descubrir uno
     if not peers:
         print(f"[NAMENODE] 🔍 Verificación de líder: No hay peers conocidos para consultar")
         return None
     
-    print(f"[NAMENODE] 🔍 Verificando líder activo consultando {len(peers)} peers conocidos: {sorted(peers)}")
-    
-    # Obtener token de servicio para autenticación
-    try:
-        service_token = generate_service_token(cluster_state["node_id"], "service")
-    except Exception:
-        service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+    print(f"[NAMENODE] 🔍 No hay líder conocido localmente, consultando {len(peers)} peers conocidos: {sorted(peers)}")
     
     # Consultar cada peer para ver si hay un líder activo
     for peer in peers:
@@ -1334,22 +1430,44 @@ def check_existing_leader(peers: List[str]) -> Optional[str]:
             response = requests.get(f"{peer_url}/", timeout=2)
             if response.status_code == 200:
                 data = response.json()
-                # Si este peer es el líder, retornar su ID
+                # Si este peer es el líder, intentar comunicarse directamente con él
                 if data.get("is_leader"):
                     leader_id = data.get("leader_id") or data.get("node_id")
-                    print(f"[NAMENODE] ✅ Líder activo encontrado: {leader_id} (consultado desde {peer})")
-                    return leader_id
-                # Si este peer conoce un líder, retornar ese ID
+                    # Verificar que el líder responde directamente
+                    try:
+                        leader_url = get_peer_url(leader_id)
+                        leader_response = requests.get(f"{leader_url}/", timeout=2)
+                        if leader_response.status_code == 200:
+                            leader_data = leader_response.json()
+                            if leader_data.get("is_leader"):
+                                print(f"[NAMENODE] ✅ Líder activo encontrado y verificado: {leader_id}")
+                                update_peer_status(leader_id, True)
+                                return leader_id
+                    except Exception as e:
+                        print(f"[NAMENODE] ⚠️  Líder {leader_id} reportado por {peer} pero no responde: {e}")
+                        continue
+                # Si este peer conoce un líder, intentar comunicarse directamente con él
                 elif data.get("leader_id"):
                     leader_id = data.get("leader_id")
-                    print(f"[NAMENODE] ✅ Líder conocido encontrado: {leader_id} (según {peer})")
-                    return leader_id
+                    try:
+                        leader_url = get_peer_url(leader_id)
+                        leader_response = requests.get(f"{leader_url}/", timeout=2)
+                        if leader_response.status_code == 200:
+                            leader_data = leader_response.json()
+                            if leader_data.get("is_leader"):
+                                print(f"[NAMENODE] ✅ Líder conocido encontrado y verificado: {leader_id}")
+                                update_peer_status(leader_id, True)
+                                return leader_id
+                    except Exception as e:
+                        print(f"[NAMENODE] ⚠️  Líder {leader_id} reportado por {peer} pero no responde: {e}")
+                        continue
         except Exception as e:
             # Continuar con el siguiente peer si este no responde
             print(f"[NAMENODE] ⚠️  No se pudo contactar a peer {peer} para verificar líder: {e}")
             continue
     
     print(f"[NAMENODE] ❌ No se encontró líder activo después de consultar {len(peers)} peers")
+    print(f"[NAMENODE] 🗳️  Se iniciará votación porque no hay líder disponible")
     return None
 
 
@@ -1463,6 +1581,9 @@ def leader_heartbeat_loop():
         # Detectar qué seguidores están activos
         active_followers = []
         
+        # Actualizar estado del líder como vivo en peer_status (el líder también se monitorea a sí mismo)
+        update_peer_status(leader_id, True)
+        
         print(f"[NAMENODE] 💓 [HEARTBEAT] Enviando heartbeats desde líder {leader_id}")
         print(f"[NAMENODE] 💓 [HEARTBEAT] 📋 Lista completa de peers que se enviará ({len(all_known_peers)}): {sorted(all_known_peers)}")
         print(f"[NAMENODE] 💓 [HEARTBEAT] 📋 Detalle: peers={sorted(peers)}, leader_id={leader_id} (incluido en lista)")
@@ -1538,7 +1659,8 @@ def leader_heartbeat_loop():
 def follower_heartbeat_check():
     """Verifica si el líder sigue activo (para seguidores)"""
     while True:
-        time.sleep(ELECTION_TIMEOUT)
+        # Verificar más frecuentemente (cada 5 segundos en lugar de ELECTION_TIMEOUT)
+        time.sleep(5)
         
         if is_leader():
             continue
@@ -1546,30 +1668,59 @@ def follower_heartbeat_check():
         with cluster_lock:
             time_since_heartbeat = time.time() - cluster_state["last_heartbeat_time"]
             leader_id = cluster_state["leader_id"]
+            # Verificar también el estado del líder en gossip
+            leader_status = None
+            if leader_id and leader_id in cluster_state.get("peer_status", {}):
+                leader_status = cluster_state["peer_status"][leader_id].get("status")
+        
+        # Verificar si el líder está marcado como "dead" o "suspected" en gossip
+        if leader_id and leader_status in ["dead", "suspected"]:
+            print(f"[NAMENODE] ⚠️  Líder {leader_id} detectado como {leader_status} mediante gossip, iniciando elección...")
+            with cluster_lock:
+                cluster_state["leader_id"] = None
+                cluster_state["last_heartbeat_time"] = 0  # Resetear para forzar elección
+            start_election()
+            continue
         
         if leader_id:
+            # Si han pasado más de ELECTION_TIMEOUT sin heartbeat, verificar conectividad
             if time_since_heartbeat > ELECTION_TIMEOUT:
+                print(f"[NAMENODE] ⏱️  Sin heartbeat del líder {leader_id} por {time_since_heartbeat:.1f}s, verificando conectividad...")
                 try:
                     leader_url = get_peer_url(leader_id)
                     response = requests.get(f"{leader_url}/", timeout=3)
                     if response.status_code == 200:
+                        # El líder está vivo, actualizar timestamp
                         with cluster_lock:
                             cluster_state["last_heartbeat_time"] = time.time()
+                            # Actualizar estado del líder en gossip
+                            if leader_id in cluster_state.get("peer_status", {}):
+                                cluster_state["peer_status"][leader_id]["status"] = "alive"
+                                cluster_state["peer_status"][leader_id]["last_seen"] = time.time()
+                        print(f"[NAMENODE] ✅ Líder {leader_id} responde correctamente")
                         continue
                     else:
-                        print(f"[NAMENODE] Líder {leader_id} no responde correctamente, iniciando elección...")
+                        print(f"[NAMENODE] ❌ Líder {leader_id} no responde correctamente (HTTP {response.status_code}), iniciando elección...")
                         with cluster_lock:
                             cluster_state["leader_id"] = None
+                            cluster_state["last_heartbeat_time"] = 0
                         start_election()
                 except Exception as e:
+                    # Si el timeout es mayor, definitivamente el líder está desconectado
                     if time_since_heartbeat > (ELECTION_TIMEOUT * 1.5):
-                        print(f"[NAMENODE] Líder {leader_id} inaccesible ({time_since_heartbeat:.1f}s sin contacto): {e}")
-                        print(f"[NAMENODE] Iniciando elección...")
+                        print(f"[NAMENODE] ❌ Líder {leader_id} inaccesible ({time_since_heartbeat:.1f}s sin contacto): {e}")
+                        print(f"[NAMENODE] 🗳️  Iniciando elección...")
                         with cluster_lock:
                             cluster_state["leader_id"] = None
+                            cluster_state["last_heartbeat_time"] = 0
                         start_election()
+                    else:
+                        # Aún no ha pasado suficiente tiempo, solo marcar como suspected
+                        print(f"[NAMENODE] ⚠️  Líder {leader_id} no responde temporalmente ({time_since_heartbeat:.1f}s), marcando como suspected...")
+                        if leader_id in cluster_state.get("peer_status", {}):
+                            cluster_state["peer_status"][leader_id]["status"] = "suspected"
         elif time_since_heartbeat > ELECTION_TIMEOUT:
-            print(f"[NAMENODE] No hay líder conocido después de {time_since_heartbeat:.1f}s, intentando elección...")
+            print(f"[NAMENODE] 🗳️  No hay líder conocido después de {time_since_heartbeat:.1f}s, intentando elección...")
             start_election()
 
 
@@ -3008,14 +3159,33 @@ def internal_vote(
         raise HTTPException(status_code=401, detail="Se requiere token de servicio")
     
     token = authorization.split(" ")[1]
-    payload = verify_service_token(token)
-    if not payload:
+    candidate_id = request.candidate_id
+    print(f"[NAMENODE] [VOTE] 📥 Recibida solicitud de voto de candidato: {candidate_id}, term: {request.term}")
+    
+    # Usar validate_service_request que maneja tanto JWT como tokens pre-compartidos
+    if not validate_service_request(candidate_id, token):
+        print(f"[NAMENODE] [VOTE] ❌ Token de servicio inválido para candidato {candidate_id}")
+        # Intentar verificar el token para obtener más información de diagnóstico
+        payload = verify_service_token(token)
+        if payload:
+            service_id_from_token = payload.get("service_id") or payload.get("sub", "")
+            print(f"[NAMENODE] [VOTE] 📋 Token decodificado pero no coincide: service_id={service_id_from_token}, candidate_id={candidate_id}")
+        else:
+            print(f"[NAMENODE] [VOTE] 📋 Token no se puede decodificar como JWT")
         raise HTTPException(status_code=403, detail="Token de servicio inválido")
     
-    # Verificar que viene de otro namenode
-    service_id = payload.get("service_id") or payload.get("sub", "")
-    if not service_id.startswith("namenode-"):
-        raise HTTPException(status_code=403, detail="Solo namenodes pueden votar")
+    # Si validate_service_request pasó, obtener el service_id del token para verificación adicional
+    payload = verify_service_token(token)
+    if payload:
+        service_id = payload.get("service_id") or payload.get("sub", "")
+        # Verificar que viene de otro namenode
+        if "namenode" not in service_id.lower():
+            print(f"[NAMENODE] [VOTE] ❌ Error: service_id '{service_id}' no es un namenode")
+            raise HTTPException(status_code=403, detail="Solo namenodes pueden votar")
+        print(f"[NAMENODE] [VOTE] ✅ Solicitud de voto autenticada de {service_id} (candidato: {candidate_id}, term: {request.term})")
+    else:
+        # Si no es JWT, es token pre-compartido (ya validado por validate_service_request)
+        print(f"[NAMENODE] [VOTE] ✅ Solicitud de voto autenticada con token pre-compartido (candidato: {candidate_id}, term: {request.term})")
     
     # Si este nodo es el líder, detectar si el candidato es un nuevo seguidor
     candidate_id = request.candidate_id
@@ -3311,7 +3481,7 @@ def get_operation_log_endpoint(
     
     # Verificar que viene de otro namenode
     service_id = payload.get("service_id") or payload.get("sub", "")
-    if not service_id.startswith("namenode-"):
+    if "namenode" not in service_id.lower():
         raise HTTPException(status_code=403, detail="Solo namenodes pueden obtener logs")
     
     # Cargar log desde la base de datos

@@ -21,3 +21,5 @@ SECURITY_IMPLEMENTATION.md
 security/README.md
 logs/
 a
+emisor.py
+receptor.py

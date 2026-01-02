@@ -3054,9 +3054,11 @@ def internal_replicate(
     # 🔍 LOG 4: Ver qué service_id se extrajo
     print(f"[NAMENODE] [REPLICATE] 🔍 Service ID extraído: '{service_id}'")
     print(f"[NAMENODE] [REPLICATE] 🔍 Service ID empieza con 'namenode-': {service_id.startswith('namenode-')}")
+    print(f"[NAMENODE] [REPLICATE] 🔍 Service ID empieza con 'tbfs-namenode-': {service_id.startswith('tbfs-namenode-')}")
     
-    if not service_id.startswith("namenode-"):
-        print(f"[NAMENODE] [REPLICATE] ❌ ERROR: Service ID '{service_id}' NO empieza con 'namenode-'")
+    # Aceptar tanto 'namenode-' como 'tbfs-namenode-'
+    if not (service_id.startswith("namenode-") or service_id.startswith("tbfs-namenode-")):
+        print(f"[NAMENODE] [REPLICATE] ❌ ERROR: Service ID '{service_id}' NO empieza con 'namenode-' ni 'tbfs-namenode-'")
         raise HTTPException(status_code=403, detail="Solo namenodes pueden replicar")
     
     print(f"[NAMENODE] [REPLICATE] ✅ Service ID válido: '{service_id}'")

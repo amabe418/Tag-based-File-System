@@ -354,11 +354,14 @@ def get_leader_url() -> Optional[str]:
 def update_peer_status(peer_id: str, alive: bool):
     """
     Actualiza el estado de un peer basado en si está vivo o no (para gossip).
+    Detecta reunificación cuando un peer pasa de "dead"/"suspected" a "alive".
     
     Args:
         peer_id: ID del peer
         alive: True si el peer está vivo, False si no
     """
+    reunited_peers = []
+    
     with cluster_lock:
         if peer_id not in cluster_state["peer_status"]:
             cluster_state["peer_status"][peer_id] = {
@@ -367,9 +370,14 @@ def update_peer_status(peer_id: str, alive: bool):
             }
         
         peer_info = cluster_state["peer_status"][peer_id]
+        previous_status = peer_info["status"]
         
         if alive:
             peer_info["last_seen"] = time.time()
+            # Detectar reunificación: si el peer estaba "dead" o "suspected" y ahora está "alive"
+            if previous_status in ["dead", "suspected"]:
+                print(f"[NAMENODE] [GOSSIP] 🔄 Peer {peer_id} reunificado: {previous_status} -> alive")
+                reunited_peers.append(peer_id)
             peer_info["status"] = "alive"
         else:
             # Si ha pasado mucho tiempo sin ver al peer, marcarlo como suspected o dead
@@ -382,6 +390,12 @@ def update_peer_status(peer_id: str, alive: bool):
                 elif peer_info["status"] == "suspected" and time_since_seen > (PEER_FAILURE_TIMEOUT * 2):
                     peer_info["status"] = "dead"
                     print(f"[NAMENODE] [GOSSIP] Peer {peer_id} marcado como dead (sin contacto por {time_since_seen:.1f}s)")
+    
+    # Disparar reconciliación si se detectó reunificación
+    if reunited_peers:
+        print(f"[NAMENODE] [GOSSIP] 🔄 Disparando reconciliación para peers reunificados: {reunited_peers}")
+        # Ejecutar en un hilo separado para no bloquear gossip
+        threading.Thread(target=trigger_reconciliation, args=(reunited_peers,), daemon=True).start()
 
 
 def get_peers_to_contact() -> List[str]:
@@ -835,14 +849,26 @@ def compare_operation_logs(local_log: List[OperationLog], peer_log: List[Operati
                 # Buscar operación equivalente en local
                 found_match = False
                 for local_op in local_ops:
-                    if (local_op.term == peer_op.term and 
-                        abs(local_op.timestamp - peer_op.timestamp) < 1.0):
-                        # Misma operación (mismo term y timestamp similar)
+                    # Comparación más robusta: mismo term y timestamp similar (hasta 5 segundos de diferencia)
+                    # o mismo term y mismo hash de datos (para operaciones de archivos)
+                    timestamp_match = abs(local_op.timestamp - peer_op.timestamp) < 5.0
+                    term_match = local_op.term == peer_op.term
+                    
+                    # Para operaciones de archivos, también comparar hash si está disponible
+                    hash_match = True
+                    if peer_op.operation == "add_file" and local_op.operation == "add_file":
+                        peer_hash = peer_op.data.get("hash", "")
+                        local_hash = local_op.data.get("hash", "")
+                        if peer_hash and local_hash:
+                            hash_match = peer_hash == local_hash
+                    
+                    if term_match and timestamp_match and hash_match:
+                        # Misma operación
                         found_match = True
                         break
                 
                 if not found_match:
-                    # Misma operación pero diferente term/timestamp = conflicto potencial
+                    # Misma operación pero diferente term/timestamp/hash = conflicto potencial
                     conflicts.append({
                         "local": local_ops[0] if local_ops else None,
                         "peer": peer_op
@@ -907,6 +933,21 @@ def apply_operation_safely(operation: OperationLog, node_id: str = None):
                                 user_id=operation_data.get("user_id", "system"),
                                 term=operation.term
                             )
+                            # Guardar réplicas si están en los datos (también cuando se actualiza)
+                            if "datanode_ids" in operation_data:
+                                from namenode.datanode_manager import save_file_replicas
+                                # Obtener file_id del archivo actualizado
+                                updated_files = query_files(
+                                    query_tags=operation_data.get("tags", []),
+                                    node_id=node_id,
+                                    user_id=operation_data.get("user_id", "system")
+                                )
+                                for fid, name, _ in updated_files:
+                                    file_info_updated = get_file_by_id(fid, node_id=node_id)
+                                    if file_info_updated and file_info_updated.get("name") == operation_data.get("name"):
+                                        save_file_replicas(fid, operation_data["datanode_ids"], node_id_db=NODE_ID)
+                                        print(f"[NAMENODE] FASE 4: Réplicas actualizadas para archivo existente: {fid}")
+                                        break
                     break
             
             if not file_exists:
@@ -1089,18 +1130,30 @@ def perform_full_reconciliation(reunited_peers: List[str]):
             # Verificar si la operación ya está en local
             already_applied = False
             for local_op in local_log:
-                if (local_op.operation == operation.operation and
-                    local_op.term == operation.term and
-                    abs(local_op.timestamp - operation.timestamp) < 1.0):
+                # Comparación más robusta
+                timestamp_match = abs(local_op.timestamp - operation.timestamp) < 5.0
+                term_match = local_op.term == operation.term
+                operation_match = local_op.operation == operation.operation
+                
+                if term_match and timestamp_match and operation_match:
                     already_applied = True
                     break
             
             if not already_applied:
                 print(f"[NAMENODE] FASE 4: Aplicando operación faltante: {operation.operation} (term {operation.term})")
                 apply_operation_safely(operation, NODE_ID)
+                # Guardar operación aplicada en el log persistente
+                save_operation_to_log(operation, NODE_ID)
+                # Agregar al log en memoria
+                with log_lock:
+                    operation_log.append(operation)
                 applied_count += 1
         
         print(f"[NAMENODE] FASE 4: Aplicadas {applied_count} operaciones del líder")
+        
+        # Recargar log local después de aplicar operaciones del líder
+        local_log = load_operation_log(NODE_ID)
+        print(f"[NAMENODE] FASE 4: Log local actualizado: {len(local_log)} operaciones")
         
         # Actualizar term local
         with cluster_lock:
@@ -1128,6 +1181,11 @@ def perform_full_reconciliation(reunited_peers: List[str]):
         for operation in missing_ops:
             print(f"[NAMENODE] FASE 4: Aplicando operación faltante de {peer}: {operation.operation} (term {operation.term})")
             apply_operation_safely(operation, NODE_ID)
+            # Guardar operación aplicada en el log persistente
+            save_operation_to_log(operation, NODE_ID)
+            # Agregar al log en memoria
+            with log_lock:
+                operation_log.append(operation)
         
         # Resolver conflictos (last-write-wins)
         for conflict in comparison["conflicts"]:
@@ -1139,8 +1197,17 @@ def perform_full_reconciliation(reunited_peers: List[str]):
                 if peer_op.timestamp > local_op.timestamp:
                     print(f"[NAMENODE] FASE 4: Resolviendo conflicto - aplicando versión de peer (timestamp: {peer_op.timestamp} > {local_op.timestamp})")
                     apply_operation_safely(peer_op, NODE_ID)
+                    # Guardar operación aplicada en el log persistente
+                    save_operation_to_log(peer_op, NODE_ID)
+                    # Agregar al log en memoria
+                    with log_lock:
+                        operation_log.append(peer_op)
                 else:
                     print(f"[NAMENODE] FASE 4: Resolviendo conflicto - manteniendo versión local (timestamp: {local_op.timestamp} >= {peer_op.timestamp})")
+        
+        # Recargar log local después de aplicar operaciones de este peer
+        local_log = load_operation_log(NODE_ID)
+        print(f"[NAMENODE] FASE 4: Log local actualizado después de procesar {peer}: {len(local_log)} operaciones")
     
     # Paso 6: Verificar integridad de datos físicos y re-replicar si es necesario
     print(f"[NAMENODE] FASE 4: Verificando integridad de réplicas...")

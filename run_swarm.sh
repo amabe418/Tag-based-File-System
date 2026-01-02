@@ -101,6 +101,14 @@ docker run -d --name tbfs-registry-3 --network tbfs_net -p 9002:9000 \
 echo "Esperando que los registries se estabilicen..."
 sleep 5
 
+# Obtener directorio raíz del proyecto para montar código como volumen
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CODE_VOLUME_ARGS=()
+if [ -d "$PROJECT_ROOT/namenode" ] && [ -d "$PROJECT_ROOT/security" ]; then
+    CODE_VOLUME_ARGS=(-v "$PROJECT_ROOT/namenode:/app/namenode" -v "$PROJECT_ROOT/security:/app/security")
+    echo "📁 Montando código desde: $PROJECT_ROOT"
+fi
+
 # Ejecutar 3 nodos del MetaNameNode
 echo "Iniciando MetaNameNode - Nodo 1..."
 docker run -d --name tbfs-namenode-1 --network tbfs_net -p 8010:8010 \
@@ -113,6 +121,7 @@ docker run -d --name tbfs-namenode-1 --network tbfs_net -p 8010:8010 \
   -e REGISTRY_URL=http://tbfs-registry-1:9000,http://tbfs-registry-2:9000,http://tbfs-registry-3:9000 \
   -e HEARTBEAT_INTERVAL=10 \
   -v tbfs-namenode-1-data:/app/namenode/data \
+  "${CODE_VOLUME_ARGS[@]}" \
   tbfs-namenode
 
 echo "Iniciando MetaNameNode - Nodo 2..."
@@ -126,6 +135,7 @@ docker run -d --name tbfs-namenode-2 --network tbfs_net -p 8011:8010 \
   -e REGISTRY_URL=http://tbfs-registry-1:9000,http://tbfs-registry-2:9000,http://tbfs-registry-3:9000 \
   -e HEARTBEAT_INTERVAL=10 \
   -v tbfs-namenode-2-data:/app/namenode/data \
+  "${CODE_VOLUME_ARGS[@]}" \
   tbfs-namenode
 
 echo "Iniciando MetaNameNode - Nodo 3..."
@@ -139,6 +149,7 @@ docker run -d --name tbfs-namenode-3 --network tbfs_net -p 8012:8010 \
   -e REGISTRY_URL=http://tbfs-registry-1:9000,http://tbfs-registry-2:9000,http://tbfs-registry-3:9000 \
   -e HEARTBEAT_INTERVAL=10 \
   -v tbfs-namenode-3-data:/app/namenode/data \
+  "${CODE_VOLUME_ARGS[@]}" \
   tbfs-namenode
 
 # Esperar un momento para que los MetaNameNodes se estabilicen

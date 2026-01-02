@@ -46,6 +46,20 @@ fi
 CONTAINER_NAME="tbfs-${TYPE}-${NUM}"
 REGISTRY_URLS="http://tbfs-registry-1:9000,http://tbfs-registry-2:9000,http://tbfs-registry-3:9000"
 
+# Obtener directorio raíz del proyecto (un nivel arriba de scripts/)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Verificar que los directorios necesarios existen y preparar volúmenes de código
+CODE_VOLUME_ARGS=()
+if [ -d "$PROJECT_ROOT/namenode" ] && [ -d "$PROJECT_ROOT/security" ]; then
+    CODE_VOLUME_ARGS=(-v "$PROJECT_ROOT/namenode:/app/namenode" -v "$PROJECT_ROOT/security:/app/security")
+    echo "📁 Montando código desde: $PROJECT_ROOT"
+else
+    echo "⚠️  Advertencia: No se encontraron directorios namenode/ o security/"
+    echo "   Los volúmenes de código no se montarán. Asegúrate de ejecutar desde el directorio raíz del proyecto."
+fi
+
 # Verificar si el contenedor ya existe
 if docker ps -a --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
     if docker ps --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
@@ -102,12 +116,14 @@ case $TYPE in
             PEERS="${PEERS}tbfs-namenode-${i}"
         done
         # Si NUM es 1, PEERS estará vacío (nodo único), lo cual es válido
+        # Montar código como volumen para desarrollo (cambios sin reconstruir imagen)
         docker run -d \
             --name "$CONTAINER_NAME" \
             --network tbfs_net \
             --hostname "$CONTAINER_NAME" \
             -p "${PORT}:8010" \
             -v "tbfs-namenode-${NUM}-data:/app/namenode/data" \
+            "${CODE_VOLUME_ARGS[@]}" \
             -e NODE_ID="tbfs-namenode-${NUM}" \
             -e PEERS="$PEERS" \
             -e NAMENODE_PORT=8010 \

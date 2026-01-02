@@ -1238,10 +1238,15 @@ def replicate_to_peers(operation: OperationLog):
     if not peers:
         return True
     
+    # 🔍 LOG: Ver qué node_id está usando el líder
+    print(f"[NAMENODE] [REPLICATE] 🔍 Líder generando token con node_id: '{leader_id}'")
+    
     # Obtener token de servicio para autenticación
     try:
         service_token = generate_service_token(cluster_state["node_id"], "service")
-    except Exception:
+        print(f"[NAMENODE] [REPLICATE] ✅ Token generado exitosamente (primeros 20 chars): {service_token[:20]}...")
+    except Exception as e:
+        print(f"[NAMENODE] [REPLICATE] ⚠️ Error generando token: {e}, usando token pre-compartido")
         service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
     
     success_count = 0
@@ -3029,14 +3034,32 @@ def internal_replicate(
         raise HTTPException(status_code=401, detail="Se requiere token de servicio")
     
     token = authorization.split(" ")[1]
+    
+    # 🔍 LOG 1: Ver si el token se puede decodificar
+    print(f"[NAMENODE] [REPLICATE] 🔍 Token recibido (primeros 20 chars): {token[:20]}...")
+    
     payload = verify_service_token(token)
+    
+    # 🔍 LOG 2: Ver si verify_service_token retorna None
     if not payload:
+        print(f"[NAMENODE] [REPLICATE] ❌ ERROR: verify_service_token retornó None (token inválido)")
         raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # 🔍 LOG 3: Ver qué contiene el payload
+    print(f"[NAMENODE] [REPLICATE] ✅ Token válido. Payload completo: {payload}")
     
     # Verificar que viene de otro namenode
     service_id = payload.get("service_id") or payload.get("sub", "")
+    
+    # 🔍 LOG 4: Ver qué service_id se extrajo
+    print(f"[NAMENODE] [REPLICATE] 🔍 Service ID extraído: '{service_id}'")
+    print(f"[NAMENODE] [REPLICATE] 🔍 Service ID empieza con 'namenode-': {service_id.startswith('namenode-')}")
+    
     if not service_id.startswith("namenode-"):
+        print(f"[NAMENODE] [REPLICATE] ❌ ERROR: Service ID '{service_id}' NO empieza con 'namenode-'")
         raise HTTPException(status_code=403, detail="Solo namenodes pueden replicar")
+    
+    print(f"[NAMENODE] [REPLICATE] ✅ Service ID válido: '{service_id}'")
     try:
         operation = data.get("operation")
         operation_data = data.get("data")

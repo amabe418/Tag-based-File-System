@@ -584,11 +584,25 @@ def delete_file_from_datanodes(file_hash: str, file_id: int, node_id_db: str = N
         print(f"[DATANODE_MANAGER] No hay réplicas registradas para file_id={file_id}")
         return False
     
-    print(f"[DATANODE_MANAGER] Eliminando de {len(replicas)} DataNodes: {[r['datanode_id'] for r in replicas]}")
+    # Eliminar duplicados: agrupar por datanode_id para evitar intentar eliminar dos veces del mismo DataNode
+    seen_datanodes = set()
+    unique_replicas = []
+    for replica in replicas:
+        datanode_id = replica["datanode_id"]
+        if datanode_id not in seen_datanodes:
+            seen_datanodes.add(datanode_id)
+            unique_replicas.append(replica)
+        else:
+            print(f"[DATANODE_MANAGER] ⚠️  Réplica duplicada detectada para {datanode_id}, saltando...")
+    
+    print(f"[DATANODE_MANAGER] Eliminando de {len(unique_replicas)} DataNodes únicos: {[r['datanode_id'] for r in unique_replicas]}")
+    if len(unique_replicas) < len(replicas):
+        print(f"[DATANODE_MANAGER] ⚠️  Se detectaron {len(replicas) - len(unique_replicas)} réplicas duplicadas")
+    
     success_count = 0
     failed_count = 0
     
-    for replica in replicas:
+    for replica in unique_replicas:
         datanode_id = replica["datanode_id"]
         url = replica["url"]
         if not url.startswith("http"):
@@ -609,12 +623,25 @@ def delete_file_from_datanodes(file_hash: str, file_id: int, node_id_db: str = N
                 headers={"Authorization": f"Bearer {service_token}"},
                 timeout=5  # Reducido a 5 segundos para evitar cuelgues
             )
-            response.raise_for_status()
-            print(f"[DATANODE_MANAGER] ✓ Archivo eliminado de {datanode_id}")
-            success_count += 1
+            
+            # Manejar 404 como éxito (el archivo ya no existe, que es el objetivo)
+            if response.status_code == 404:
+                print(f"[DATANODE_MANAGER] ⚠️  Archivo ya no existe en {datanode_id} (404), considerando como éxito")
+                success_count += 1
+            else:
+                response.raise_for_status()
+                print(f"[DATANODE_MANAGER] ✓ Archivo eliminado de {datanode_id}")
+                success_count += 1
         except requests.Timeout:
             print(f"[DATANODE_MANAGER] ✗ Timeout eliminando de {datanode_id} (más de 5 segundos)")
             failed_count += 1
+        except requests.HTTPError as e:
+            if e.response.status_code == 404:
+                print(f"[DATANODE_MANAGER] ⚠️  Archivo ya no existe en {datanode_id} (404), considerando como éxito")
+                success_count += 1
+            else:
+                print(f"[DATANODE_MANAGER] ✗ Error HTTP {e.response.status_code} eliminando de {datanode_id}: {e}")
+                failed_count += 1
         except requests.RequestException as e:
             print(f"[DATANODE_MANAGER] ✗ Error eliminando de {datanode_id}: {e}")
             failed_count += 1

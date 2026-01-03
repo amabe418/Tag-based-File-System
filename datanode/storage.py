@@ -105,23 +105,39 @@ def delete_file(file_id: str) -> bool:
         file_path = get_file_path(file_id)
         
         if not os.path.exists(file_path):
-            print(f"[STORAGE] Archivo no existe para eliminar: {file_id}")
+            print(f"[STORAGE] ⚠️  Archivo no existe para eliminar: {file_id} (ruta: {file_path})")
             return False
         
+        print(f"[STORAGE] Eliminando archivo: {file_id} (ruta: {file_path})")
         os.remove(file_path)
+        
+        # Verificar que realmente se eliminó
+        if os.path.exists(file_path):
+            print(f"[STORAGE] ❌ ERROR: Archivo {file_id} aún existe después de os.remove()")
+            return False
         
         # Intentar eliminar subdirectorio si está vacío (opcional, para limpieza)
         subdir = os.path.dirname(file_path)
         try:
             if os.path.exists(subdir) and not os.listdir(subdir):
                 os.rmdir(subdir)
-        except:
-            pass  # Ignorar si no se puede eliminar (puede tener otros archivos)
+                print(f"[STORAGE] Subdirectorio vacío eliminado: {subdir}")
+        except Exception as e:
+            # Ignorar si no se puede eliminar (puede tener otros archivos)
+            pass
         
-        print(f"[STORAGE] Archivo eliminado: {file_id}")
+        print(f"[STORAGE] ✅ Archivo eliminado exitosamente: {file_id}")
         return True
+    except FileNotFoundError:
+        print(f"[STORAGE] ⚠️  Archivo no encontrado (ya fue eliminado): {file_id}")
+        return False
+    except PermissionError as e:
+        print(f"[STORAGE] ❌ Error de permisos al eliminar {file_id}: {e}")
+        return False
     except Exception as e:
-        print(f"[STORAGE] Error al eliminar archivo {file_id}: {e}")
+        print(f"[STORAGE] ❌ Error al eliminar archivo {file_id}: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 

@@ -246,15 +246,25 @@ def delete(
     
     print(f"[DATANODE] DELETE /delete/{file_id}")
     
+    # Verificar si el archivo existe antes de intentar eliminarlo
     if not file_exists(file_id):
+        print(f"[DATANODE] ⚠️  Archivo {file_id} no existe, retornando 404")
         raise HTTPException(status_code=404, detail=f"Archivo '{file_id}' no encontrado")
     
+    # Intentar eliminar el archivo
+    print(f"[DATANODE] Intentando eliminar archivo físicamente: {file_id}")
     if delete_file(file_id):
+        # Verificar que realmente se eliminó
+        if file_exists(file_id):
+            print(f"[DATANODE] ❌ ERROR: Archivo {file_id} aún existe después de delete_file()")
+            raise HTTPException(status_code=500, detail="Error: archivo no se eliminó correctamente")
+        print(f"[DATANODE] ✅ Archivo {file_id} eliminado correctamente del disco")
         return {
             "success": True,
             "message": f"Archivo '{file_id}' eliminado correctamente"
         }
     else:
+        print(f"[DATANODE] ❌ Error en delete_file() para {file_id}")
         raise HTTPException(status_code=500, detail="Error al eliminar archivo")
 
 

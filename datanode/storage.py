@@ -119,12 +119,19 @@ def delete_file(file_id: str) -> bool:
         # Intentar eliminar subdirectorio si está vacío (opcional, para limpieza)
         subdir = os.path.dirname(file_path)
         try:
-            if os.path.exists(subdir) and not os.listdir(subdir):
-                os.rmdir(subdir)
-                print(f"[STORAGE] Subdirectorio vacío eliminado: {subdir}")
+            if os.path.exists(subdir):
+                contents = os.listdir(subdir)
+                if not contents:
+                    os.rmdir(subdir)
+                    print(f"[STORAGE] Subdirectorio vacío eliminado: {subdir}")
+                else:
+                    print(f"[STORAGE] Subdirectorio {subdir} no está vacío ({len(contents)} elementos), no se elimina")
+        except OSError as e:
+            # Error al eliminar subdirectorio (puede tener otros archivos o problemas de permisos)
+            print(f"[STORAGE] ⚠️  No se pudo eliminar subdirectorio {subdir}: {e}")
         except Exception as e:
-            # Ignorar si no se puede eliminar (puede tener otros archivos)
-            pass
+            # Otro tipo de error inesperado
+            print(f"[STORAGE] ⚠️  Error inesperado al intentar eliminar subdirectorio {subdir}: {e}")
         
         print(f"[STORAGE] ✅ Archivo eliminado exitosamente: {file_id}")
         return True

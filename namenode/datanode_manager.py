@@ -765,20 +765,40 @@ def rereplicate_file(file_id: int, file_hash: str, failed_datanode_id: str,
         except Exception:
             service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
         
-        # Enviar archivo al nuevo DataNode
-        files = {"file": ("replica", file_content)}
-        data = {"file_id": file_hash}
+        # Enviar archivo al nuevo DataNode (usar chunked si es grande)
+        use_chunked = file_size > (50 * 1024 * 1024)
         
-        response = requests.post(
-            f"{new_datanode_url}/store",
-            files=files,
-            data=data,
-            headers={"Authorization": f"Bearer {service_token}"},
-            timeout=30
-        )
-        response.raise_for_status()
-        
-        print(f"[DATANODE_MANAGER] Archivo re-replicado a {new_datanode_id}")
+        if use_chunked:
+            print(f"[DATANODE_MANAGER] Usando chunked transfer para re-replicación ({file_size:,} bytes)")
+            from namenode.datanode_transfer import send_file_to_datanode_chunked
+            
+            success, message = send_file_to_datanode_chunked(
+                datanode_url=new_datanode_url,
+                file_id=file_hash,
+                file_content=file_content,
+                service_token=service_token
+            )
+            
+            if not success:
+                print(f"[DATANODE_MANAGER] Error en chunked transfer: {message}")
+                return False
+            
+            print(f"[DATANODE_MANAGER] Archivo re-replicado a {new_datanode_id} (chunked)")
+        else:
+            # Método legacy para archivos pequeños
+            files = {"file": ("replica", file_content)}
+            data = {"file_id": file_hash}
+            
+            response = requests.post(
+                f"{new_datanode_url}/store",
+                files=files,
+                data=data,
+                headers={"Authorization": f"Bearer {service_token}"},
+                timeout=120
+            )
+            response.raise_for_status()
+            
+            print(f"[DATANODE_MANAGER] Archivo re-replicado a {new_datanode_id}")
         
         # Actualizar asignación de réplicas (reemplazar el DataNode fallido)
         # Obtener el tipo de réplica que tenía el DataNode fallido

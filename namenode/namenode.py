@@ -125,6 +125,9 @@ from namenode.datanode_manager import (
     unmark_datanode_draining, drain_datanode, discover_file_replicas
 )
 from namenode.registry_client import registry_client
+from namenode.chunked_upload import chunked_upload_manager
+from namenode.datanode_transfer import send_file_to_datanode_chunked, send_file_to_datanode_legacy
+import uuid
 
 app = FastAPI(title="TBFS MetaNameNode (Distributed)")
 
@@ -2061,6 +2064,10 @@ async def lifespan(app: FastAPI):
     gossip_thread.start()
     print(f"[NAMENODE] [GOSSIP] Loop de gossip iniciado (interval={GOSSIP_INTERVAL}s, fanout={GOSSIP_FANOUT})")
     
+    # Iniciar limpieza automática de uploads antiguos
+    chunked_upload_manager.start_cleanup_thread(max_age_hours=24)
+    print(f"[NAMENODE] [CHUNKED_UPLOAD] Manager iniciado con limpieza automática (24h)")
+    
     # Hilo para monitorear DataNodes inactivos y re-replicar archivos (solo en el líder)
     def datanode_monitor_loop():
         """Monitorea DataNodes inactivos cada 30 segundos y re-replica archivos afectados"""
@@ -2115,6 +2122,7 @@ async def lifespan(app: FastAPI):
     yield
     
     # Shutdown
+    chunked_upload_manager.stop_cleanup_thread()
     registry_client.stop()
     print(f"[NAMENODE] Nodo deteniéndose...")
 
@@ -2677,6 +2685,444 @@ def undrain_datanode_endpoint(
         raise HTTPException(status_code=404, detail=f"DataNode {node_id} no encontrado")
 
 
+# ========== CHUNKED UPLOAD ENDPOINTS ==========
+
+@app.post("/upload/init")
+def init_chunked_upload(
+    filename: str = Form(...),
+    file_hash: str = Form(...),
+    file_size: int = Form(...),
+    tags: str = Form(...),
+    chunk_size: int = Form(10 * 1024 * 1024),  # 10 MB por defecto
+    current_user: User = Depends(require_permission(Permission.WRITE_FILES))
+):
+    """
+    Inicia una sesión de upload por chunks.
+    Permite subir archivos grandes dividiéndolos en bloques.
+    """
+    print(f"[NAMENODE] POST /upload/init: filename={filename}, size={file_size}, chunks={chunk_size}")
+    
+    # Redirigir al líder si no somos el líder
+    leader_url = get_leader_url()
+    if leader_url:
+        print(f"[NAMENODE] Redirigiendo init upload a líder: {leader_url}")
+        try:
+            response = requests.post(
+                f"{leader_url}/upload/init",
+                data={
+                    "filename": filename,
+                    "file_hash": file_hash,
+                    "file_size": file_size,
+                    "tags": tags,
+                    "chunk_size": chunk_size
+                },
+                timeout=10
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"[NAMENODE] Error redirigiendo init upload a líder: {e}")
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    # Crear sesión de upload
+    upload_id = str(uuid.uuid4())
+    
+    try:
+        session = chunked_upload_manager.create_session(
+            upload_id=upload_id,
+            filename=filename,
+            file_hash=file_hash,
+            file_size=file_size,
+            tags=tags,
+            chunk_size=chunk_size,
+            user_id=current_user.username
+        )
+        
+        return {
+            "upload_id": upload_id,
+            "total_chunks": session.total_chunks,
+            "chunk_size": chunk_size,
+            "message": f"Sesión de upload creada. Envía {session.total_chunks} chunks."
+        }
+    except Exception as e:
+        print(f"[NAMENODE] Error creando sesión de upload: {e}")
+        raise HTTPException(status_code=500, detail=f"Error creando sesión: {str(e)}")
+
+
+@app.get("/upload/{upload_id}/status")
+def get_upload_status(
+    upload_id: str,
+    current_user: User = Depends(require_permission(Permission.READ_FILES))
+):
+    """
+    Obtiene el estado de un upload: qué chunks han sido subidos.
+    Útil para reanudar uploads interrumpidos.
+    """
+    # Redirigir al líder si no somos el líder
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            response = requests.get(
+                f"{leader_url}/upload/{upload_id}/status",
+                timeout=5
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    session = chunked_upload_manager.get_session(upload_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Sesión de upload no encontrada")
+    
+    # Verificar que el usuario es el dueño de la sesión
+    if session.user_id != current_user.username:
+        raise HTTPException(status_code=403, detail="No autorizado para esta sesión")
+    
+    return {
+        "upload_id": upload_id,
+        "filename": session.filename,
+        "total_chunks": session.total_chunks,
+        "uploaded_chunks": list(session.uploaded_chunks),
+        "progress_percentage": session.progress_percentage,
+        "is_complete": session.is_complete
+    }
+
+
+@app.post("/upload/{upload_id}/chunk/{chunk_index}")
+async def upload_chunk(
+    upload_id: str,
+    chunk_index: int,
+    chunk: UploadFile = File(...),
+    chunk_hash: str = Form(...),
+    current_user: User = Depends(require_permission(Permission.WRITE_FILES))
+):
+    """
+    Sube un chunk individual del archivo.
+    Los chunks se numeran desde 0.
+    """
+    # Redirigir al líder si no somos el líder
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            chunk_data = await chunk.read()
+            response = requests.post(
+                f"{leader_url}/upload/{upload_id}/chunk/{chunk_index}",
+                files={"chunk": (f"chunk_{chunk_index}", chunk_data)},
+                data={"chunk_hash": chunk_hash},
+                timeout=60
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    session = chunked_upload_manager.get_session(upload_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Sesión de upload no encontrada")
+    
+    # Verificar que el usuario es el dueño de la sesión
+    if session.user_id != current_user.username:
+        raise HTTPException(status_code=403, detail="No autorizado para esta sesión")
+    
+    # Leer chunk
+    chunk_data = await chunk.read()
+    
+    # Guardar chunk
+    success = chunked_upload_manager.save_chunk(
+        upload_id=upload_id,
+        chunk_index=chunk_index,
+        chunk_data=chunk_data,
+        chunk_hash=chunk_hash
+    )
+    
+    if not success:
+        raise HTTPException(status_code=400, detail="Error guardando chunk (hash inválido o error de I/O)")
+    
+    return {
+        "success": True,
+        "chunk_index": chunk_index,
+        "progress_percentage": session.progress_percentage
+    }
+
+
+@app.post("/upload/{upload_id}/finalize")
+async def finalize_chunked_upload(
+    upload_id: str,
+    current_user: User = Depends(require_permission(Permission.WRITE_FILES))
+):
+    """
+    Finaliza el upload: ensambla los chunks y envía el archivo a los DataNodes.
+    """
+    # Redirigir al líder si no somos el líder
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            response = requests.post(
+                f"{leader_url}/upload/{upload_id}/finalize",
+                timeout=120
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    session = chunked_upload_manager.get_session(upload_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Sesión de upload no encontrada")
+    
+    # Verificar que el usuario es el dueño de la sesión
+    if session.user_id != current_user.username:
+        raise HTTPException(status_code=403, detail="No autorizado para esta sesión")
+    
+    # Verificar que todos los chunks están presentes
+    if not session.is_complete:
+        missing = session.total_chunks - len(session.uploaded_chunks)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Upload incompleto: faltan {missing} chunks de {session.total_chunks}"
+        )
+    
+    # Ensamblar archivo
+    print(f"[NAMENODE] Ensamblando archivo {session.filename} ({session.total_chunks} chunks)...")
+    file_content = chunked_upload_manager.assemble_file(upload_id)
+    
+    if not file_content:
+        raise HTTPException(status_code=500, detail="Error ensamblando archivo o hash no coincide")
+    
+    file_size = len(file_content)
+    file_hash = session.file_hash.replace("sha256:", "")
+    
+    print(f"[NAMENODE] Archivo ensamblado: {file_size} bytes, hash verificado")
+    
+    # Parsear tags
+    tag_list = [t.strip() for t in session.tags.split(",") if t.strip()]
+    
+    # Agregar metadatos
+    with cluster_lock:
+        current_term = cluster_state["term"]
+    
+    file_id = add_file_metadata(
+        name=session.filename,
+        tags=tag_list,
+        size=file_size,
+        hash_value=f"sha256:{file_hash}",
+        node_id=NODE_ID,
+        user_id=current_user.username,
+        term=current_term
+    )
+    
+    if not file_id:
+        chunked_upload_manager.cleanup_session(upload_id)
+        raise HTTPException(status_code=400, detail="No se pudo agregar metadatos")
+    
+    # Asignar réplicas a DataNodes
+    datanode_ids = assign_replicas(file_hash, file_size, node_id_db=NODE_ID)
+    
+    if not datanode_ids:
+        delete_file_metadata(file_id, node_id=NODE_ID)
+        chunked_upload_manager.cleanup_session(upload_id)
+        raise HTTPException(
+            status_code=503,
+            detail="No hay suficientes DataNodes disponibles"
+        )
+    
+    # Enviar archivo a DataNodes (usando chunked transfer para archivos grandes)
+    from namenode.datanode_manager import get_datanode
+    
+    success_count = 0
+    successful_datanodes = []
+    min_required_replicas = min(2, len(datanode_ids))
+    
+    # Determinar si usar chunked transfer (para archivos > 50 MB)
+    use_chunked_transfer = file_size > (50 * 1024 * 1024)
+    
+    if use_chunked_transfer:
+        print(f"[NAMENODE] Usando chunked transfer para archivo grande ({file_size:,} bytes)")
+    
+    for dn_id in datanode_ids:
+        dn_info = get_datanode(dn_id, node_id_db=NODE_ID)
+        if not dn_info:
+            continue
+        
+        url = dn_info["url"]
+        if not url.startswith("http"):
+            url = f"http://{url}:{dn_info['port']}"
+        
+        try:
+            # Generar token de servicio
+            try:
+                service_token = generate_service_token(cluster_state["node_id"], "service")
+            except Exception:
+                service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+            
+            print(f"[NAMENODE] Enviando archivo a {dn_id}...")
+            
+            # Enviar por chunks o legacy según el tamaño
+            if use_chunked_transfer:
+                success, message = send_file_to_datanode_chunked(
+                    datanode_url=url,
+                    file_id=file_hash,
+                    file_content=file_content,
+                    service_token=service_token
+                )
+            else:
+                success, message = send_file_to_datanode_legacy(
+                    datanode_url=url,
+                    file_id=file_hash,
+                    filename=session.filename,
+                    file_content=file_content,
+                    service_token=service_token
+                )
+            
+            if success:
+                print(f"[NAMENODE] ✓ Archivo enviado exitosamente a {dn_id}: {message}")
+                success_count += 1
+                successful_datanodes.append(dn_id)
+            else:
+                print(f"[NAMENODE] ✗ Error enviando a {dn_id}: {message}")
+            
+        except Exception as e:
+            print(f"[NAMENODE] Error enviando a {dn_id}: {e}")
+    
+    # Verificar que se guardó en suficientes DataNodes
+    if success_count < min_required_replicas:
+        # Rollback
+        delete_file_metadata(file_id, node_id=NODE_ID)
+        chunked_upload_manager.cleanup_session(upload_id)
+        raise HTTPException(
+            status_code=507,
+            detail=f"Solo se almacenó en {success_count} DataNodes (mínimo: {min_required_replicas})"
+        )
+    
+    # Guardar asignación de réplicas
+    save_file_replicas(file_id, successful_datanodes, node_id_db=NODE_ID)
+    
+    # Replicar operación a otros MetaNameNodes
+    operation = OperationLog(
+        operation="add_file",
+        data={
+            "name": session.filename,
+            "tags": tag_list,
+            "size": file_size,
+            "hash": f"sha256:{file_hash}",
+            "datanode_ids": datanode_ids,
+            "user_id": current_user.username
+        },
+        term=cluster_state["term"],
+        timestamp=time.time()
+    )
+    
+    with log_lock:
+        operation_log.append(operation)
+    
+    save_operation_to_log(operation, NODE_ID)
+    replicate_to_peers(operation)
+    
+    # Limpiar sesión
+    chunked_upload_manager.cleanup_session(upload_id)
+    
+    print(f"[NAMENODE] Upload finalizado: {session.filename} ({success_count} réplicas)")
+    
+    return {
+        "success": True,
+        "message": f"Archivo '{session.filename}' subido correctamente",
+        "file_id": file_id,
+        "file_hash": file_hash,
+        "replicas": successful_datanodes,
+        "replicas_stored": success_count
+    }
+
+
+@app.delete("/upload/{upload_id}")
+def cancel_chunked_upload(
+    upload_id: str,
+    current_user: User = Depends(require_permission(Permission.WRITE_FILES))
+):
+    """
+    Cancela un upload en progreso y limpia los archivos temporales.
+    """
+    # Redirigir al líder si no somos el líder
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            response = requests.delete(
+                f"{leader_url}/upload/{upload_id}",
+                timeout=10
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    session = chunked_upload_manager.get_session(upload_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Sesión de upload no encontrada")
+    
+    # Verificar que el usuario es el dueño de la sesión
+    if session.user_id != current_user.username:
+        raise HTTPException(status_code=403, detail="No autorizado para esta sesión")
+    
+    # Limpiar sesión
+    chunked_upload_manager.cleanup_session(upload_id)
+    
+    return {
+        "success": True,
+        "message": f"Upload cancelado: {session.filename}"
+    }
+
+
+@app.get("/uploads/active")
+def list_active_uploads(
+    current_user: User = Depends(require_permission(Permission.READ_FILES))
+):
+    """
+    Lista todos los uploads activos del usuario actual.
+    Útil para ver qué uploads están en progreso.
+    """
+    # Redirigir al líder si no somos el líder
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            response = requests.get(
+                f"{leader_url}/uploads/active",
+                timeout=5
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    # Obtener todas las sesiones y filtrar por usuario
+    all_sessions = chunked_upload_manager.get_all_sessions()
+    user_sessions = [s for s in all_sessions if s["user_id"] == current_user.username]
+    
+    return {
+        "active_uploads": user_sessions,
+        "total": len(user_sessions)
+    }
+
+
+# ========== ENDPOINT ORIGINAL /add (MANTENIDO PARA COMPATIBILIDAD) ==========
+
 @app.post("/add")
 async def add_file_compat(
     file: UploadFile,
@@ -2824,6 +3270,11 @@ async def add_file_compat(
         
         print(f"[NAMENODE] Enviando archivo a {len(datanode_urls)} DataNodes (intento {attempt + 1}/{max_attempts})...")
         
+        # Determinar si usar chunked transfer
+        use_chunked_transfer = file_size > (50 * 1024 * 1024)
+        if use_chunked_transfer:
+            print(f"[NAMENODE] Usando chunked transfer para archivo grande ({file_size:,} bytes)")
+        
         # Enviar archivo a los DataNodes
         for dn_id, dn_url in datanode_urls:
             if dn_id in successful_datanodes:
@@ -2839,21 +3290,40 @@ async def add_file_compat(
                     print(f"[NAMENODE] Error generando token para node_id={node_id}: {token_error}, usando token pre-compartido")
                     service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
                 
-                files = {"file": (file.filename, file_content)}
-                data = {"file_id": file_hash}
+                print(f"[NAMENODE] Enviando archivo a {dn_id} ({dn_url}) con node_id={node_id}")
                 
-                print(f"[NAMENODE] Enviando archivo a {dn_id} ({dn_url}/store) con node_id={node_id}")
-                response = requests.post(
-                    f"{dn_url}/store",
-                    files=files,
-                    data=data,
-                    headers={"Authorization": f"Bearer {service_token}"},
-                    timeout=30
-                )
-                response.raise_for_status()
-                print(f"[NAMENODE] ✓ Archivo almacenado exitosamente en {dn_id} ({dn_url})")
-                success_count += 1
-                successful_datanodes.append(dn_id)
+                # Enviar por chunks o legacy según tamaño
+                if use_chunked_transfer:
+                    success, message = send_file_to_datanode_chunked(
+                        datanode_url=dn_url,
+                        file_id=file_hash,
+                        file_content=file_content,
+                        service_token=service_token
+                    )
+                    if success:
+                        print(f"[NAMENODE] ✓ Archivo almacenado exitosamente en {dn_id} (chunked): {message}")
+                        success_count += 1
+                        successful_datanodes.append(dn_id)
+                    else:
+                        print(f"[NAMENODE] ✗ Error en {dn_id} (chunked): {message}")
+                        if dn_id not in failed_datanodes:
+                            failed_datanodes.append(dn_id)
+                else:
+                    # Método legacy para archivos pequeños
+                    files = {"file": (file.filename, file_content)}
+                    data = {"file_id": file_hash}
+                    
+                    response = requests.post(
+                        f"{dn_url}/store",
+                        files=files,
+                        data=data,
+                        headers={"Authorization": f"Bearer {service_token}"},
+                        timeout=120
+                    )
+                    response.raise_for_status()
+                    print(f"[NAMENODE] ✓ Archivo almacenado exitosamente en {dn_id} ({dn_url})")
+                    success_count += 1
+                    successful_datanodes.append(dn_id)
             except requests.HTTPError as e:
                 if e.response.status_code == 403:
                     print(f"[NAMENODE] ❌ Error 403 Forbidden almacenando en {dn_id} ({dn_url}): {e}")
@@ -3139,13 +3609,15 @@ def delete_tags_compat(
 def download_file_compat(
     file_name: str,
     current_user: User = Depends(require_permission(Permission.READ_FILES)),
-    authorization: Optional[str] = Header(None, alias="Authorization")
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    range_header: Optional[str] = Header(None, alias="Range")
 ):
     """
-    Endpoint de compatibilidad: descarga de archivo desde DataNodes.
+    Endpoint de compatibilidad: descarga de archivo desde DataNodes con soporte para HTTP Range.
     Busca el archivo por nombre, obtiene sus réplicas y descarga desde un DataNode disponible.
+    Soporta descarga parcial via Range header para archivos grandes.
     """
-    print(f"[NAMENODE] GET /download/{file_name} (nodo: {NODE_ID})")
+    print(f"[NAMENODE] GET /download/{file_name} (nodo: {NODE_ID}, range: {range_header})")
     
     # Verificar si somos el líder
     if not is_leader():
@@ -3153,10 +3625,12 @@ def download_file_compat(
         leader_url = get_leader_url()
         if leader_url:
             print(f"[NAMENODE] Redirigiendo descarga a líder: {leader_url}/download/{file_name}")
-            # Pasar el token de autenticación al líder
+            # Pasar el token de autenticación y Range header al líder
             headers = {}
             if authorization:
                 headers["Authorization"] = authorization
+            if range_header:
+                headers["Range"] = range_header
             try:
                 response = requests.get(
                     f"{leader_url}/download/{file_name}",
@@ -3165,15 +3639,22 @@ def download_file_compat(
                     allow_redirects=True  # Seguir redirecciones automáticamente
                 )
                 response.raise_for_status()
-                # Retornar el archivo directamente
+                # Retornar el archivo directamente preservando headers de Range
                 from fastapi.responses import Response
+                response_headers = {
+                    "Content-Disposition": response.headers.get("Content-Disposition", f'attachment; filename="{file_name}"'),
+                    "Content-Length": response.headers.get("Content-Length", str(len(response.content)))
+                }
+                if "Content-Range" in response.headers:
+                    response_headers["Content-Range"] = response.headers["Content-Range"]
+                if "Accept-Ranges" in response.headers:
+                    response_headers["Accept-Ranges"] = response.headers["Accept-Ranges"]
+                
                 return Response(
                     content=response.content,
+                    status_code=response.status_code,  # Preservar 206 si es Range request
                     media_type=response.headers.get("Content-Type", "application/octet-stream"),
-                    headers={
-                        "Content-Disposition": response.headers.get("Content-Disposition", f'attachment; filename="{file_name}"'),
-                        "Content-Length": response.headers.get("Content-Length", str(len(response.content)))
-                    }
+                    headers=response_headers
                 )
             except requests.RequestException as e:
                 print(f"[NAMENODE] Error redirigiendo descarga a líder: {e}")
@@ -3240,27 +3721,45 @@ def download_file_compat(
                 service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
             
             print(f"[NAMENODE] Intentando leer desde {replica['datanode_id']} ({replica_type})...")
+            
+            # Preparar headers para DataNode
+            headers = {"Authorization": f"Bearer {service_token}"}
+            if range_header:
+                headers["Range"] = range_header
+                print(f"[NAMENODE] Solicitando rango: {range_header}")
+            
             response = requests.get(
                 f"{datanode_url}/retrieve/{file_hash}",
-                headers={"Authorization": f"Bearer {service_token}"},
+                headers=headers,
                 timeout=30
             )
             response.raise_for_status()
             
-            # Obtener el contenido del archivo
+            # Obtener el contenido del archivo (completo o parcial)
             file_content = response.content
             
             print(f"[NAMENODE] Archivo leído exitosamente desde {replica['datanode_id']} ({len(file_content)} bytes)")
             
-            # Retornar archivo como respuesta
+            # Preparar headers de respuesta
+            response_headers = {
+                "Content-Disposition": f'attachment; filename="{file_name}"',
+                "Content-Length": str(len(file_content))
+            }
+            
+            # Preservar headers de Range si están presentes
+            if "Content-Range" in response.headers:
+                response_headers["Content-Range"] = response.headers["Content-Range"]
+                print(f"[NAMENODE] Enviando respuesta con Range: {response.headers['Content-Range']}")
+            if "Accept-Ranges" in response.headers:
+                response_headers["Accept-Ranges"] = response.headers["Accept-Ranges"]
+            
+            # Retornar archivo como respuesta (preservar código 206 si es Range)
             from fastapi.responses import Response
             return Response(
                 content=file_content,
+                status_code=response.status_code,  # 200 o 206
                 media_type="application/octet-stream",
-                headers={
-                    "Content-Disposition": f'attachment; filename="{file_name}"',
-                    "Content-Length": str(len(file_content))
-                }
+                headers=response_headers
             )
             
         except requests.RequestException as e:

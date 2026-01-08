@@ -5,11 +5,16 @@ import pandas as pd
 import math
 import random
 import time
-from typing import Optional
+import hashlib
+from typing import Optional, Tuple
 from registry_client import registry_client
 
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", os.path.join(os.path.dirname(__file__),"downloads/"))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# Configuración de chunked upload
+CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB por chunk
+USE_CHUNKED_UPLOAD_THRESHOLD = 50 * 1024 * 1024  # Usar chunked para archivos > 50 MB
 
 def get_server_url():
     """Obtiene la URL de un servidor desde el registry. Retorna (url, error_message)"""
@@ -599,6 +604,186 @@ def get_file_content(file_name):
     except Exception as e:
         return None, f"Error inesperado: {str(e)}"
 
+
+# ========== FUNCIONES PARA CHUNKED UPLOAD ==========
+
+def calculate_file_hash(file_bytes: bytes) -> str:
+    """Calcula el hash SHA-256 de un archivo"""
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def upload_file_chunked(
+    leader_url: str,
+    filename: str,
+    file_bytes: bytes,
+    tags: str,
+    progress_callback=None
+) -> Tuple[bool, str]:
+    """
+    Sube un archivo usando chunked upload con barra de progreso
+    
+    Args:
+        leader_url: URL del namenode líder
+        filename: Nombre del archivo
+        file_bytes: Contenido del archivo en bytes
+        tags: Etiquetas separadas por comas
+        progress_callback: Función para actualizar progreso (recibe progress_pct, status_text)
+    
+    Returns:
+        (success, message): Tupla con éxito y mensaje
+    """
+    file_size = len(file_bytes)
+    file_hash = f"sha256:{calculate_file_hash(file_bytes)}"
+    
+    try:
+        # 1. Iniciar sesión de upload
+        if progress_callback:
+            progress_callback(0, "Iniciando sesión de upload...")
+        
+        response = requests.post(
+            f"{leader_url}/upload/init",
+            data={
+                "filename": filename,
+                "file_hash": file_hash,
+                "file_size": file_size,
+                "tags": tags,
+                "chunk_size": CHUNK_SIZE
+            },
+            headers=get_auth_headers(),
+            timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        upload_id = data["upload_id"]
+        total_chunks = data["total_chunks"]
+        
+        print(f"[CLIENT] Sesión de upload creada: {upload_id}, {total_chunks} chunks")
+        
+        # 2. Verificar chunks ya subidos (para reanudar)
+        uploaded_chunks = set()
+        try:
+            response = requests.get(
+                f"{leader_url}/upload/{upload_id}/status",
+                headers=get_auth_headers(),
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            uploaded_chunks = set(data["uploaded_chunks"])
+            if uploaded_chunks:
+                print(f"[CLIENT] Reanudando: {len(uploaded_chunks)}/{total_chunks} chunks ya subidos")
+        except Exception:
+            pass  # Si falla, empezar desde cero
+        
+        # 3. Subir chunks
+        for chunk_index in range(total_chunks):
+            # Saltar chunks ya subidos
+            if chunk_index in uploaded_chunks:
+                progress_pct = ((chunk_index + 1) / total_chunks) * 100
+                if progress_callback:
+                    progress_callback(progress_pct, f"Chunk {chunk_index + 1}/{total_chunks} (ya subido)")
+                continue
+            
+            # Calcular posición y tamaño del chunk
+            start = chunk_index * CHUNK_SIZE
+            end = min(start + CHUNK_SIZE, file_size)
+            chunk_data = file_bytes[start:end]
+            chunk_hash = calculate_file_hash(chunk_data)
+            
+            # Subir chunk con reintentos
+            max_retries = 3
+            success = False
+            
+            for retry in range(max_retries):
+                try:
+                    response = requests.post(
+                        f"{leader_url}/upload/{upload_id}/chunk/{chunk_index}",
+                        files={"chunk": (f"chunk_{chunk_index}", chunk_data)},
+                        data={"chunk_hash": chunk_hash},
+                        headers=get_auth_headers(),
+                        timeout=120
+                    )
+                    response.raise_for_status()
+                    success = True
+                    break
+                except Exception as e:
+                    if retry < max_retries - 1:
+                        wait_time = 2 ** retry
+                        if progress_callback:
+                            progress_callback(
+                                ((chunk_index) / total_chunks) * 100,
+                                f"Reintentando chunk {chunk_index + 1} en {wait_time}s..."
+                            )
+                        time.sleep(wait_time)
+                    else:
+                        return False, f"Error en chunk {chunk_index + 1}: {e}"
+            
+            if not success:
+                return False, f"No se pudo subir chunk {chunk_index + 1}"
+            
+            # Actualizar progreso
+            progress_pct = ((chunk_index + 1) / total_chunks) * 100
+            if progress_callback:
+                progress_callback(
+                    progress_pct,
+                    f"Subiendo chunk {chunk_index + 1}/{total_chunks} ({progress_pct:.1f}%)"
+                )
+        
+        # 4. Finalizar upload
+        if progress_callback:
+            progress_callback(100, "Ensamblando archivo y enviando a DataNodes...")
+        
+        response = requests.post(
+            f"{leader_url}/upload/{upload_id}/finalize",
+            headers=get_auth_headers(),
+            timeout=300
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        return True, f"Archivo subido correctamente (ID: {data['file_id']}, {data['replicas_stored']} réplicas)"
+        
+    except requests.RequestException as e:
+        return False, f"Error de red: {e}"
+    except Exception as e:
+        return False, f"Error inesperado: {e}"
+
+
+def upload_file_legacy(
+    leader_url: str,
+    filename: str,
+    file_bytes: bytes,
+    tags: str
+) -> Tuple[bool, str]:
+    """
+    Sube un archivo usando el método tradicional (sin chunks)
+    
+    Args:
+        leader_url: URL del namenode líder
+        filename: Nombre del archivo
+        file_bytes: Contenido del archivo en bytes
+        tags: Etiquetas separadas por comas
+    
+    Returns:
+        (success, message): Tupla con éxito y mensaje
+    """
+    try:
+        response = requests.post(
+            f"{leader_url}/add",
+            files={"file": (filename, file_bytes)},
+            data={"tags": tags},
+            headers=get_auth_headers(),
+            timeout=120
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        return True, f"Archivo subido correctamente (ID: {data['file_id']}, {data['replicas_stored']} réplicas)"
+        
+    except requests.RequestException as e:
+        return False, f"Error: {e}"
+
 # --- Mostrar lista ---
 st.subheader("📖 Archivos disponibles")
 tags_filter = st.text_input("Filtrar por etiquetas (separadas por comas):", key="tag_filter")
@@ -884,6 +1069,14 @@ if st.session_state.modal == "add_file":
     with st.expander("📁 Subir nuevos archivos", expanded=True):
         uploaded_files = st.file_uploader("Selecciona archivos", accept_multiple_files=True, key="file_uploader")
         tags = st.text_input("Etiquetas (separadas por comas):", key="add_file_tags")
+        
+        # Mostrar información sobre chunked upload
+        if uploaded_files:
+            total_size = sum(len(f.getvalue()) for f in uploaded_files)
+            large_files = [f for f in uploaded_files if len(f.getvalue()) > USE_CHUNKED_UPLOAD_THRESHOLD]
+            
+            if large_files:
+                st.info(f"📦 {len(large_files)} archivo(s) grande(s) detectado(s). Se usará **chunked upload** (resumible si se interrumpe).")
 
         colA, colB, colC = st.columns([2, 1, 1])
         with colA:
@@ -903,35 +1096,64 @@ if st.session_state.modal == "add_file":
                         if not leader_url:
                             st.error(f"No se pudo obtener el líder del namenode: {leader_error}")
                         else:
-                            print(f"[CLIENT] Intentando subir archivo(s) al líder: {leader_url}/add")
+                            print(f"[CLIENT] Intentando subir archivo(s) al líder: {leader_url}")
                             success_count = 0
                             error_count = 0
-                            for file in uploaded_files:
-                                files = {"file": (file.name, file.getvalue())}
-                                data = {"tags": tags}
+                            
+                            # Contenedor para barra de progreso general
+                            progress_container = st.empty()
+                            status_container = st.empty()
+                            
+                            for file_idx, file in enumerate(uploaded_files):
+                                file_bytes = file.getvalue()
+                                file_size = len(file_bytes)
+                                
+                                # Determinar si usar chunked upload
+                                use_chunked = file_size > USE_CHUNKED_UPLOAD_THRESHOLD
+                                
+                                # Mostrar archivo actual
+                                status_container.info(f"📤 Subiendo {file_idx + 1}/{len(uploaded_files)}: **{file.name}** ({file_size:,} bytes) {'[Chunked]' if use_chunked else '[Legacy]'}")
+                                
                                 try:
-                                    print(f"[CLIENT] Enviando POST a {leader_url}/add con archivo: {file.name}, tags: {tags}")
-                                    response = requests.post(
-                                        f"{leader_url}/add",
-                                        files=files,
-                                        data=data,
-                                        headers=get_auth_headers(),
-                                        timeout=30
-                                    )
-                                    print(f"[CLIENT] Respuesta recibida: status={response.status_code}, body={response.text[:200]}")
-                                    response.raise_for_status()
-                                    result = response.json()
-                                    print(f"[CLIENT] Archivo subido exitosamente: {result}")
-                                    st.success(f"Archivo '{file.name}' subido correctamente.")
-                                    success_count += 1
-                                except requests.RequestException as e:
+                                    if use_chunked:
+                                        # Usar chunked upload con barra de progreso
+                                        progress_bar = progress_container.progress(0)
+                                        
+                                        def update_progress(progress_pct, status_text):
+                                            progress_bar.progress(int(progress_pct))
+                                        
+                                        success, message = upload_file_chunked(
+                                            leader_url,
+                                            file.name,
+                                            file_bytes,
+                                            tags,
+                                            progress_callback=update_progress
+                                        )
+                                    else:
+                                        # Usar método legacy para archivos pequeños
+                                        progress_container.info("⏳ Subiendo...")
+                                        success, message = upload_file_legacy(
+                                            leader_url,
+                                            file.name,
+                                            file_bytes,
+                                            tags
+                                        )
+                                    
+                                    if success:
+                                        st.success(f"✅ {file.name}: {message}")
+                                        success_count += 1
+                                    else:
+                                        st.error(f"❌ {file.name}: {message}")
+                                        error_count += 1
+                                        
+                                except Exception as e:
                                     print(f"[CLIENT] ERROR al subir '{file.name}': {e}")
-                                    print(f"[CLIENT] Tipo de error: {type(e)}")
-                                    if hasattr(e, 'response') and e.response is not None:
-                                        print(f"[CLIENT] Status code: {e.response.status_code}")
-                                        print(f"[CLIENT] Response body: {e.response.text[:500]}")
-                                    st.error(f"Error al subir '{file.name}': {e}")
+                                    st.error(f"❌ Error al subir '{file.name}': {e}")
                                     error_count += 1
+                            
+                            # Limpiar contenedores de progreso
+                            progress_container.empty()
+                            status_container.empty()
                             
                             # Mostrar resumen
                             if success_count > 0:
@@ -940,6 +1162,7 @@ if st.session_state.modal == "add_file":
                                 else:
                                     st.warning(f"⚠️ {success_count} de {len(uploaded_files)} archivos subidos correctamente. {error_count} fallaron.")
                                 # Cerrar el modal y refrescar la lista de archivos
+                                time.sleep(1)  # Dar tiempo para ver el mensaje
                                 st.session_state.modal = None
                                 st.session_state.refresh_needed = True
                                 st.rerun()

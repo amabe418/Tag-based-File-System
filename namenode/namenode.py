@@ -2212,7 +2212,7 @@ def login(credentials: UserLogin):
             response = requests.post(
                 f"{leader_url}/auth/login",
                 json=credentials.dict(),
-                timeout=5
+                timeout=30
             )
             response.raise_for_status()
             return response.json()
@@ -2261,7 +2261,7 @@ def register(user_data: UserCreate, current_user: User = Depends(require_role([R
                 f"{leader_url}/auth/register",
                 json=user_data.dict(),
                 headers=headers,
-                timeout=5
+                timeout=30
             )
             response.raise_for_status()
             return response.json()
@@ -2325,7 +2325,7 @@ def signup(user_data: UserSignup):
             response = requests.post(
                 f"{leader_url}/auth/signup",
                 json=user_data.dict(),
-                timeout=5
+                timeout=30
             )
             response.raise_for_status()
             return response.json()
@@ -2420,7 +2420,7 @@ def change_user_password(
                 f"{leader_url}/auth/change-password",
                 json=password_data.dict(),
                 headers=headers,
-                timeout=5
+                timeout=30
             )
             response.raise_for_status()
             return response.json()
@@ -2516,7 +2516,7 @@ def register_datanode_endpoint(
                 f"{leader_url}/datanodes/register",
                 json=registration.dict(),
                 headers=headers,
-                timeout=5
+                timeout=30
             )
             return response.json()
         except Exception as e:
@@ -2604,7 +2604,7 @@ def datanode_heartbeat_endpoint(
                 f"{leader_url}/datanodes/{node_id}/heartbeat",
                 json=heartbeat.dict(),
                 headers=headers,
-                timeout=5
+                timeout=30
             )
             return response.json()
         except Exception as e:
@@ -2677,7 +2677,7 @@ def undrain_datanode_endpoint(
     leader_url = get_leader_url()
     if leader_url:
         try:
-            response = requests.post(f"{leader_url}/datanodes/{node_id}/undrain", timeout=5)
+            response = requests.post(f"{leader_url}/datanodes/{node_id}/undrain", timeout=30)
             return response.json()
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
@@ -2775,7 +2775,7 @@ def get_upload_status(
         try:
             response = requests.get(
                 f"{leader_url}/upload/{upload_id}/status",
-                timeout=5
+                timeout=30
             )
             response.raise_for_status()
             return response.json()
@@ -3109,7 +3109,7 @@ def list_active_uploads(
         try:
             response = requests.get(
                 f"{leader_url}/uploads/active",
-                timeout=5
+                timeout=30
             )
             response.raise_for_status()
             return response.json()
@@ -3442,7 +3442,7 @@ def list_files_compat(
                 f"{leader_url}/list",
                 params=params,
                 headers=headers,
-                timeout=5
+                timeout=30
             )
             response.raise_for_status()
             return response.json()
@@ -3480,7 +3480,7 @@ def delete_files_compat(
                 f"{leader_url}/delete",
                 params={"tags": tags},
                 headers=headers,
-                timeout=5
+                timeout=30
             )
             response.raise_for_status()
             return response.json()
@@ -3530,7 +3530,7 @@ def add_tags_compat(
             response = requests.post(
                 f"{leader_url}/add-tags",
                 params={"query": query, "new_tags": new_tags},
-                timeout=5
+                timeout=30
             )
             return response.json()
         except Exception as e:
@@ -3577,7 +3577,7 @@ def delete_tags_compat(
             response = requests.post(
                 f"{leader_url}/delete-tags",
                 params={"query": query, "del_tags": del_tags},
-                timeout=5
+                timeout=30
             )
             return response.json()
         except Exception as e:

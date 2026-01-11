@@ -1141,7 +1141,7 @@ if st.session_state.modal == "add_file":
                                     
                                     if success:
                                         st.success(f"✅ {file.name}: {message}")
-                                        success_count += 1
+                                    success_count += 1
                                     else:
                                         st.error(f"❌ {file.name}: {message}")
                                         error_count += 1

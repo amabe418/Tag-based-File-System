@@ -797,7 +797,7 @@ def rereplicate_file(file_id: int, file_hash: str, failed_datanode_id: str,
                 timeout=120
             )
             response.raise_for_status()
-            
+        
             print(f"[DATANODE_MANAGER] Archivo re-replicado a {new_datanode_id}")
         
         # Actualizar asignación de réplicas (reemplazar el DataNode fallido)

@@ -3,7 +3,7 @@ MetaNameNode - Servicio distribuido con 3 réplicas
 Mantiene metadatos de archivos (nombres y etiquetas) con replicación Raft-like
 Los archivos físicos se almacenan en DataNodes, no aquí.
 """
-from fastapi import FastAPI, HTTPException, Query, UploadFile, Form, Depends, Header
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form, Depends, Header
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -2509,9 +2509,13 @@ def register_datanode_endpoint(
     leader_url = get_leader_url()
     if leader_url:
         try:
+            headers = {}
+            if authorization:
+                headers["Authorization"] = authorization
             response = requests.post(
                 f"{leader_url}/datanodes/register",
                 json=registration.dict(),
+                headers=headers,
                 timeout=5
             )
             return response.json()
@@ -2593,9 +2597,13 @@ def datanode_heartbeat_endpoint(
     leader_url = get_leader_url()
     if leader_url:
         try:
+            headers = {}
+            if authorization:
+                headers["Authorization"] = authorization
             response = requests.post(
                 f"{leader_url}/datanodes/{node_id}/heartbeat",
                 json=heartbeat.dict(),
+                headers=headers,
                 timeout=5
             )
             return response.json()
@@ -2799,7 +2807,7 @@ def get_upload_status(
 async def upload_chunk(
     upload_id: str,
     chunk_index: int,
-    chunk: UploadFile = File(...),
+    chunk: UploadFile,
     chunk_hash: str = Form(...),
     current_user: User = Depends(require_permission(Permission.WRITE_FILES))
 ):
@@ -3336,8 +3344,6 @@ async def add_file_compat(
                 print(f"[NAMENODE] Error almacenando en {dn_id} ({dn_url}): {e}")
                 if dn_id not in failed_datanodes:
                     failed_datanodes.append(dn_id)
-                if dn_id not in failed_datanodes:
-                    failed_datanodes.append(dn_id)
     
     # Verificar que se guardó al menos 1 réplica (o 2 si hay múltiples DataNodes disponibles)
     # Si solo hay 1 DataNode disponible, aceptar 1 réplica; si hay más, preferir al menos 2
@@ -3642,9 +3648,9 @@ def download_file_compat(
                 # Retornar el archivo directamente preservando headers de Range
                 from fastapi.responses import Response
                 response_headers = {
-                    "Content-Disposition": response.headers.get("Content-Disposition", f'attachment; filename="{file_name}"'),
-                    "Content-Length": response.headers.get("Content-Length", str(len(response.content)))
-                }
+                        "Content-Disposition": response.headers.get("Content-Disposition", f'attachment; filename="{file_name}"'),
+                        "Content-Length": response.headers.get("Content-Length", str(len(response.content)))
+                    }
                 if "Content-Range" in response.headers:
                     response_headers["Content-Range"] = response.headers["Content-Range"]
                 if "Accept-Ranges" in response.headers:
@@ -4199,15 +4205,30 @@ def internal_gossip(
         # Actualizar información del líder si el peer remoto es líder o conoce un líder
         if exchange.is_leader and exchange.leader_id == sender_id:
             # El peer remoto es el líder
-            if cluster_state["leader_id"] != sender_id or cluster_state["is_leader"]:
-                print(f"[NAMENODE] [GOSSIP] Líder actualizado desde gossip: {sender_id}")
-                cluster_state["leader_id"] = sender_id
-                cluster_state["is_leader"] = False
+            # Solo actualizar si el nodo actual NO es el líder
+            # (es decir, el sender_id es diferente del node_id y el nodo actual no se considera líder)
+            if sender_id != cluster_state["node_id"]:
+                # El sender_id es un nodo diferente, actualizar para reconocerlo como líder
+                if cluster_state["leader_id"] != sender_id:
+                    print(f"[NAMENODE] [GOSSIP] Líder actualizado desde gossip: {sender_id}")
+                    cluster_state["leader_id"] = sender_id
+                    cluster_state["is_leader"] = False
+            else:
+                # El nodo actual es el líder (sender_id == node_id), asegurarse de que is_leader sea True
+                if not cluster_state["is_leader"] or cluster_state["leader_id"] != sender_id:
+                    print(f"[NAMENODE] [GOSSIP] Nodo actual es el líder, estableciendo is_leader=True, leader_id={sender_id}")
+                    cluster_state["is_leader"] = True
+                    cluster_state["leader_id"] = sender_id
         elif exchange.leader_id and exchange.leader_id != cluster_state["leader_id"]:
             # El peer remoto conoce un líder diferente
             if not cluster_state["is_leader"]:
                 print(f"[NAMENODE] [GOSSIP] Líder conocido actualizado desde gossip: {exchange.leader_id}")
                 cluster_state["leader_id"] = exchange.leader_id
+        
+        # Asegurar consistencia: si el nodo actual es el líder (leader_id == node_id), is_leader debe ser True
+        if cluster_state["leader_id"] == cluster_state["node_id"] and not cluster_state["is_leader"]:
+            print(f"[NAMENODE] [GOSSIP] Corrección de consistencia: nodo actual es el líder, estableciendo is_leader=True")
+            cluster_state["is_leader"] = True
         
         # Preparar lista de peers conocidos para retornar (sin duplicados, incluyendo este nodo y el líder si existe)
         known_peers_list = [p for p in cluster_state["peers"] if p != cluster_state["node_id"]]

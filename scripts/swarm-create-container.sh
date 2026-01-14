@@ -51,12 +51,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Verificar que los directorios necesarios existen y preparar volúmenes de código
-CODE_VOLUME_ARGS=()
+# Esto permite cambios en el código sin reconstruir las imágenes Docker
+NAMENODE_CODE_VOLUMES=()
+DATANODE_CODE_VOLUMES=()
+REGISTRY_CODE_VOLUMES=()
+FRONTEND_CODE_VOLUMES=()
+
 if [ -d "$PROJECT_ROOT/namenode" ] && [ -d "$PROJECT_ROOT/security" ]; then
-    CODE_VOLUME_ARGS=(-v "$PROJECT_ROOT/namenode:/app/namenode" -v "$PROJECT_ROOT/security:/app/security")
-    echo "📁 Montando código desde: $PROJECT_ROOT"
+    NAMENODE_CODE_VOLUMES=(-v "$PROJECT_ROOT/namenode:/app/namenode" -v "$PROJECT_ROOT/security:/app/security")
+    DATANODE_CODE_VOLUMES=(-v "$PROJECT_ROOT/datanode:/app/datanode" -v "$PROJECT_ROOT/security:/app/security")
+    # El registry necesita que registry.py esté en /app/Registry/registry.py
+    REGISTRY_CODE_VOLUMES=(-v "$PROJECT_ROOT/registry/registry.py:/app/Registry/registry.py" -v "$PROJECT_ROOT/security:/app/security")
+    # El frontend copia archivos directamente a /app
+    FRONTEND_CODE_VOLUMES=(-v "$PROJECT_ROOT/client:/app")
+    echo "📁 Modo desarrollo: Montando código desde: $PROJECT_ROOT"
+    echo "   Los cambios en el código se reflejarán sin reconstruir imágenes"
 else
-    echo "⚠️  Advertencia: No se encontraron directorios namenode/ o security/"
+    echo "⚠️  Advertencia: No se encontraron directorios necesarios"
     echo "   Los volúmenes de código no se montarán. Asegúrate de ejecutar desde el directorio raíz del proyecto."
 fi
 
@@ -87,11 +98,13 @@ case $TYPE in
             PEERS="${PEERS}tbfs-registry-${i}"
         done
         # Si NUM es 1, PEERS estará vacío (nodo único), lo cual es válido
+        # Montar código como volumen para desarrollo (cambios sin reconstruir imagen)
         docker run -d \
             --name "$CONTAINER_NAME" \
             --network tbfs_net \
             --hostname "$CONTAINER_NAME" \
             -p "${PORT}:9000" \
+            "${REGISTRY_CODE_VOLUMES[@]}" \
             -e NODE_ID="tbfs-registry-${NUM}" \
             -e PEERS="$PEERS" \
             -e REGISTRY_PORT=9000 \
@@ -123,7 +136,7 @@ case $TYPE in
             --hostname "$CONTAINER_NAME" \
             -p "${PORT}:8010" \
             -v "tbfs-namenode-${NUM}-data:/app/namenode/data" \
-            "${CODE_VOLUME_ARGS[@]}" \
+            "${NAMENODE_CODE_VOLUMES[@]}" \
             -e NODE_ID="tbfs-namenode-${NUM}" \
             -e PEERS="$PEERS" \
             -e NAMENODE_PORT=8010 \
@@ -138,12 +151,14 @@ case $TYPE in
     
     datanode)
         PORT=$((8000 + NUM))
+        # Montar código como volumen para desarrollo (cambios sin reconstruir imagen)
         docker run -d \
             --name "$CONTAINER_NAME" \
             --network tbfs_net \
             --hostname "$CONTAINER_NAME" \
             -p "${PORT}:${PORT}" \
             -v "tbfs-datanode-${NUM}-storage:/app/storage" \
+            "${DATANODE_CODE_VOLUMES[@]}" \
             -e DATANODE_ID="tbfs-datanode-${NUM}" \
             -e NODE_ID="$CONTAINER_NAME" \
             -e DATANODE_PORT="$PORT" \
@@ -158,11 +173,13 @@ case $TYPE in
         if [ "$NUM" -ne 1 ]; then
             echo "⚠️  Advertencia: Solo hay un frontend, usando número 1"
         fi
+        # Montar código como volumen para desarrollo (cambios sin reconstruir imagen)
         docker run -d \
             --name "$CONTAINER_NAME" \
             --network tbfs_net \
             --hostname "$CONTAINER_NAME" \
             -p 8501:8501 \
+            "${FRONTEND_CODE_VOLUMES[@]}" \
             -e REGISTRY_URL="$REGISTRY_URLS" \
             -e DOWNLOAD_DIR=downloads \
             "${EXTRA_ARGS[@]}" \

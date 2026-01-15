@@ -12,6 +12,8 @@ from registry_client import registry_client
 # Configuración de chunked upload
 CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB por chunk
 USE_CHUNKED_UPLOAD_THRESHOLD = 5 * 1024 * 1024  # Usar chunked para archivos > 5 MB
+registry_client.print_registries()
+registry_client.print_namenodes()
 
 def get_server_url():
     """Obtiene la URL de un servidor desde el registry. Retorna (url, error_message)"""

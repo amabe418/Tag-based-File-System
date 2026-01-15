@@ -6,6 +6,7 @@ import requests
 import os
 import random
 from typing import List, Optional, Dict
+import socket
 
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://127.0.0.1:9000")
 
@@ -161,6 +162,18 @@ class RegistryClient:
         
         # Si todos fallaron, lanzar el último error
         raise last_error or requests.RequestException("Todos los servidores fallaron")
+    
+    def print_registries(self):
+        regs_info = socket.getaddrinfo("registry", 9000,proto=socket.IPPROTO_TCP)
+        print("LISTA DE REGISTRIES: ", regs_info)
+        registries = set(registry[4] for registry in regs_info)
+        print("CONJUNTO DE REGISTRIES: ", registries)
+    
+    def print_namenodes(self):
+        namenodes_info = socket.getaddrinfo("namenode", 8010,proto=socket.IPPROTO_TCP)
+        print("LISTA DE NAMENODES: ", namenodes_info)
+        namenodes = set(namenode[4] for namenode in namenodes_info)
+        print("CONJUNTO DE NAMENODES: ", namenodes)
 
 
 # Instancia global del cliente

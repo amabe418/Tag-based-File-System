@@ -63,7 +63,7 @@ docker rm tbfs-registry-1 tbfs-registry-2 tbfs-registry-3 \
 # Ejecutar 3 nodos del Registry Service (Protocolo Gossip)
 # Con volúmenes de código montados para desarrollo
 echo "Iniciando Registry Service - Nodo 1..."
-docker run -d --name tbfs-registry-1 --network tbfs_net -p 9000:9000 \
+docker run -d --name tbfs-registry-1 --network tbfs_net --network-alias registry -p 9000:9000 \
   -e NODE_ID=tbfs-registry-1 \
   -e PEERS=tbfs-registry-2,tbfs-registry-3 \
   -e REGISTRY_PORT=9000 \
@@ -76,7 +76,7 @@ docker run -d --name tbfs-registry-1 --network tbfs_net -p 9000:9000 \
   tbfs-registry
 
 echo "Iniciando Registry Service - Nodo 2..."
-docker run -d --name tbfs-registry-2 --network tbfs_net -p 9001:9000 \
+docker run -d --name tbfs-registry-2 --network tbfs_net --network-alias registry -p 9001:9000 \
   -e NODE_ID=tbfs-registry-2 \
   -e PEERS=tbfs-registry-1,tbfs-registry-3 \
   -e REGISTRY_PORT=9000 \
@@ -89,7 +89,7 @@ docker run -d --name tbfs-registry-2 --network tbfs_net -p 9001:9000 \
   tbfs-registry
 
 echo "Iniciando Registry Service - Nodo 3..."
-docker run -d --name tbfs-registry-3 --network tbfs_net -p 9002:9000 \
+docker run -d --name tbfs-registry-3 --network tbfs_net --network-alias registry -p 9002:9000 \
   -e NODE_ID=tbfs-registry-3 \
   -e PEERS=tbfs-registry-1,tbfs-registry-2 \
   -e REGISTRY_PORT=9000 \
@@ -132,7 +132,7 @@ fi
 
 # Ejecutar 3 nodos del MetaNameNode
 echo "Iniciando MetaNameNode - Nodo 1..."
-docker run -d --name tbfs-namenode-1 --network tbfs_net -p 8010:8010 \
+docker run -d --name tbfs-namenode-1 --network tbfs_net --network-alias namenode -p 8010:8010 \
   -e NODE_ID=namenode-1 \
   -e PEERS=tbfs-namenode-2,tbfs-namenode-3 \
   -e NAMENODE_PORT=8010 \
@@ -146,7 +146,7 @@ docker run -d --name tbfs-namenode-1 --network tbfs_net -p 8010:8010 \
   tbfs-namenode
 
 echo "Iniciando MetaNameNode - Nodo 2..."
-docker run -d --name tbfs-namenode-2 --network tbfs_net -p 8011:8010 \
+docker run -d --name tbfs-namenode-2 --network tbfs_net --network-alias namenode -p 8011:8010 \
   -e NODE_ID=namenode-2 \
   -e PEERS=tbfs-namenode-1,tbfs-namenode-3 \
   -e NAMENODE_PORT=8010 \
@@ -160,7 +160,7 @@ docker run -d --name tbfs-namenode-2 --network tbfs_net -p 8011:8010 \
   tbfs-namenode
 
 echo "Iniciando MetaNameNode - Nodo 3..."
-docker run -d --name tbfs-namenode-3 --network tbfs_net -p 8012:8010 \
+docker run -d --name tbfs-namenode-3 --network tbfs_net --network-alias namenode -p 8012:8010 \
   -e NODE_ID=namenode-3 \
   -e PEERS=tbfs-namenode-1,tbfs-namenode-2 \
   -e NAMENODE_PORT=8010 \
@@ -180,7 +180,7 @@ sleep 5
 # Ejecutar 5 DataNodes
 # Con volúmenes de código montados para desarrollo
 echo "Iniciando DataNode - Nodo 1..."
-docker run -d --name tbfs-datanode-1 --network tbfs_net -p 8001:8001 \
+docker run -d --name tbfs-datanode-1 --network tbfs_net --network-alias datanode -p 8001:8001 \
   -e DATANODE_ID=datanode-1 \
   -e NODE_ID=tbfs-datanode-1 \
   -e DATANODE_PORT=8001 \
@@ -192,7 +192,7 @@ docker run -d --name tbfs-datanode-1 --network tbfs_net -p 8001:8001 \
   tbfs-datanode
 
 echo "Iniciando DataNode - Nodo 2..."
-docker run -d --name tbfs-datanode-2 --network tbfs_net -p 8002:8002 \
+docker run -d --name tbfs-datanode-2 --network tbfs_net --network-alias datanode -p 8002:8002 \
   -e DATANODE_ID=datanode-2 \
   -e NODE_ID=tbfs-datanode-2 \
   -e DATANODE_PORT=8002 \
@@ -204,7 +204,7 @@ docker run -d --name tbfs-datanode-2 --network tbfs_net -p 8002:8002 \
   tbfs-datanode
 
 echo "Iniciando DataNode - Nodo 3..."
-docker run -d --name tbfs-datanode-3 --network tbfs_net -p 8003:8003 \
+docker run -d --name tbfs-datanode-3 --network tbfs_net --network-alias datanode -p 8003:8003 \
   -e DATANODE_ID=datanode-3 \
   -e NODE_ID=tbfs-datanode-3 \
   -e DATANODE_PORT=8003 \
@@ -216,7 +216,7 @@ docker run -d --name tbfs-datanode-3 --network tbfs_net -p 8003:8003 \
   tbfs-datanode
 
 echo "Iniciando DataNode - Nodo 4..."
-docker run -d --name tbfs-datanode-4 --network tbfs_net -p 8004:8004 \
+docker run -d --name tbfs-datanode-4 --network tbfs_net --network-alias datanode -p 8004:8004 \
   -e DATANODE_ID=datanode-4 \
   -e NODE_ID=tbfs-datanode-4 \
   -e DATANODE_PORT=8004 \
@@ -228,7 +228,7 @@ docker run -d --name tbfs-datanode-4 --network tbfs_net -p 8004:8004 \
   tbfs-datanode
 
 echo "Iniciando DataNode - Nodo 5..."
-docker run -d --name tbfs-datanode-5 --network tbfs_net -p 8005:8005 \
+docker run -d --name tbfs-datanode-5 --network tbfs_net --network-alias datanode -p 8005:8005 \
   -e DATANODE_ID=datanode-5 \
   -e NODE_ID=tbfs-datanode-5 \
   -e DATANODE_PORT=8005 \
@@ -242,7 +242,7 @@ docker run -d --name tbfs-datanode-5 --network tbfs_net -p 8005:8005 \
 # Ejecutar Frontend Service
 # Con volúmenes de código montados para desarrollo
 echo "Iniciando Frontend Service..."
-docker run -d --name tbfs-frontend --network tbfs_net -p 8501:8501 \
+docker run -d --name tbfs-frontend --network tbfs_net --network-alias frontend -p 8501:8501 \
   -e REGISTRY_URL=http://tbfs-registry-1:9000,http://tbfs-registry-2:9000,http://tbfs-registry-3:9000 \
   -e DOWNLOAD_DIR=downloads \
   "${FRONTEND_CODE_VOLUMES[@]}" \

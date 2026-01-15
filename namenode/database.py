@@ -7,34 +7,94 @@ import os
 import threading
 import time
 
-# Lock para operaciones concurrentes en la base de datos
-db_lock = threading.Lock()
+# Locks separados para cada base de datos (evita bloqueos cruzados)
+# Usar ReadWriteLock para permitir múltiples lecturas simultáneas
+from namenode.rw_lock import ReadWriteLock, WriteLock
+
+_metadata_rw_lock = ReadWriteLock()  # Para metadatos (files, tags, users, etc.)
+_operations_rw_lock = ReadWriteLock()  # Para logs de operaciones (operation_log, operation_states, etc.)
+
+# Wrappers para compatibilidad: usar como context manager para escritura (comportamiento legacy)
+class _WriteLockWrapper:
+    """Wrapper que hace que 'with db_lock:' funcione como write lock"""
+    def __init__(self, rw_lock):
+        self.rw_lock = rw_lock
+    
+    def __enter__(self):
+        self.rw_lock.acquire_write()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.rw_lock.release_write()
+
+metadata_db_lock = _WriteLockWrapper(_metadata_rw_lock)
+operations_db_lock = _WriteLockWrapper(_operations_rw_lock)
+
+# Lock legacy para compatibilidad (usar metadata_db_lock como write lock)
+db_lock = metadata_db_lock
+
+# Exponer los locks RW reales para uso avanzado
+metadata_rw_lock = _metadata_rw_lock
+operations_rw_lock = _operations_rw_lock
+
+# NODE_ID del contenedor actual - solo este nodo debe tener su carpeta de datos
+_CURRENT_NODE_ID = os.getenv("NODE_ID", "namenode-1")
+
+def _get_current_node_id() -> str:
+    """Obtiene el NODE_ID del contenedor actual"""
+    return _CURRENT_NODE_ID
 
 def get_db_path(node_id: str = None) -> str:
-    """Obtiene la ruta de la base de datos para un nodo específico"""
-    if node_id:
-        data_dir = os.path.join(os.path.dirname(__file__), "data", node_id)
-        os.makedirs(data_dir, exist_ok=True)
-        return os.path.join(data_dir, "namenode.db")
-    else:
-        # Fallback para compatibilidad
-        base_dir = os.path.dirname(__file__)
-        db_dir = os.path.join(base_dir, "..", "database")
-        os.makedirs(db_dir, exist_ok=True)
-        return os.path.join(db_dir, "namenode.db")
+    """Obtiene la ruta de la base de datos de METADATOS para este nodo"""
+    return get_metadata_db_path(node_id)
+
+def get_metadata_db_path(node_id: str = None) -> str:
+    """
+    Obtiene la ruta de la base de datos de METADATOS.
+    IMPORTANTE: Siempre usa el NODE_ID del contenedor actual, ignorando el parámetro node_id.
+    Esto evita crear carpetas para otros nodos dentro de este contenedor.
+    """
+    # Siempre usar el NODE_ID del contenedor actual
+    current_node_id = _get_current_node_id()
+    data_dir = os.path.join(os.path.dirname(__file__), "data", current_node_id)
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, "namenode_metadata.db")
+
+def get_operations_db_path(node_id: str = None) -> str:
+    """
+    Obtiene la ruta de la base de datos de OPERACIONES.
+    IMPORTANTE: Siempre usa el NODE_ID del contenedor actual, ignorando el parámetro node_id.
+    Esto evita crear carpetas para otros nodos dentro de este contenedor.
+    """
+    # Siempre usar el NODE_ID del contenedor actual
+    current_node_id = _get_current_node_id()
+    data_dir = os.path.join(os.path.dirname(__file__), "data", current_node_id)
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, "namenode_operations.db")
 
 
-def get_connection(db_path: str = None, node_id: str = None):
+def get_connection(db_path: str = None, node_id: str = None, db_type: str = "metadata"):
     """
     Abre una conexión a la base de datos y devuelve (conn, cursor).
+    
+    Args:
+        db_path: Ruta específica de la BD (opcional)
+        node_id: ID del nodo (opcional)
+        db_type: Tipo de BD - "metadata" o "operations" (default: "metadata")
     """
     if db_path is None:
-        db_path = get_db_path(node_id)
+        if db_type == "operations":
+            db_path = get_operations_db_path(node_id)
+        else:
+            db_path = get_metadata_db_path(node_id)
     
     # Asegurar que existe el directorio
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10.0)
+    # Habilitar WAL mode para mejor concurrencia (menos bloqueos)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")  # 5 segundos máximo de espera
     conn.row_factory = sqlite3.Row  # Para acceder por nombre de columna
     cursor = conn.cursor()
     return conn, cursor
@@ -42,13 +102,24 @@ def get_connection(db_path: str = None, node_id: str = None):
 
 def init_db(db_path: str = None, node_id: str = None):
     """
-    Inicializa la base de datos creando las tablas necesarias si no existen.
-    Solo almacena metadatos: nombre de archivo y etiquetas.
+    Inicializa AMBAS bases de datos: metadatos y operaciones.
+    Crea las tablas necesarias si no existen.
+    """
+    # Inicializar base de datos de metadatos
+    init_metadata_db(db_path, node_id)
+    
+    # Inicializar base de datos de operaciones
+    init_operations_db(node_id)
+
+def init_metadata_db(db_path: str = None, node_id: str = None):
+    """
+    Inicializa la base de datos de METADATOS.
+    Solo almacena metadatos: nombre de archivo, etiquetas, usuarios, datanodes.
     """
     if db_path is None:
-        db_path = get_db_path(node_id)
+        db_path = get_metadata_db_path(node_id)
     
-    conn, cursor = get_connection(db_path=db_path)
+    conn, cursor = get_connection(db_path=db_path, db_type="metadata")
     
     # Tabla de archivos - solo metadatos
     cursor.execute("""
@@ -317,6 +388,27 @@ def init_db(db_path: str = None, node_id: str = None):
         )
     """)
     
+    # Índices optimizados para DataNodes (consultas frecuentes)
+    try:
+        # Índice compuesto para get_active_datanodes (status + draining + free_space)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_datanodes_status_draining_space 
+            ON datanodes(status, draining, free_space DESC)
+        """)
+        # Índice para consultas por status
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_datanodes_status 
+            ON datanodes(status)
+        """)
+        # Índice para heartbeats (last_heartbeat)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_datanodes_heartbeat 
+            ON datanodes(last_heartbeat)
+        """)
+        print("[DATABASE] Índices optimizados para DataNodes creados/verificados")
+    except sqlite3.OperationalError as e:
+        print(f"[DATABASE] Error creando índices de DataNodes: {e}")
+    
     # Tabla de usuarios (autenticación)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -330,21 +422,8 @@ def init_db(db_path: str = None, node_id: str = None):
         )
     """)
     
-    # Tabla para log persistente de operaciones (Fase 2)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS operation_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            operation TEXT NOT NULL,
-            data TEXT NOT NULL,  -- JSON string
-            term INTEGER NOT NULL,
-            timestamp REAL NOT NULL,
-            node_id TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_log_term ON operation_log(term)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_log_timestamp ON operation_log(timestamp)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_log_node_id ON operation_log(node_id)")
+    # NOTA: Las tablas de operaciones (operation_log, operation_states, operation_state_log)
+    # ahora están en una base de datos separada (init_operations_db)
     
     # Índices para mejorar rendimiento
     # Verificar que las tablas existen antes de crear índices
@@ -364,7 +443,68 @@ def init_db(db_path: str = None, node_id: str = None):
     
     conn.commit()
     conn.close()
-    print(f"[DATABASE] Base de datos inicializada: {db_path}")
+    print(f"[DATABASE] Base de datos de METADATOS inicializada: {db_path}")
+
+
+def init_operations_db(node_id: str = None):
+    """
+    Inicializa la base de datos de OPERACIONES.
+    Almacena logs de operaciones, estados de operaciones y auditoría.
+    """
+    db_path = get_operations_db_path(node_id)
+    conn, cursor = get_connection(db_path=db_path, db_type="operations")
+    
+    # Tabla para log persistente de operaciones (Fase 2)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS operation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation TEXT NOT NULL,
+            data TEXT NOT NULL,  -- JSON string
+            term INTEGER NOT NULL,
+            timestamp REAL NOT NULL,
+            node_id TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_log_term ON operation_log(term)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_log_timestamp ON operation_log(timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_log_node_id ON operation_log(node_id)")
+    
+    # Tabla para estado actual de operaciones activas (nueva)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS operation_states (
+            operation_id TEXT PRIMARY KEY,
+            operation_type TEXT NOT NULL,  -- 'upload', 'replicate', 'delete', etc.
+            user_id TEXT,
+            state TEXT NOT NULL,  -- 'init', 'in_progress', 'completed', 'failed'
+            progress_data TEXT,  -- JSON con detalles del progreso
+            metadata TEXT,  -- JSON con metadata de la operación
+            created_at REAL NOT NULL,
+            last_updated REAL NOT NULL,
+            retry_count INTEGER DEFAULT 0
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_states_user ON operation_states(user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_states_state ON operation_states(state)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_states_type ON operation_states(operation_type)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_states_updated ON operation_states(last_updated)")
+    
+    # Tabla para historial de cambios de estado (auditoría y recovery)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS operation_state_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id TEXT NOT NULL,
+            timestamp REAL NOT NULL,
+            state_change TEXT,  -- 'init' -> 'receiving_chunks'
+            progress_snapshot TEXT  -- JSON snapshot del progreso
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_state_log_op ON operation_state_log(operation_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_state_log_time ON operation_state_log(timestamp)")
+    
+    conn.commit()
+    conn.close()
+    print(f"[DATABASE] Base de datos de OPERACIONES inicializada: {db_path}")
 
 
 def close_connection(conn):

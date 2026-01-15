@@ -136,7 +136,7 @@ case $TYPE in
             --network tbfs_net \
             --network-alias frontend \
             --hostname "$CONTAINER_NAME" \
-            -p 5000:5000 \
+            -p 8501:8501 \
             "${FRONTEND_CODE_VOLUMES[@]}" \
             -e NAMENODE_SERVICE=namenode \
             -e NAMENODE_PORT=8010 \

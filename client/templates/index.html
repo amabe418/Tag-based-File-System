@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TBFS - Sistema de Archivos</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Auth Section -->
+        <div id="auth-section">
+            <div class="card">
+                <div class="logo" style="text-align: center; margin-bottom: 30px;">TBFS</div>
+                
+                <div class="auth-tabs">
+                    <div class="auth-tab active" onclick="showLogin()">Iniciar Sesión</div>
+                    <div class="auth-tab" onclick="showRegister()">Registrarse</div>
+                </div>
+                
+                <div id="message-auth" class="message"></div>
+                
+                <!-- Login Form -->
+                <form id="login-form" onsubmit="handleLogin(event)">
+                    <div class="form-group">
+                        <label>Usuario</label>
+                        <input type="text" id="login-username" required autocomplete="username">
+                    </div>
+                    <div class="form-group">
+                        <label>Contraseña</label>
+                        <input type="password" id="login-password" required autocomplete="current-password">
+                    </div>
+                    <button type="submit" class="btn btn-primary" style="width: 100%;">Entrar</button>
+                </form>
+                
+                <!-- Register Form -->
+                <form id="register-form" style="display: none;" onsubmit="handleRegister(event)">
+                    <div class="form-group">
+                        <label>Usuario</label>
+                        <input type="text" id="register-username" required autocomplete="username">
+                    </div>
+                    <div class="form-group">
+                        <label>Contraseña</label>
+                        <input type="password" id="register-password" required autocomplete="new-password">
+                    </div>
+                    <div class="form-group">
+                        <label>Confirmar Contraseña</label>
+                        <input type="password" id="register-password-confirm" required autocomplete="new-password">
+                    </div>
+                    <button type="submit" class="btn btn-primary" style="width: 100%;">Crear Cuenta</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Main Section -->
+        <div id="main-section">
+            <header>
+                <div class="logo">TBFS</div>
+                <div class="user-info">
+                    <div class="status-indicator" id="status-indicator"></div>
+                    <span id="username-display"></span>
+                    <button class="btn btn-secondary" onclick="handleLogout()">Salir</button>
+                </div>
+            </header>
+
+            <div id="message-main" class="message"></div>
+
+            <!-- Upload Card -->
+            <div class="card">
+                <h2 class="card-title">Subir Archivos</h2>
+                
+                <!-- Paso 1: Seleccionar archivos -->
+                <div id="upload-step-1">
+                    <div class="upload-area" id="upload-area" onclick="document.getElementById('file-input').click()">
+                        <input type="file" id="file-input" multiple onchange="handleFileSelect(event)">
+                        <div class="upload-icon">📁</div>
+                        <p>Arrastra archivos aquí o haz clic para seleccionar</p>
+                        <p style="color: #666; margin-top: 10px; font-size: 0.9rem;">Sin límite de tamaño</p>
+                    </div>
+                </div>
+                
+                <!-- Paso 2: Archivos seleccionados + etiquetas -->
+                <div id="upload-step-2" style="display: none;">
+                    <div style="margin-bottom: 15px;">
+                        <h3 style="color: #aaa; font-size: 1rem; margin-bottom: 10px;">Archivos seleccionados:</h3>
+                        <div id="selected-files-list" class="selected-files-list"></div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Etiquetas para todos los archivos (separadas por comas)</label>
+                        <input type="text" id="upload-tags" placeholder="documento, importante, trabajo">
+                    </div>
+                    
+                    <div class="upload-actions">
+                        <button class="btn btn-primary" onclick="startUpload()">
+                            📤 Subir archivos
+                        </button>
+                        <button class="btn btn-secondary" onclick="clearSelection()">
+                            ❌ Cancelar
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- Progreso -->
+                <div class="progress-bar" id="upload-progress">
+                    <div class="progress" id="upload-progress-bar"></div>
+                </div>
+                <div id="upload-status" style="margin-top: 10px; color: #aaa;"></div>
+            </div>
+
+            <!-- Files Card -->
+            <div class="card">
+                <h2 class="card-title">Mis Archivos</h2>
+                
+                <div class="search-bar">
+                    <input type="text" id="search-tags" placeholder="Buscar por etiquetas..." onkeyup="handleSearch(event)">
+                    <button class="btn btn-primary" onclick="loadFiles()">Buscar</button>
+                    <button class="btn btn-secondary" onclick="clearSearch()">Limpiar</button>
+                </div>
+                
+                <div id="files-container">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        <p>Cargando archivos...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

@@ -130,16 +130,18 @@ case $TYPE in
             echo "⚠️  Advertencia: Solo hay un frontend, usando número 1"
         fi
         # El frontend se conecta a namenodes usando DNS de Docker
+        # Flask en puerto 5000 (sin límite de tamaño), Streamlit en 8501
         docker run -d \
             --name "$CONTAINER_NAME" \
             --network tbfs_net \
             --network-alias frontend \
             --hostname "$CONTAINER_NAME" \
-            -p 8501:8501 \
+            -p 5000:5000 \
             "${FRONTEND_CODE_VOLUMES[@]}" \
             -e NAMENODE_SERVICE=namenode \
             -e NAMENODE_PORT=8010 \
             -e DOWNLOAD_DIR=downloads \
+            -e FLASK_PORT=5000 \
             "${EXTRA_ARGS[@]}" \
             tbfs-frontend:latest
         ;;

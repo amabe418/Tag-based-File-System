@@ -3,20 +3,15 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY client/main.py /app
-COPY client/web.py /app
 COPY client/namenode_client.py /app
-COPY client/chunked_client.py /app
+COPY client/flask_app.py /app
+COPY client/templates /app/templates
+COPY client/static /app/static
 
-# Aumentar timeout y reintentos para instalaciones pesadas (streamlit)
-ENV PIP_DEFAULT_TIMEOUT=300 PIP_RETRIES=5
-RUN pip install --no-cache-dir --default-timeout=300 --retries=5 requests streamlit
+RUN pip install --no-cache-dir requests flask
 
-EXPOSE 8501
+EXPOSE 5000
 
-# Variables de entorno
-ENV REGISTRY_URL=http://tbfs-registry-1:9000,http://tbfs-registry-2:9000,http://tbfs-registry-3:9000
-# ENV API_URL=http://tbfs-namenode-1:8010
 ENV DOWNLOAD_DIR="downloads"
 
-CMD ["streamlit", "run", "web.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD ["python", "flask_app.py"]

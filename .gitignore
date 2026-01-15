@@ -24,3 +24,4 @@ a
 emisor.py
 receptor.py
 client/downloads/
+namenode/data/

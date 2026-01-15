@@ -1,7 +1,7 @@
 #!/bin/bash
 # Script para crear un contenedor en la red overlay del Swarm
 # Uso: ./swarm-create-container.sh <tipo> <numero> [opciones adicionales]
-# Tipos: registry, namenode, datanode, frontend
+# Tipos: namenode, datanode, frontend
 
 set -e
 
@@ -11,13 +11,11 @@ if [ $# -lt 2 ]; then
     echo "Uso: ./swarm-create-container.sh <tipo> <numero> [opciones]"
     echo ""
     echo "Tipos disponibles:"
-    echo "  registry  - Registry Service (1-N)"
     echo "  namenode  - MetaNameNode (1-N)"
     echo "  datanode  - DataNode (1-N)"
     echo "  frontend  - Frontend (solo 1)"
     echo ""
     echo "Ejemplos:"
-    echo "  ./swarm-create-container.sh registry 1"
     echo "  ./swarm-create-container.sh datanode 6"
     echo "  ./swarm-create-container.sh namenode 4"
     exit 1
@@ -44,7 +42,6 @@ if ! docker network ls | grep -q "tbfs_net"; then
 fi
 
 CONTAINER_NAME="tbfs-${TYPE}-${NUM}"
-REGISTRY_URLS="http://tbfs-registry-1:9000,http://tbfs-registry-2:9000,http://tbfs-registry-3:9000"
 
 # Obtener directorio raíz del proyecto (un nivel arriba de scripts/)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,14 +51,11 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Esto permite cambios en el código sin reconstruir las imágenes Docker
 NAMENODE_CODE_VOLUMES=()
 DATANODE_CODE_VOLUMES=()
-REGISTRY_CODE_VOLUMES=()
 FRONTEND_CODE_VOLUMES=()
 
 if [ -d "$PROJECT_ROOT/namenode" ] && [ -d "$PROJECT_ROOT/security" ]; then
     NAMENODE_CODE_VOLUMES=(-v "$PROJECT_ROOT/namenode:/app/namenode" -v "$PROJECT_ROOT/security:/app/security")
     DATANODE_CODE_VOLUMES=(-v "$PROJECT_ROOT/datanode:/app/datanode" -v "$PROJECT_ROOT/security:/app/security")
-    # El registry necesita que registry.py esté en /app/Registry/registry.py
-    REGISTRY_CODE_VOLUMES=(-v "$PROJECT_ROOT/registry/registry.py:/app/Registry/registry.py" -v "$PROJECT_ROOT/security:/app/security")
     # El frontend copia archivos directamente a /app
     FRONTEND_CODE_VOLUMES=(-v "$PROJECT_ROOT/client:/app")
     echo "📁 Modo desarrollo: Montando código desde: $PROJECT_ROOT"
@@ -87,63 +81,23 @@ echo "📦 Creando contenedor: $CONTAINER_NAME"
 echo ""
 
 case $TYPE in
-    registry)
-        PORT=$((9000 + NUM - 1))
-        # Construir lista de peers: incluir todos los nodos desde 1 hasta NUM-1
-        PEERS=""
-        for i in $(seq 1 $((NUM - 1))); do
-            if [ -n "$PEERS" ]; then
-                PEERS="${PEERS},"
-            fi
-            PEERS="${PEERS}tbfs-registry-${i}"
-        done
-        # Si NUM es 1, PEERS estará vacío (nodo único), lo cual es válido
-        # Montar código como volumen para desarrollo (cambios sin reconstruir imagen)
-        docker run -d \
-            --name "$CONTAINER_NAME" \
-            --network tbfs_net \
-            --hostname "$CONTAINER_NAME" \
-            -p "${PORT}:9000" \
-            "${REGISTRY_CODE_VOLUMES[@]}" \
-            -e NODE_ID="tbfs-registry-${NUM}" \
-            -e PEERS="$PEERS" \
-            -e REGISTRY_PORT=9000 \
-            -e HEARTBEAT_TIMEOUT=30 \
-            -e CLEANUP_INTERVAL=10 \
-            -e GOSSIP_INTERVAL=3 \
-            -e GOSSIP_FANOUT=2 \
-            -e PEER_FAILURE_TIMEOUT=30 \
-            "${EXTRA_ARGS[@]}" \
-            tbfs-registry:latest
-        ;;
-    
     namenode)
         PORT=$((8010 + NUM - 1))
-        # Construir lista de peers: incluir todos los nodos desde 1 hasta NUM-1
-        # No verificamos si están corriendo porque pueden estar en otra computadora
-        PEERS=""
-        for i in $(seq 1 $((NUM - 1))); do
-            if [ -n "$PEERS" ]; then
-                PEERS="${PEERS},"
-            fi
-            PEERS="${PEERS}tbfs-namenode-${i}"
-        done
-        # Si NUM es 1, PEERS estará vacío (nodo único), lo cual es válido
-        # Montar código como volumen para desarrollo (cambios sin reconstruir imagen)
+        # Los namenodes se descubren entre sí usando DNS de Docker (alias: namenode)
         docker run -d \
             --name "$CONTAINER_NAME" \
             --network tbfs_net \
+            --network-alias namenode \
             --hostname "$CONTAINER_NAME" \
             -p "${PORT}:8010" \
             -v "tbfs-namenode-${NUM}-data:/app/namenode/data" \
             "${NAMENODE_CODE_VOLUMES[@]}" \
-            -e NODE_ID="tbfs-namenode-${NUM}" \
-            -e PEERS="$PEERS" \
+            -e NODE_ID="namenode-${NUM}" \
             -e NAMENODE_PORT=8010 \
+            -e NAMENODE_SERVICE=namenode \
             -e HEARTBEAT_TIMEOUT=15 \
             -e LEADER_HEARTBEAT_INTERVAL=5 \
             -e ELECTION_TIMEOUT=15 \
-            -e REGISTRY_URL="$REGISTRY_URLS" \
             -e HEARTBEAT_INTERVAL=10 \
             "${EXTRA_ARGS[@]}" \
             tbfs-namenode:latest
@@ -151,18 +105,20 @@ case $TYPE in
     
     datanode)
         PORT=$((8000 + NUM))
-        # Montar código como volumen para desarrollo (cambios sin reconstruir imagen)
+        # Los datanodes se conectan a namenodes usando DNS de Docker (alias: namenode, datanode)
         docker run -d \
             --name "$CONTAINER_NAME" \
             --network tbfs_net \
+            --network-alias datanode \
             --hostname "$CONTAINER_NAME" \
-            -p "${PORT}:${PORT}" \
+            -p "${PORT}:8001" \
             -v "tbfs-datanode-${NUM}-storage:/app/storage" \
             "${DATANODE_CODE_VOLUMES[@]}" \
-            -e DATANODE_ID="tbfs-datanode-${NUM}" \
+            -e DATANODE_ID="datanode-${NUM}" \
             -e NODE_ID="$CONTAINER_NAME" \
-            -e DATANODE_PORT="$PORT" \
-            -e REGISTRY_URL="$REGISTRY_URLS" \
+            -e DATANODE_PORT=8001 \
+            -e NAMENODE_SERVICE=namenode \
+            -e NAMENODE_PORT=8010 \
             -e HEARTBEAT_INTERVAL=10 \
             -e STORAGE_PATH=/app/storage \
             "${EXTRA_ARGS[@]}" \
@@ -173,14 +129,16 @@ case $TYPE in
         if [ "$NUM" -ne 1 ]; then
             echo "⚠️  Advertencia: Solo hay un frontend, usando número 1"
         fi
-        # Montar código como volumen para desarrollo (cambios sin reconstruir imagen)
+        # El frontend se conecta a namenodes usando DNS de Docker
         docker run -d \
             --name "$CONTAINER_NAME" \
             --network tbfs_net \
+            --network-alias frontend \
             --hostname "$CONTAINER_NAME" \
             -p 8501:8501 \
             "${FRONTEND_CODE_VOLUMES[@]}" \
-            -e REGISTRY_URL="$REGISTRY_URLS" \
+            -e NAMENODE_SERVICE=namenode \
+            -e NAMENODE_PORT=8010 \
             -e DOWNLOAD_DIR=downloads \
             "${EXTRA_ARGS[@]}" \
             tbfs-frontend:latest
@@ -188,7 +146,7 @@ case $TYPE in
     
     *)
         echo "❌ Error: Tipo desconocido: $TYPE"
-        echo "   Tipos válidos: registry, namenode, datanode, frontend"
+        echo "   Tipos válidos: namenode, datanode, frontend"
         exit 1
         ;;
 esac

@@ -15,18 +15,44 @@ echo "📁 Directorio de trabajo: $(pwd)"
 echo ""
 
 # Verificar que estamos en el directorio correcto
-if [ ! -d "namenode" ] || [ ! -d "registry" ] || [ ! -d "datanode" ] || [ ! -d "client" ] || [ ! -d "security" ]; then
-    echo "❌ Error: No se encontraron los directorios necesarios (namenode, registry, datanode, client, security)"
+if [ ! -d "namenode" ] || [ ! -d "datanode" ] || [ ! -d "client" ] || [ ! -d "security" ]; then
+    echo "❌ Error: No se encontraron los directorios necesarios (namenode, datanode, client, security)"
     echo "   Asegúrate de ejecutar este script desde el directorio raíz del proyecto"
     exit 1
 fi
 
+# Mostrar ayuda
+show_help() {
+    echo "Uso: $0 [opciones]"
+    echo ""
+    echo "Opciones:"
+    echo "  -r, --rebuild    Forzar reconstrucción de todas las imágenes"
+    echo "  -h, --help       Mostrar esta ayuda"
+    echo ""
+    echo "Nota: Si solo hiciste cambios en el código y los volúmenes están montados,"
+    echo "      no necesitas reconstruir las imágenes. Solo reinicia los contenedores."
+}
+
 # Verificar si se debe forzar la reconstrucción
 FORCE_REBUILD=false
-if [ "$1" == "--rebuild" ] || [ "$1" == "-r" ]; then
-    FORCE_REBUILD=true
-    echo "⚠️  Modo de reconstrucción forzada activado"
-fi
+case "$1" in
+    -r|--rebuild)
+        FORCE_REBUILD=true
+        echo "⚠️  Modo de reconstrucción forzada activado"
+        ;;
+    -h|--help)
+        show_help
+        exit 0
+        ;;
+    "")
+        # Sin argumentos, comportamiento normal
+        ;;
+    *)
+        echo "❌ Opción desconocida: $1"
+        show_help
+        exit 1
+        ;;
+esac
 
 # Función para construir imagen solo si no existe o si se fuerza
 build_if_needed() {
@@ -48,8 +74,7 @@ build_if_needed() {
 echo "🏗️  Construyendo imágenes Docker..."
 echo ""
 
-# Construir imágenes
-build_if_needed "tbfs-registry:latest" "registry/dockerfile.yml" "Registry"
+# Construir imágenes (sin Registry - ya no es necesario)
 build_if_needed "tbfs-namenode:latest" "namenode/dockerfile.yml" "MetaNameNode"
 build_if_needed "tbfs-datanode:latest" "datanode/dockerfile.yml" "DataNode"
 build_if_needed "tbfs-frontend:latest" "client/dockerfile.yml" "Frontend"
@@ -60,4 +85,7 @@ echo ""
 echo "📋 Para ver las imágenes:"
 echo "   docker images | grep tbfs"
 echo ""
-
+echo "💡 Tip: Si solo cambias código Python, no necesitas reconstruir."
+echo "   Los volúmenes montan el código directamente en los contenedores."
+echo "   Solo reinicia los contenedores para aplicar los cambios."
+echo ""

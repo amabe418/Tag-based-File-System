@@ -141,7 +141,7 @@ case $TYPE in
             -e NAMENODE_SERVICE=namenode \
             -e NAMENODE_PORT=8010 \
             -e DOWNLOAD_DIR=downloads \
-            -e FLASK_PORT=5000 \
+            -e FLASK_PORT=8501 \
             "${EXTRA_ARGS[@]}" \
             tbfs-frontend:latest
         ;;

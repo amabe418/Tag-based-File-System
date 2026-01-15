@@ -15,6 +15,7 @@ def get_server_url():
     """Obtiene la URL de un servidor desde el registry. Retorna (url, error_message)"""
     try:
         # Intentar obtener servidor del registry
+        registry_client.print_registries()
         server_url = registry_client.get_server_url(strategy="random")
         if server_url:
             print(f"[CLIENT] URL obtenida del registry: {server_url}")

@@ -15,6 +15,8 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 # Configuración de chunked upload
 CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB por chunk
 USE_CHUNKED_UPLOAD_THRESHOLD = 50 * 1024 * 1024  # Usar chunked para archivos > 50 MB
+registry_client.print_registries()
+registry_client.print_namenodes()
 
 def get_server_url():
     """Obtiene la URL de un servidor desde el registry. Retorna (url, error_message)"""
@@ -1141,7 +1143,7 @@ if st.session_state.modal == "add_file":
                                     
                                     if success:
                                         st.success(f"✅ {file.name}: {message}")
-                                    success_count += 1
+                                        success_count += 1
                                     else:
                                         st.error(f"❌ {file.name}: {message}")
                                         error_count += 1

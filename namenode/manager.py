@@ -525,6 +525,77 @@ def delete_files_by_tags(query_tags: List[str], node_id: str = None, user_id: st
     return deleted_count > 0
 
 
+def delete_files_by_exact_tags(exact_tags: List[str], node_id: str = None, user_id: str = None, term: int = 0) -> int:
+    """
+    Elimina archivos que tienen EXACTAMENTE las etiquetas especificadas (ni más, ni menos).
+    
+    Args:
+        exact_tags: Lista de etiquetas exactas que debe tener el archivo
+        node_id: ID del nodo
+        user_id: ID del usuario
+        term: Término del namenode
+    
+    Returns: Número de archivos eliminados
+    """
+    if not exact_tags:
+        print("[ERROR] delete_files_by_exact_tags requiere etiquetas.")
+        return 0
+    
+    if not user_id:
+        print("[ERROR] delete_files_by_exact_tags requiere user_id.")
+        return 0
+    
+    db_path = get_db_path(node_id)
+    deleted_count = 0
+    exact_tags_set = set(t.lower().strip() for t in exact_tags)
+    num_exact_tags = len(exact_tags_set)
+    
+    print(f"[DEBUG] delete_files_by_exact_tags: buscando archivos con exactamente {exact_tags_set}")
+    
+    with db_lock:
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id)
+        
+        try:
+            # Buscar archivos del usuario
+            cursor.execute("""
+                SELECT f.id, f.name, GROUP_CONCAT(DISTINCT LOWER(t.tag)) as tags
+                FROM files f
+                LEFT JOIN file_tags ft ON f.id = ft.file_id
+                LEFT JOIN tags t ON ft.tag_id = t.id AND t.user_id = ?
+                WHERE f.user_id = ?
+                GROUP BY f.id
+            """, (user_id, user_id))
+            
+            files_to_delete = []
+            
+            for row in cursor.fetchall():
+                file_id, file_name, tags_str = row
+                if tags_str:
+                    file_tags_set = set(t.strip() for t in tags_str.split(','))
+                else:
+                    file_tags_set = set()
+                
+                # Verificar coincidencia exacta
+                if file_tags_set == exact_tags_set:
+                    files_to_delete.append((file_id, file_name))
+                    print(f"[DEBUG] Archivo '{file_name}' (id={file_id}) coincide exactamente: {file_tags_set}")
+            
+            close_connection(conn)
+        except Exception as e:
+            close_connection(conn)
+            print(f"[ERROR] Error buscando archivos: {e}")
+            return 0
+    
+    # Eliminar archivos encontrados
+    for file_id, file_name in files_to_delete:
+        if delete_file_metadata(file_id, node_id=node_id, user_id=user_id, term=term):
+            deleted_count += 1
+            print(f"[INFO] Archivo '{file_name}' eliminado (coincidencia exacta de etiquetas)")
+    
+    print(f"[INFO] delete_files_by_exact_tags: {deleted_count} archivos eliminados")
+    return deleted_count
+
+
 def add_tags_to_files(query_tags: List[str], new_tags: List[str], node_id: str = None, user_id: str = None, term: int = 0) -> bool:
     """
     Añade etiquetas new_tags a todos los archivos del usuario que cumplen query_tags.

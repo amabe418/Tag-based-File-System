@@ -116,7 +116,7 @@ def require_delete_permission():
 from namenode.database import init_db, get_db_path, get_connection, close_connection, db_lock
 from namenode.manager import (
     add_file_metadata, query_files, get_file_by_id, delete_file_metadata,
-    delete_files_by_tags, add_tags_to_files, delete_tags_from_files
+    delete_files_by_tags, delete_files_by_exact_tags, add_tags_to_files, delete_tags_from_files
 )
 from namenode.datanode_manager import (
     register_datanode, update_datanode_heartbeat, get_datanode, list_datanodes,
@@ -3282,6 +3282,113 @@ def delete_files_compat(
     return {
         "success": deleted,
         "message": "Archivos eliminados" if deleted else "No se encontró coincidencia"
+    }
+
+
+@app.delete("/delete-by-id/{file_id}")
+def delete_file_by_id(
+    file_id: int,
+    current_user: User = Depends(require_delete_permission()),
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """Elimina un archivo por su ID"""
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            headers = {}
+            if authorization:
+                headers["Authorization"] = authorization
+            response = requests.delete(
+                f"{leader_url}/delete-by-id/{file_id}",
+                headers=headers,
+                timeout=5
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    # Verificar que el archivo existe y pertenece al usuario
+    file_info = get_file_by_id(file_id, node_id=NODE_ID, user_id=current_user.username)
+    if not file_info:
+        raise HTTPException(status_code=404, detail="Archivo no encontrado")
+    
+    with cluster_lock:
+        current_term = cluster_state["term"]
+    
+    deleted = delete_file_metadata(file_id, node_id=NODE_ID, user_id=current_user.username, term=current_term)
+    
+    if deleted:
+        operation = OperationLog(
+            operation="delete_file",
+            data={"file_id": file_id, "user_id": current_user.username},
+            term=cluster_state["term"],
+            timestamp=time.time()
+        )
+        with cluster_lock:
+            operation_log.append(operation)
+        save_operation_to_log(operation, NODE_ID)
+        replicate_to_peers(operation)
+    
+    return {
+        "success": deleted,
+        "message": "Archivo eliminado" if deleted else "No se pudo eliminar el archivo"
+    }
+
+
+@app.delete("/delete-exact")
+def delete_files_exact_tags(
+    tags: str = Query(...),
+    current_user: User = Depends(require_delete_permission()),
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """Elimina archivos que tienen EXACTAMENTE las etiquetas especificadas (ni más, ni menos)"""
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            headers = {}
+            if authorization:
+                headers["Authorization"] = authorization
+            response = requests.delete(
+                f"{leader_url}/delete-exact",
+                params={"tags": tags},
+                headers=headers,
+                timeout=5
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    
+    with cluster_lock:
+        current_term = cluster_state["term"]
+    
+    deleted_count = delete_files_by_exact_tags(tag_list, node_id=NODE_ID, user_id=current_user.username, term=current_term)
+    
+    if deleted_count > 0:
+        operation = OperationLog(
+            operation="delete_files_by_exact_tags",
+            data={"tags": tag_list, "user_id": current_user.username, "deleted": deleted_count},
+            term=cluster_state["term"],
+            timestamp=time.time()
+        )
+        with cluster_lock:
+            operation_log.append(operation)
+        save_operation_to_log(operation, NODE_ID)
+        replicate_to_peers(operation)
+    
+    return {
+        "success": deleted_count > 0,
+        "deleted": deleted_count,
+        "message": f"{deleted_count} archivo(s) eliminado(s)" if deleted_count > 0 else "No se encontraron archivos con esas etiquetas exactas"
     }
 
 

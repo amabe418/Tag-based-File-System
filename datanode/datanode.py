@@ -20,7 +20,7 @@ from security.rate_limit import RateLimitMiddleware
 from datanode.storage import (
     store_file, retrieve_file, delete_file, file_exists, get_storage_info
 )
-from datanode.registry_client import registry_client
+from datanode.namenode_client import registry_client
 from datanode.chunked_storage import chunked_storage_manager
 import uuid
 

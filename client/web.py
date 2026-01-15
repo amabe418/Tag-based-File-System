@@ -7,218 +7,46 @@ import random
 import time
 import hashlib
 from typing import Optional, Tuple
-from registry_client import registry_client
+from namenode_client import namenode_client
 
-# Configuración de chunked upload
-CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB por chunk
-USE_CHUNKED_UPLOAD_THRESHOLD = 5 * 1024 * 1024  # Usar chunked para archivos > 5 MB
-registry_client.print_registries()
-registry_client.print_namenodes()
+# Configuración
+NAMENODE_PORT = int(os.getenv("NAMENODE_PORT", "8010"))
+
+# Imprimir información de namenodes descubiertos al inicio
+namenode_client.print_namenodes()
+
 
 def get_server_url():
-    """Obtiene la URL de un servidor desde el registry. Retorna (url, error_message)"""
+    """
+    Obtiene la URL de un namenode disponible usando DNS de Docker.
+    Retorna (url, error_message)
+    """
     try:
-        # Intentar obtener servidor del registry
-        server_url = registry_client.get_server_url(strategy="random")
-        if server_url:
-            print(f"[CLIENT] URL obtenida del registry: {server_url}")
-            # Verificar que la URL tenga el formato correcto
-            if not server_url.startswith("http"):
-                # Si el registry devuelve solo el hostname, agregar http:// y puerto
-                if ":" not in server_url:
-                    server_url = f"http://{server_url}:8010"
-                else:
-                    server_url = f"http://{server_url}"
-            print(f"[CLIENT] URL final a usar: {server_url}")
-            return server_url, None
-        
-        # Si no hay servidor, intentar obtener lista directamente
-        print("[CLIENT] No se obtuvo URL directa, intentando obtener lista de servidores...")
-        servers = registry_client.get_active_servers(use_cache=False)
-        print(f"[CLIENT] Servidores obtenidos: {servers}")
-        if servers and len(servers) > 0:
-            server = random.choice(servers)
-            server_url = server.get("url")
-            print(f"[CLIENT] URL del servidor seleccionado: {server_url}")
-            
-            # Validar que server_url no sea None
-            if not server_url:
-                error_msg = f"El servidor seleccionado no tiene URL válida. Datos del servidor: {server}"
-                print(f"[CLIENT] ERROR: {error_msg}")
-                return None, error_msg
-            
-            # Verificar formato de URL
-            if not server_url.startswith("http"):
-                if ":" not in server_url:
-                    server_url = f"http://{server_url}:8010"
-                else:
-                    server_url = f"http://{server_url}"
-            print(f"[CLIENT] URL final a usar: {server_url}")
-            return server_url, None
-        
-        # Si no hay servidores disponibles, retornar error
-        print("[CLIENT] ERROR: No hay servidores disponibles en el registry")
-        return None, "No hay servidores de datos disponibles en el registry. Por favor, verifica que el registry y los servidores backend estén funcionando."
-        
+        url, error = namenode_client.get_any_namenode_url()
+        if url:
+            print(f"[CLIENT] URL obtenida via DNS: {url}")
+            return url, None
+        return None, error or "No hay namenodes disponibles"
     except Exception as e:
-        print(f"[CLIENT] EXCEPCIÓN al obtener servidor: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, f"Error al consultar el registry: {e}"
+        print(f"[CLIENT] Error obteniendo namenode: {e}")
+        return None, f"Error al descubrir namenodes: {e}"
+
 
 def get_leader_url():
-    """Obtiene la URL del líder del namenode consultando el endpoint / de cualquier namenode"""
-    # Obtener todos los NameNodes disponibles del registry
-    try:
-        servers = registry_client.get_active_servers(use_cache=False)
-        namenode_servers = [s for s in servers if "namenode" in s.get("server_id", "").lower()]
-        
-        if not namenode_servers:
-            # Fallback: intentar obtener un servidor cualquiera
-            server_url, error = get_server_url()
-            if not server_url:
-                return None, error or "No hay servidores disponibles"
-            namenode_servers = [{"url": server_url}]
-    except Exception as e:
-        print(f"[CLIENT] Error obteniendo servidores del registry: {e}")
-        # Fallback: intentar obtener un servidor cualquiera
-        server_url, error = get_server_url()
-        if not server_url:
-            return None, error or "No hay servidores disponibles"
-        namenode_servers = [{"url": server_url}]
-    
-    # Intentar consultar cada NameNode hasta encontrar el líder válido
-    last_error = None
-    for server in namenode_servers:
-        server_url = server.get("url")
-        if not server_url:
-            continue
-            
-        # Asegurar formato correcto de URL
-        if not server_url.startswith("http"):
-            if ":" not in server_url:
-                server_url = f"http://{server_url}:8010"
-            else:
-                server_url = f"http://{server_url}"
-        
-        try:
-            print(f"[CLIENT] Consultando NameNode: {server_url}")
-            # Consultar el endpoint / para obtener información del líder
-            response = requests.get(f"{server_url}/", timeout=5)
-            response.raise_for_status()
-            data = response.json()
-            
-            # Prioridad 1: Si este namenode es el líder, verificar y usar su URL
-            if data.get("is_leader"):
-                print(f"[CLIENT] ✅ NameNode consultado es el líder: {server_url}")
-                # Verificar que realmente es el líder
-                verify_response = requests.get(f"{server_url}/", timeout=3)
-                verify_response.raise_for_status()
-                verify_data = verify_response.json()
-                if verify_data.get("is_leader"):
-                    return server_url, None
-                else:
-                    print(f"[CLIENT] ⚠️  {server_url} reporta que no es el líder en verificación")
-                    continue
-            
-            # Prioridad 2: Usar leader_url si está disponible
-            leader_url = data.get("leader_url")
-            if leader_url:
-                print(f"[CLIENT] Líder encontrado desde leader_url: {leader_url}")
-                # Verificar que el líder realmente es el líder consultando su endpoint /
-                try:
-                    leader_response = requests.get(f"{leader_url}/", timeout=3)
-                    leader_response.raise_for_status()
-                    leader_data = leader_response.json()
-                    if leader_data.get("is_leader"):
-                        print(f"[CLIENT] ✅ Líder verificado: {leader_url}")
-                        return leader_url, None
-                    else:
-                        # El líder reportado no es realmente el líder (información desactualizada)
-                        # Continuar buscando en otros NameNodes
-                        print(f"[CLIENT] ⚠️  {leader_url} reporta que no es el líder (información desactualizada), continuando búsqueda...")
-                        # Guardar este líder como candidato pero continuar buscando
-                        continue
-                except requests.RequestException as e:
-                    print(f"[CLIENT] ⚠️  Error verificando líder {leader_url}: {e}, continuando búsqueda...")
-                    continue
-            
-            # Prioridad 3: Si hay leader_id pero no leader_url, construir la URL y verificar
-            leader_id = data.get("leader_id")
-            if leader_id:
-                # Construir URL del líder basado en el leader_id
-                # Si el leader_id es "namenode-1", la URL será "http://tbfs-namenode-1:8010"
-                constructed_url = f"http://tbfs-{leader_id}:8010"
-                print(f"[CLIENT] Líder construido desde leader_id: {constructed_url}")
-                
-                # VERIFICAR que realmente es el líder antes de retornarlo
-                try:
-                    verify_response = requests.get(f"{constructed_url}/", timeout=3)
-                    verify_response.raise_for_status()
-                    verify_data = verify_response.json()
-                    if verify_data.get("is_leader") and (verify_data.get("leader_id") == leader_id or verify_data.get("node_id") == leader_id):
-                        print(f"[CLIENT] ✅ Líder verificado desde leader_id: {constructed_url}")
-                        return constructed_url, None
-                    else:
-                        # El líder reportado no es realmente el líder (información desactualizada)
-                        print(f"[CLIENT] ⚠️  {constructed_url} no es el líder (is_leader={verify_data.get('is_leader')}, leader_id={verify_data.get('leader_id')}), continuando búsqueda...")
-                        continue
-                except requests.RequestException as e:
-                    print(f"[CLIENT] ⚠️  Error verificando líder construido {constructed_url}: {e}, continuando búsqueda...")
-                    continue
-            
-        except requests.RequestException as e:
-            last_error = e
-            print(f"[CLIENT] Error consultando {server_url}: {e}")
-            continue
-        except Exception as e:
-            last_error = e
-            print(f"[CLIENT] Error inesperado consultando {server_url}: {e}")
-            continue
-    
-    # Si llegamos aquí, no se encontró un líder válido después de consultar todos los NameNodes
-    # Esto puede pasar si:
-    # 1. Hay una elección en curso
-    # 2. Todos los NameNodes tienen información desactualizada
-    # 3. No hay líder actualmente
-    
-    # Intentar una última vez consultando todos los NameNodes para ver si alguno es el líder
-    print(f"[CLIENT] ⚠️  No se encontró líder válido después de consultar {len(namenode_servers)} NameNodes")
-    print(f"[CLIENT] 🔄 Intentando búsqueda directa del líder consultando todos los NameNodes...")
-    
-    for server in namenode_servers:
-        server_url = server.get("url")
-        if not server_url:
-            continue
-        if not server_url.startswith("http"):
-            if ":" not in server_url:
-                server_url = f"http://{server_url}:8010"
-            else:
-                server_url = f"http://{server_url}"
-        
-        try:
-            response = requests.get(f"{server_url}/", timeout=3)
-            response.raise_for_status()
-            data = response.json()
-            if data.get("is_leader"):
-                print(f"[CLIENT] ✅ Líder encontrado en búsqueda directa: {server_url}")
-                return server_url, None
-        except Exception:
-            continue
-    
-    error_msg = f"No se pudo encontrar un líder válido después de consultar todos los NameNodes. Puede haber una elección en curso."
-    print(f"[CLIENT] ❌ {error_msg}")
-    return None, error_msg
+    """
+    Obtiene la URL del líder del cluster de namenodes usando DNS de Docker.
+    Retorna (leader_url, error_message)
+    """
+    return namenode_client.get_leader_url()
 
 
 def check_server_connection():
-    """Verifica si hay conexión con el servidor. Retorna (connected, error_message)"""
+    """Verifica si hay conexión con algún namenode. Retorna (connected, error_message)"""
     server_url, error = get_server_url()
     if not server_url:
         return False, error
     
     try:
-        # Intentar hacer una petición simple al servidor para verificar conexión
         response = requests.get(f"{server_url}/", timeout=3)
         if response.status_code == 200:
             return True, None
@@ -227,6 +55,7 @@ def check_server_connection():
     except requests.RequestException as e:
         return False, f"No se pudo conectar con el servidor: {e}"
 
+
 # Inicializar URL del servidor en session state
 if "server_url" not in st.session_state:
     server_url, _ = get_server_url()
@@ -234,7 +63,7 @@ if "server_url" not in st.session_state:
     if st.session_state.server_url:
         print(f"Usando servidor: {st.session_state.server_url}")
     else:
-        print("⚠️ No se pudo obtener servidor del registry")
+        print("⚠️ No se pudo obtener servidor via DNS")
 
 # Inicializar autenticación con persistencia usando cookies
 COOKIE_TOKEN_KEY = "tbfs_auth_token"

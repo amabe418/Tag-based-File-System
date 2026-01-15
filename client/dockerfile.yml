@@ -5,7 +5,8 @@ WORKDIR /app
 
 COPY client/main.py /app
 COPY client/web.py /app
-COPY client/registry_client.py /app
+COPY client/namenode_client.py /app
+COPY client/chunked_client.py /app
 
 # Aumentar timeout y reintentos para instalaciones pesadas (streamlit)
 ENV PIP_DEFAULT_TIMEOUT=300 PIP_RETRIES=5

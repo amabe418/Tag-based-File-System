@@ -37,35 +37,40 @@ db_lock = metadata_db_lock
 metadata_rw_lock = _metadata_rw_lock
 operations_rw_lock = _operations_rw_lock
 
+# NODE_ID del contenedor actual - solo este nodo debe tener su carpeta de datos
+_CURRENT_NODE_ID = os.getenv("NODE_ID", "namenode-1")
+
+def _get_current_node_id() -> str:
+    """Obtiene el NODE_ID del contenedor actual"""
+    return _CURRENT_NODE_ID
+
 def get_db_path(node_id: str = None) -> str:
-    """Obtiene la ruta de la base de datos de METADATOS para un nodo específico"""
+    """Obtiene la ruta de la base de datos de METADATOS para este nodo"""
     return get_metadata_db_path(node_id)
 
 def get_metadata_db_path(node_id: str = None) -> str:
-    """Obtiene la ruta de la base de datos de METADATOS para un nodo específico"""
-    if node_id:
-        data_dir = os.path.join(os.path.dirname(__file__), "data", node_id)
-        os.makedirs(data_dir, exist_ok=True)
-        return os.path.join(data_dir, "namenode_metadata.db")
-    else:
-        # Fallback para compatibilidad
-        base_dir = os.path.dirname(__file__)
-        db_dir = os.path.join(base_dir, "..", "database")
-        os.makedirs(db_dir, exist_ok=True)
-        return os.path.join(db_dir, "namenode_metadata.db")
+    """
+    Obtiene la ruta de la base de datos de METADATOS.
+    IMPORTANTE: Siempre usa el NODE_ID del contenedor actual, ignorando el parámetro node_id.
+    Esto evita crear carpetas para otros nodos dentro de este contenedor.
+    """
+    # Siempre usar el NODE_ID del contenedor actual
+    current_node_id = _get_current_node_id()
+    data_dir = os.path.join(os.path.dirname(__file__), "data", current_node_id)
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, "namenode_metadata.db")
 
 def get_operations_db_path(node_id: str = None) -> str:
-    """Obtiene la ruta de la base de datos de OPERACIONES para un nodo específico"""
-    if node_id:
-        data_dir = os.path.join(os.path.dirname(__file__), "data", node_id)
-        os.makedirs(data_dir, exist_ok=True)
-        return os.path.join(data_dir, "namenode_operations.db")
-    else:
-        # Fallback para compatibilidad
-        base_dir = os.path.dirname(__file__)
-        db_dir = os.path.join(base_dir, "..", "database")
-        os.makedirs(db_dir, exist_ok=True)
-        return os.path.join(db_dir, "namenode_operations.db")
+    """
+    Obtiene la ruta de la base de datos de OPERACIONES.
+    IMPORTANTE: Siempre usa el NODE_ID del contenedor actual, ignorando el parámetro node_id.
+    Esto evita crear carpetas para otros nodos dentro de este contenedor.
+    """
+    # Siempre usar el NODE_ID del contenedor actual
+    current_node_id = _get_current_node_id()
+    data_dir = os.path.join(os.path.dirname(__file__), "data", current_node_id)
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, "namenode_operations.db")
 
 
 def get_connection(db_path: str = None, node_id: str = None, db_type: str = "metadata"):

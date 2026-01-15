@@ -61,8 +61,9 @@ docker rm tbfs-registry-1 tbfs-registry-2 tbfs-registry-3 \
   tbfs-frontend 2>/dev/null || true
 
 # Ejecutar 3 nodos del Registry Service (Protocolo Gossip)
+# Con volúmenes de código montados para desarrollo
 echo "Iniciando Registry Service - Nodo 1..."
-docker run -d --name tbfs-registry-1 --network tbfs_net -p 9000:9000 \
+docker run -d --name tbfs-registry-1 --network tbfs_net --network-alias registry -p 9000:9000 \
   -e NODE_ID=tbfs-registry-1 \
   -e PEERS=tbfs-registry-2,tbfs-registry-3 \
   -e REGISTRY_PORT=9000 \
@@ -71,10 +72,11 @@ docker run -d --name tbfs-registry-1 --network tbfs_net -p 9000:9000 \
   -e GOSSIP_INTERVAL=3 \
   -e GOSSIP_FANOUT=2 \
   -e PEER_FAILURE_TIMEOUT=30 \
+  "${REGISTRY_CODE_VOLUMES[@]}" \
   tbfs-registry
 
 echo "Iniciando Registry Service - Nodo 2..."
-docker run -d --name tbfs-registry-2 --network tbfs_net -p 9001:9000 \
+docker run -d --name tbfs-registry-2 --network tbfs_net --network-alias registry -p 9001:9000 \
   -e NODE_ID=tbfs-registry-2 \
   -e PEERS=tbfs-registry-1,tbfs-registry-3 \
   -e REGISTRY_PORT=9000 \
@@ -83,10 +85,11 @@ docker run -d --name tbfs-registry-2 --network tbfs_net -p 9001:9000 \
   -e GOSSIP_INTERVAL=3 \
   -e GOSSIP_FANOUT=2 \
   -e PEER_FAILURE_TIMEOUT=30 \
+  "${REGISTRY_CODE_VOLUMES[@]}" \
   tbfs-registry
 
 echo "Iniciando Registry Service - Nodo 3..."
-docker run -d --name tbfs-registry-3 --network tbfs_net -p 9002:9000 \
+docker run -d --name tbfs-registry-3 --network tbfs_net --network-alias registry -p 9002:9000 \
   -e NODE_ID=tbfs-registry-3 \
   -e PEERS=tbfs-registry-1,tbfs-registry-2 \
   -e REGISTRY_PORT=9000 \
@@ -95,6 +98,7 @@ docker run -d --name tbfs-registry-3 --network tbfs_net -p 9002:9000 \
   -e GOSSIP_INTERVAL=3 \
   -e GOSSIP_FANOUT=2 \
   -e PEER_FAILURE_TIMEOUT=30 \
+  "${REGISTRY_CODE_VOLUMES[@]}" \
   tbfs-registry
 
 # Esperar un momento para que los registries se estabilicen
@@ -102,11 +106,28 @@ echo "Esperando que los registries se estabilicen..."
 sleep 5
 
 # Obtener directorio raíz del proyecto para montar código como volumen
+# Esto permite cambios en el código sin reconstruir las imágenes Docker
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CODE_VOLUME_ARGS=()
+
+# Preparar volúmenes de código para cada servicio
+# Los cambios en el código se reflejarán inmediatamente sin reconstruir imágenes
+NAMENODE_CODE_VOLUMES=()
+DATANODE_CODE_VOLUMES=()
+REGISTRY_CODE_VOLUMES=()
+FRONTEND_CODE_VOLUMES=()
+
 if [ -d "$PROJECT_ROOT/namenode" ] && [ -d "$PROJECT_ROOT/security" ]; then
-    CODE_VOLUME_ARGS=(-v "$PROJECT_ROOT/namenode:/app/namenode" -v "$PROJECT_ROOT/security:/app/security")
-    echo "📁 Montando código desde: $PROJECT_ROOT"
+    NAMENODE_CODE_VOLUMES=(-v "$PROJECT_ROOT/namenode:/app/namenode" -v "$PROJECT_ROOT/security:/app/security")
+    DATANODE_CODE_VOLUMES=(-v "$PROJECT_ROOT/datanode:/app/datanode" -v "$PROJECT_ROOT/security:/app/security")
+    # El registry necesita que registry.py esté en /app/Registry/registry.py
+    REGISTRY_CODE_VOLUMES=(-v "$PROJECT_ROOT/registry/registry.py:/app/Registry/registry.py" -v "$PROJECT_ROOT/security:/app/security")
+    # El frontend copia archivos directamente a /app
+    FRONTEND_CODE_VOLUMES=(-v "$PROJECT_ROOT/client:/app")
+    echo "📁 Modo desarrollo: Montando código desde: $PROJECT_ROOT"
+    echo "   Los cambios en el código se reflejarán sin reconstruir imágenes"
+else
+    echo "⚠️  Advertencia: No se encontraron directorios necesarios"
+    echo "   Los volúmenes de código no se montarán"
 fi
 
 # Ejecutar 3 nodos del MetaNameNode
@@ -121,7 +142,7 @@ docker run -d --name tbfs-namenode-1 --network tbfs_net -p 8010:8010 \
   -e REGISTRY_URL=http://tbfs-registry-1:9000,http://tbfs-registry-2:9000,http://tbfs-registry-3:9000 \
   -e HEARTBEAT_INTERVAL=10 \
   -v tbfs-namenode-1-data:/app/namenode/data \
-  "${CODE_VOLUME_ARGS[@]}" \
+  "${NAMENODE_CODE_VOLUMES[@]}" \
   tbfs-namenode
 
 echo "Iniciando MetaNameNode - Nodo 2..."
@@ -135,7 +156,7 @@ docker run -d --name tbfs-namenode-2 --network tbfs_net -p 8011:8010 \
   -e REGISTRY_URL=http://tbfs-registry-1:9000,http://tbfs-registry-2:9000,http://tbfs-registry-3:9000 \
   -e HEARTBEAT_INTERVAL=10 \
   -v tbfs-namenode-2-data:/app/namenode/data \
-  "${CODE_VOLUME_ARGS[@]}" \
+  "${NAMENODE_CODE_VOLUMES[@]}" \
   tbfs-namenode
 
 echo "Iniciando MetaNameNode - Nodo 3..."
@@ -149,7 +170,7 @@ docker run -d --name tbfs-namenode-3 --network tbfs_net -p 8012:8010 \
   -e REGISTRY_URL=http://tbfs-registry-1:9000,http://tbfs-registry-2:9000,http://tbfs-registry-3:9000 \
   -e HEARTBEAT_INTERVAL=10 \
   -v tbfs-namenode-3-data:/app/namenode/data \
-  "${CODE_VOLUME_ARGS[@]}" \
+  "${NAMENODE_CODE_VOLUMES[@]}" \
   tbfs-namenode
 
 # Esperar un momento para que los MetaNameNodes se estabilicen
@@ -157,6 +178,7 @@ echo "Esperando que los MetaNameNodes se estabilicen..."
 sleep 5
 
 # Ejecutar 5 DataNodes
+# Con volúmenes de código montados para desarrollo
 echo "Iniciando DataNode - Nodo 1..."
 docker run -d --name tbfs-datanode-1 --network tbfs_net -p 8001:8001 \
   -e DATANODE_ID=datanode-1 \
@@ -166,6 +188,7 @@ docker run -d --name tbfs-datanode-1 --network tbfs_net -p 8001:8001 \
   -e HEARTBEAT_INTERVAL=10 \
   -e STORAGE_PATH=/app/storage \
   -v tbfs-datanode-1-storage:/app/storage \
+  "${DATANODE_CODE_VOLUMES[@]}" \
   tbfs-datanode
 
 echo "Iniciando DataNode - Nodo 2..."
@@ -177,6 +200,7 @@ docker run -d --name tbfs-datanode-2 --network tbfs_net -p 8002:8002 \
   -e HEARTBEAT_INTERVAL=10 \
   -e STORAGE_PATH=/app/storage \
   -v tbfs-datanode-2-storage:/app/storage \
+  "${DATANODE_CODE_VOLUMES[@]}" \
   tbfs-datanode
 
 echo "Iniciando DataNode - Nodo 3..."
@@ -188,6 +212,7 @@ docker run -d --name tbfs-datanode-3 --network tbfs_net -p 8003:8003 \
   -e HEARTBEAT_INTERVAL=10 \
   -e STORAGE_PATH=/app/storage \
   -v tbfs-datanode-3-storage:/app/storage \
+  "${DATANODE_CODE_VOLUMES[@]}" \
   tbfs-datanode
 
 echo "Iniciando DataNode - Nodo 4..."
@@ -199,6 +224,7 @@ docker run -d --name tbfs-datanode-4 --network tbfs_net -p 8004:8004 \
   -e HEARTBEAT_INTERVAL=10 \
   -e STORAGE_PATH=/app/storage \
   -v tbfs-datanode-4-storage:/app/storage \
+  "${DATANODE_CODE_VOLUMES[@]}" \
   tbfs-datanode
 
 echo "Iniciando DataNode - Nodo 5..."
@@ -210,13 +236,16 @@ docker run -d --name tbfs-datanode-5 --network tbfs_net -p 8005:8005 \
   -e HEARTBEAT_INTERVAL=10 \
   -e STORAGE_PATH=/app/storage \
   -v tbfs-datanode-5-storage:/app/storage \
+  "${DATANODE_CODE_VOLUMES[@]}" \
   tbfs-datanode
 
 # Ejecutar Frontend Service
+# Con volúmenes de código montados para desarrollo
 echo "Iniciando Frontend Service..."
 docker run -d --name tbfs-frontend --network tbfs_net -p 8501:8501 \
   -e REGISTRY_URL=http://tbfs-registry-1:9000,http://tbfs-registry-2:9000,http://tbfs-registry-3:9000 \
   -e DOWNLOAD_DIR=downloads \
+  "${FRONTEND_CODE_VOLUMES[@]}" \
   tbfs-frontend
 
 echo ""

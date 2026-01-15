@@ -10,7 +10,7 @@ from typing import Optional, List
 import time
 
 # Tamaño de chunk por defecto: 10 MB
-DEFAULT_CHUNK_SIZE = 10 * 1024 * 1024
+DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024
 
 class ChunkedUploadClient:
     """Cliente para upload de archivos por chunks"""

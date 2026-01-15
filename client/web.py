@@ -9,12 +9,9 @@ import hashlib
 from typing import Optional, Tuple
 from registry_client import registry_client
 
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", os.path.join(os.path.dirname(__file__),"downloads/"))
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
 # Configuración de chunked upload
-CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB por chunk
-USE_CHUNKED_UPLOAD_THRESHOLD = 50 * 1024 * 1024  # Usar chunked para archivos > 50 MB
+CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB por chunk
+USE_CHUNKED_UPLOAD_THRESHOLD = 5 * 1024 * 1024  # Usar chunked para archivos > 5 MB
 
 def get_server_url():
     """Obtiene la URL de un servidor desde el registry. Retorna (url, error_message)"""
@@ -69,54 +66,147 @@ def get_server_url():
 
 def get_leader_url():
     """Obtiene la URL del líder del namenode consultando el endpoint / de cualquier namenode"""
-    server_url, error = get_server_url()
-    if not server_url:
-        return None, error
-    
+    # Obtener todos los NameNodes disponibles del registry
     try:
-        # Consultar el endpoint / para obtener información del líder
-        response = requests.get(f"{server_url}/", timeout=5)
-        response.raise_for_status()
-        data = response.json()
+        servers = registry_client.get_active_servers(use_cache=False)
+        namenode_servers = [s for s in servers if "namenode" in s.get("server_id", "").lower()]
         
-        # Prioridad 1: Usar leader_url si está disponible (siempre debe estar si hay líder)
-        leader_url = data.get("leader_url")
-        if leader_url:
-            print(f"[CLIENT] Líder encontrado desde leader_url: {leader_url}")
-            # Verificar que el líder realmente es el líder consultando su endpoint /
-            try:
-                leader_response = requests.get(f"{leader_url}/", timeout=3)
-                leader_response.raise_for_status()
-                leader_data = leader_response.json()
-                if leader_data.get("is_leader"):
-                    return leader_url, None
+        if not namenode_servers:
+            # Fallback: intentar obtener un servidor cualquiera
+            server_url, error = get_server_url()
+            if not server_url:
+                return None, error or "No hay servidores disponibles"
+            namenode_servers = [{"url": server_url}]
+    except Exception as e:
+        print(f"[CLIENT] Error obteniendo servidores del registry: {e}")
+        # Fallback: intentar obtener un servidor cualquiera
+        server_url, error = get_server_url()
+        if not server_url:
+            return None, error or "No hay servidores disponibles"
+        namenode_servers = [{"url": server_url}]
+    
+    # Intentar consultar cada NameNode hasta encontrar el líder válido
+    last_error = None
+    for server in namenode_servers:
+        server_url = server.get("url")
+        if not server_url:
+            continue
+            
+        # Asegurar formato correcto de URL
+        if not server_url.startswith("http"):
+            if ":" not in server_url:
+                server_url = f"http://{server_url}:8010"
+            else:
+                server_url = f"http://{server_url}"
+        
+        try:
+            print(f"[CLIENT] Consultando NameNode: {server_url}")
+            # Consultar el endpoint / para obtener información del líder
+            response = requests.get(f"{server_url}/", timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Prioridad 1: Si este namenode es el líder, verificar y usar su URL
+            if data.get("is_leader"):
+                print(f"[CLIENT] ✅ NameNode consultado es el líder: {server_url}")
+                # Verificar que realmente es el líder
+                verify_response = requests.get(f"{server_url}/", timeout=3)
+                verify_response.raise_for_status()
+                verify_data = verify_response.json()
+                if verify_data.get("is_leader"):
+                    return server_url, None
                 else:
-                    print(f"[CLIENT] WARNING: {leader_url} reporta que no es el líder")
-            except:
-                pass  # Si falla la verificación, usar la URL de todos modos
-            return leader_url, None
+                    print(f"[CLIENT] ⚠️  {server_url} reporta que no es el líder en verificación")
+                    continue
+            
+            # Prioridad 2: Usar leader_url si está disponible
+            leader_url = data.get("leader_url")
+            if leader_url:
+                print(f"[CLIENT] Líder encontrado desde leader_url: {leader_url}")
+                # Verificar que el líder realmente es el líder consultando su endpoint /
+                try:
+                    leader_response = requests.get(f"{leader_url}/", timeout=3)
+                    leader_response.raise_for_status()
+                    leader_data = leader_response.json()
+                    if leader_data.get("is_leader"):
+                        print(f"[CLIENT] ✅ Líder verificado: {leader_url}")
+                        return leader_url, None
+                    else:
+                        # El líder reportado no es realmente el líder (información desactualizada)
+                        # Continuar buscando en otros NameNodes
+                        print(f"[CLIENT] ⚠️  {leader_url} reporta que no es el líder (información desactualizada), continuando búsqueda...")
+                        # Guardar este líder como candidato pero continuar buscando
+                        continue
+                except requests.RequestException as e:
+                    print(f"[CLIENT] ⚠️  Error verificando líder {leader_url}: {e}, continuando búsqueda...")
+                    continue
+            
+            # Prioridad 3: Si hay leader_id pero no leader_url, construir la URL y verificar
+            leader_id = data.get("leader_id")
+            if leader_id:
+                # Construir URL del líder basado en el leader_id
+                # Si el leader_id es "namenode-1", la URL será "http://tbfs-namenode-1:8010"
+                constructed_url = f"http://tbfs-{leader_id}:8010"
+                print(f"[CLIENT] Líder construido desde leader_id: {constructed_url}")
+                
+                # VERIFICAR que realmente es el líder antes de retornarlo
+                try:
+                    verify_response = requests.get(f"{constructed_url}/", timeout=3)
+                    verify_response.raise_for_status()
+                    verify_data = verify_response.json()
+                    if verify_data.get("is_leader") and (verify_data.get("leader_id") == leader_id or verify_data.get("node_id") == leader_id):
+                        print(f"[CLIENT] ✅ Líder verificado desde leader_id: {constructed_url}")
+                        return constructed_url, None
+                    else:
+                        # El líder reportado no es realmente el líder (información desactualizada)
+                        print(f"[CLIENT] ⚠️  {constructed_url} no es el líder (is_leader={verify_data.get('is_leader')}, leader_id={verify_data.get('leader_id')}), continuando búsqueda...")
+                        continue
+                except requests.RequestException as e:
+                    print(f"[CLIENT] ⚠️  Error verificando líder construido {constructed_url}: {e}, continuando búsqueda...")
+                    continue
+            
+        except requests.RequestException as e:
+            last_error = e
+            print(f"[CLIENT] Error consultando {server_url}: {e}")
+            continue
+        except Exception as e:
+            last_error = e
+            print(f"[CLIENT] Error inesperado consultando {server_url}: {e}")
+            continue
+    
+    # Si llegamos aquí, no se encontró un líder válido después de consultar todos los NameNodes
+    # Esto puede pasar si:
+    # 1. Hay una elección en curso
+    # 2. Todos los NameNodes tienen información desactualizada
+    # 3. No hay líder actualmente
+    
+    # Intentar una última vez consultando todos los NameNodes para ver si alguno es el líder
+    print(f"[CLIENT] ⚠️  No se encontró líder válido después de consultar {len(namenode_servers)} NameNodes")
+    print(f"[CLIENT] 🔄 Intentando búsqueda directa del líder consultando todos los NameNodes...")
+    
+    for server in namenode_servers:
+        server_url = server.get("url")
+        if not server_url:
+            continue
+        if not server_url.startswith("http"):
+            if ":" not in server_url:
+                server_url = f"http://{server_url}:8010"
+            else:
+                server_url = f"http://{server_url}"
         
-        # Prioridad 2: Si este namenode es el líder, usar su URL
-        if data.get("is_leader"):
-            print(f"[CLIENT] Namenode consultado es el líder: {server_url}")
-            return server_url, None
-        
-        # Prioridad 3: Si hay leader_id pero no leader_url, construir la URL
-        leader_id = data.get("leader_id")
-        if leader_id:
-            # Construir URL del líder basado en el leader_id
-            # Si el leader_id es "namenode-1", la URL será "http://tbfs-namenode-1:8010"
-            leader_url = f"http://tbfs-{leader_id}:8010"
-            print(f"[CLIENT] Líder construido desde leader_id: {leader_url}")
-            return leader_url, None
-        
-        # Si no hay líder disponible, retornar el servidor actual como fallback
-        print(f"[CLIENT] No se pudo obtener líder, usando servidor actual: {server_url}")
-        return server_url, None
-        
-    except requests.RequestException as e:
-        print(f"[CLIENT] Error al consultar líder: {e}")
-        return None, f"Error al consultar el líder: {e}"
+        try:
+            response = requests.get(f"{server_url}/", timeout=3)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("is_leader"):
+                print(f"[CLIENT] ✅ Líder encontrado en búsqueda directa: {server_url}")
+                return server_url, None
+        except Exception:
+            continue
+    
+    error_msg = f"No se pudo encontrar un líder válido después de consultar todos los NameNodes. Puede haber una elección en curso."
+    print(f"[CLIENT] ❌ {error_msg}")
+    return None, error_msg
 
 
 def check_server_connection():
@@ -308,11 +398,19 @@ if "logged_in_user" not in st.session_state:
 
 def login(username: str, password: str):
     """Autentica al usuario y guarda el token - siempre usa el líder"""
+    import time
+    start_time = time.time()
+    print(f"[CLIENT] [LOGIN] 🔐 Iniciando login para usuario: {username}")
+    
     leader_url, error = get_leader_url()
     if not leader_url:
+        print(f"[CLIENT] [LOGIN] ❌ No se pudo obtener líder: {error}")
         return False, error or "No hay líder disponible"
     
+    print(f"[CLIENT] [LOGIN] 📍 Líder obtenido: {leader_url}")
+    
     try:
+        print(f"[CLIENT] [LOGIN] 📤 Enviando petición de login a {leader_url}/auth/login")
         response = requests.post(
             f"{leader_url}/auth/login",
             json={"username": username, "password": password},
@@ -322,11 +420,14 @@ def login(username: str, password: str):
         data = response.json()
         token = data.get("access_token")
         user = data.get("user", {}).get("username")
+        user_role = data.get("user", {}).get("role", "unknown")
+        
+        elapsed = time.time() - start_time
         
         # Validar que tanto token como user sean no-None
         if not token or not user:
             error_msg = "La respuesta del servidor no contiene token o usuario válido"
-            print(f"[CLIENT] ❌ {error_msg}")
+            print(f"[CLIENT] [LOGIN] ❌ {error_msg} (tiempo: {elapsed:.2f}s)")
             return False, error_msg
         
         # Guardar en session_state
@@ -336,10 +437,18 @@ def login(username: str, password: str):
         # Guardar en storage para persistencia (hacer esto ANTES del rerun)
         save_to_storage(COOKIE_TOKEN_KEY, token)
         save_to_storage(COOKIE_USER_KEY, user)
-        print(f"[CLIENT] Token y usuario guardados en storage: user={user}")
+        print(f"[CLIENT] [LOGIN] ✅ Login exitoso: user={user}, role={user_role}, tiempo={elapsed:.2f}s")
+        print(f"[CLIENT] [LOGIN] 💾 Token y usuario guardados en storage")
         
         return True, None
+    except requests.HTTPError as e:
+        elapsed = time.time() - start_time
+        status_code = e.response.status_code if e.response else "unknown"
+        print(f"[CLIENT] [LOGIN] ❌ Error HTTP {status_code}: {e} (tiempo: {elapsed:.2f}s)")
+        return False, f"Error de autenticación: {e}"
     except requests.RequestException as e:
+        elapsed = time.time() - start_time
+        print(f"[CLIENT] [LOGIN] ❌ Error de conexión: {e} (tiempo: {elapsed:.2f}s)")
         return False, str(e)
 
 def get_auth_headers():
@@ -400,28 +509,50 @@ if not st.session_state.auth_token:
                 elif len(su_password) < 6:
                     st.warning("La contraseña debe tener al menos 6 caracteres")
                 else:
+                    import time
+                    signup_start = time.time()
                     su_username = su_username.strip().lower()
+                    print(f"[CLIENT] [SIGNUP] 📝 Iniciando registro de usuario: {su_username}")
+                    
                     leader_url, error = get_leader_url()
                     if not leader_url:
+                        print(f"[CLIENT] [SIGNUP] ❌ No se pudo obtener líder: {error}")
                         st.error(error or "No hay líder disponible")
                     else:
                         try:
+                            print(f"[CLIENT] [SIGNUP] 📍 Líder obtenido: {leader_url}")
+                            print(f"[CLIENT] [SIGNUP] 📤 Enviando petición de signup a {leader_url}/auth/signup")
                             resp = requests.post(
                                 f"{leader_url}/auth/signup",
                                 json={"username": su_username, "password": su_password},
                                 timeout=5,
                             )
                             if resp.status_code == 400:
+                                elapsed = time.time() - signup_start
+                                print(f"[CLIENT] [SIGNUP] ❌ Usuario ya existe (tiempo: {elapsed:.2f}s)")
                                 st.error("El usuario ya existe, elige otro nombre de usuario.")
-                            resp.raise_for_status()
-                            data = resp.json()
-                            st.success("✅ Cuenta creada. Inicia sesión con tus credenciales.")
-                            # Limpiar campos y cambiar a login
-                            st.session_state.auth_mode = "login"
-                            st.session_state.login_username = su_username
-                            st.session_state.login_password = ""
-                            st.rerun()
+                            else:
+                                resp.raise_for_status()
+                                data = resp.json()
+                                elapsed = time.time() - signup_start
+                                token = data.get("access_token")
+                                print(f"[CLIENT] [SIGNUP] ✅ Cuenta creada exitosamente (tiempo: {elapsed:.2f}s)")
+                                if token:
+                                    print(f"[CLIENT] [SIGNUP] 🎫 Token recibido, usuario puede iniciar sesión automáticamente")
+                                st.success("✅ Cuenta creada. Inicia sesión con tus credenciales.")
+                                # Limpiar campos y cambiar a login
+                                st.session_state.auth_mode = "login"
+                                st.session_state.login_username = su_username
+                                st.session_state.login_password = ""
+                                st.rerun()
+                        except requests.HTTPError as e:
+                            elapsed = time.time() - signup_start
+                            status_code = e.response.status_code if e.response else "unknown"
+                            print(f"[CLIENT] [SIGNUP] ❌ Error HTTP {status_code}: {e} (tiempo: {elapsed:.2f}s)")
+                            st.error(f"Error al crear cuenta: {e}")
                         except requests.RequestException as e:
+                            elapsed = time.time() - signup_start
+                            print(f"[CLIENT] [SIGNUP] ❌ Error de conexión: {e} (tiempo: {elapsed:.2f}s)")
                             st.error(f"Error al crear cuenta: {e}")
     st.stop()  # Detener la ejecución hasta que se autentique
 else:
@@ -463,11 +594,19 @@ else:
                     elif len(new_password) < 6:
                         st.warning("La nueva contraseña debe tener al menos 6 caracteres")
                     else:
+                        import time
+                        change_pwd_start = time.time()
+                        user = st.session_state.logged_in_user or "unknown"
+                        print(f"[CLIENT] [CHANGE_PASSWORD] 🔐 Iniciando cambio de contraseña (usuario: {user})")
+                        
                         leader_url, error = get_leader_url()
                         if not leader_url:
+                            print(f"[CLIENT] [CHANGE_PASSWORD] ❌ No se pudo obtener líder: {error}")
                             st.error(error or "No hay líder disponible")
                         else:
                             try:
+                                print(f"[CLIENT] [CHANGE_PASSWORD] 📍 Líder obtenido: {leader_url}")
+                                print(f"[CLIENT] [CHANGE_PASSWORD] 📤 Enviando petición a {leader_url}/auth/change-password")
                                 response = requests.post(
                                     f"{leader_url}/auth/change-password",
                                     json={
@@ -479,18 +618,27 @@ else:
                                 )
                                 response.raise_for_status()
                                 data = response.json()
+                                elapsed = time.time() - change_pwd_start
                                 if data.get("success"):
+                                    print(f"[CLIENT] [CHANGE_PASSWORD] ✅ Contraseña cambiada exitosamente (tiempo: {elapsed:.2f}s)")
                                     st.success("✅ Contraseña cambiada exitosamente")
                                     st.session_state.show_change_password = False
                                     st.rerun()
                                 else:
+                                    print(f"[CLIENT] [CHANGE_PASSWORD] ❌ Error: respuesta no exitosa (tiempo: {elapsed:.2f}s)")
                                     st.error("Error al cambiar la contraseña")
                             except requests.HTTPError as e:
-                                if e.response and e.response.status_code == 400:
+                                elapsed = time.time() - change_pwd_start
+                                status_code = e.response.status_code if e.response else "unknown"
+                                if status_code == 400:
+                                    print(f"[CLIENT] [CHANGE_PASSWORD] ❌ Contraseña actual incorrecta (tiempo: {elapsed:.2f}s)")
                                     st.error("❌ La contraseña actual es incorrecta")
                                 else:
+                                    print(f"[CLIENT] [CHANGE_PASSWORD] ❌ Error HTTP {status_code}: {e} (tiempo: {elapsed:.2f}s)")
                                     st.error(f"Error: {e}")
                             except requests.RequestException as e:
+                                elapsed = time.time() - change_pwd_start
+                                print(f"[CLIENT] [CHANGE_PASSWORD] ❌ Error de conexión: {e} (tiempo: {elapsed:.2f}s)")
                                 st.error(f"Error de conexión: {e}")
             with col_cancel:
                 if st.button("Cancelar", key="cancel_change_password", use_container_width=True):
@@ -529,17 +677,26 @@ if "files_to_download" not in st.session_state:
 # --- Función para refrescar lista ---
 def refresh_list(tags=None):
     """Obtiene la lista de archivos desde el líder"""
+    import time
+    start_time = time.time()
+    user = st.session_state.logged_in_user or "unknown"
+    filter_info = f"tags={tags}" if tags else "sin filtros"
+    print(f"[CLIENT] [LIST] 📋 Obteniendo lista de archivos (usuario: {user}, {filter_info})")
+    
     leader_url, _ = get_leader_url()
     if not leader_url:
+        print(f"[CLIENT] [LIST] ❌ No se pudo obtener líder")
         return []
     
     if not st.session_state.auth_token:
+        print(f"[CLIENT] [LIST] ❌ No hay token de autenticación")
         return []
     
     try:
         params = {}
         if tags:
             params["tags"] = tags
+        print(f"[CLIENT] [LIST] 📤 Enviando petición a {leader_url}/list con params={params}")
         response = requests.get(
             f"{leader_url}/list",
             params=params,
@@ -548,26 +705,45 @@ def refresh_list(tags=None):
         )
         response.raise_for_status()
         data = response.json()
-        return data.get("files", [])
+        files = data.get("files", [])
+        elapsed = time.time() - start_time
+        print(f"[CLIENT] [LIST] ✅ Lista obtenida: {len(files)} archivos (tiempo: {elapsed:.2f}s)")
+        return files
+    except requests.HTTPError as e:
+        elapsed = time.time() - start_time
+        status_code = e.response.status_code if e.response else "unknown"
+        print(f"[CLIENT] [LIST] ❌ Error HTTP {status_code}: {e} (tiempo: {elapsed:.2f}s)")
+        return []
     except requests.RequestException as e:
-        # No mostrar error aquí, ya se muestra en el expander de conexión
+        elapsed = time.time() - start_time
+        print(f"[CLIENT] [LIST] ❌ Error de conexión: {e} (tiempo: {elapsed:.2f}s)")
         return []
 
-# --- Función para obtener contenido de archivo y guardarlo en downloads ---
+# --- Función para obtener contenido de archivo en memoria ---
 def get_file_content(file_name):
     """
-    Obtiene el contenido de un archivo y lo guarda en la carpeta downloads/.
-    Retorna la ruta del archivo guardado y None si hay error.
+    Obtiene el contenido de un archivo directamente en memoria.
+    Retorna el contenido en bytes y None si hay error.
     """
+    import time
+    start_time = time.time()
+    user = st.session_state.logged_in_user or "unknown"
+    print(f"[CLIENT] [DOWNLOAD] ⬇️  Iniciando descarga: {file_name} (usuario: {user})")
+    
     server_url, _ = get_server_url()
     if not server_url:
+        print(f"[CLIENT] [DOWNLOAD] ❌ No hay servidor disponible")
         return None, "No hay servidor disponible"
     
     try:
         # Obtener la URL del líder para la descarga
         leader_url, leader_error = get_leader_url()
         if not leader_url:
+            print(f"[CLIENT] [DOWNLOAD] ❌ No se pudo obtener líder: {leader_error}")
             return None, f"No se pudo obtener el líder: {leader_error}"
+        
+        print(f"[CLIENT] [DOWNLOAD] 📍 Líder obtenido: {leader_url}")
+        print(f"[CLIENT] [DOWNLOAD] 📤 Enviando petición de descarga a {leader_url}/download/{file_name}")
         
         # Intentar descargar desde el líder, siguiendo redirecciones automáticamente
         r = requests.get(
@@ -579,29 +755,38 @@ def get_file_content(file_name):
         )
         r.raise_for_status()
         
-        # Guardar el archivo en la carpeta downloads/
-        file_path = os.path.join(DOWNLOAD_DIR, file_name)
-        # Asegurar que el directorio existe
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        # Obtener tamaño del archivo si está disponible
+        content_length = r.headers.get('Content-Length')
+        file_size = int(content_length) if content_length else "unknown"
+        print(f"[CLIENT] [DOWNLOAD] 📦 Tamaño del archivo: {file_size} bytes")
         
-        # Guardar el contenido del archivo
-        with open(file_path, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
+        # Leer el contenido directamente en memoria
+        chunks = []
+        for chunk in r.iter_content(chunk_size=8192):
+            if chunk:
+                chunks.append(chunk)
+        file_content = b''.join(chunks)
         
-        print(f"[CLIENT] Archivo guardado en: {file_path}")
-        return file_path, None
+        elapsed = time.time() - start_time
+        print(f"[CLIENT] [DOWNLOAD] ✅ Archivo descargado en memoria: {file_name} ({len(file_content)} bytes, tiempo: {elapsed:.2f}s)")
+        return file_content, None
         
     except requests.HTTPError as e:
+        elapsed = time.time() - start_time
+        status_code = e.response.status_code if e.response else "unknown"
         # Si es un error 503, puede ser que el namenode no sea el líder
-        if e.response and e.response.status_code == 503:
+        if status_code == 503:
+            print(f"[CLIENT] [DOWNLOAD] ❌ Servicio no disponible (503) - El namenode puede no ser el líder (tiempo: {elapsed:.2f}s)")
             return None, f"Servicio no disponible. El namenode puede no ser el líder. Intenta de nuevo."
+        print(f"[CLIENT] [DOWNLOAD] ❌ Error HTTP {status_code}: {e} (tiempo: {elapsed:.2f}s)")
         return None, str(e)
     except requests.RequestException as e:
+        elapsed = time.time() - start_time
+        print(f"[CLIENT] [DOWNLOAD] ❌ Error de conexión: {e} (tiempo: {elapsed:.2f}s)")
         return None, f"Error de conexión: {str(e)}"
-    except IOError as e:
-        return None, f"Error guardando archivo: {str(e)}"
     except Exception as e:
+        elapsed = time.time() - start_time
+        print(f"[CLIENT] [DOWNLOAD] ❌ Error inesperado: {e} (tiempo: {elapsed:.2f}s)")
         return None, f"Error inesperado: {str(e)}"
 
 
@@ -632,14 +817,22 @@ def upload_file_chunked(
     Returns:
         (success, message): Tupla con éxito y mensaje
     """
+    import time
+    start_time = time.time()
     file_size = len(file_bytes)
     file_hash = f"sha256:{calculate_file_hash(file_bytes)}"
+    user = st.session_state.logged_in_user or "unknown"
+    
+    print(f"[CLIENT] [UPLOAD_CHUNKED] 📤 Iniciando upload chunked: {filename}")
+    print(f"[CLIENT] [UPLOAD_CHUNKED] 📊 Tamaño: {file_size:,} bytes, tags: {tags}, usuario: {user}")
+    print(f"[CLIENT] [UPLOAD_CHUNKED] 📍 Líder: {leader_url}")
     
     try:
         # 1. Iniciar sesión de upload
         if progress_callback:
             progress_callback(0, "Iniciando sesión de upload...")
         
+        print(f"[CLIENT] [UPLOAD_CHUNKED] 🔄 Paso 1/4: Iniciando sesión de upload...")
         response = requests.post(
             f"{leader_url}/upload/init",
             data={
@@ -650,59 +843,74 @@ def upload_file_chunked(
                 "chunk_size": CHUNK_SIZE
             },
             headers=get_auth_headers(),
-            timeout=30
+            timeout=2000  # Timeout aumentado a 2000 segundos para archivos grandes
         )
         response.raise_for_status()
         data = response.json()
         
         upload_id = data["upload_id"]
         total_chunks = data["total_chunks"]
+        datanode_urls = data.get("datanode_urls", [])
         
-        print(f"[CLIENT] Sesión de upload creada: {upload_id}, {total_chunks} chunks")
+        print(f"[CLIENT] [UPLOAD_CHUNKED] ✅ Sesión creada: upload_id={upload_id}, total_chunks={total_chunks}, datanodes={len(datanode_urls)}")
         
-        # 2. Verificar chunks ya subidos (para reanudar)
-        uploaded_chunks = set()
+        if not datanode_urls:
+            return False, "No se recibieron URLs de DataNodes para upload directo"
+        
+        # 2. Inicializar sesión en el DataNode primario (solo uno)
+        print(f"[CLIENT] [UPLOAD_CHUNKED] 🔄 Paso 2/4: Inicializando sesión en DataNode primario...")
+        dn_info = datanode_urls[0]  # Solo el primer DataNode
+        dn_url = dn_info["url"]
+        dn_token = dn_info["token"]
+        dn_id = dn_info["datanode_id"]
+        
         try:
-            response = requests.get(
-                f"{leader_url}/upload/{upload_id}/status",
-                headers=get_auth_headers(),
-                timeout=10
+            response = requests.post(
+                f"{dn_url}/client/upload/init",
+                data={
+                    "file_id": file_hash.replace("sha256:", ""),
+                    "total_chunks": total_chunks,
+                    "chunk_size": CHUNK_SIZE,
+                    "file_size": file_size
+                },
+                headers={"Authorization": f"Bearer {dn_token}"},
+                timeout=2000
             )
             response.raise_for_status()
-            data = response.json()
-            uploaded_chunks = set(data["uploaded_chunks"])
-            if uploaded_chunks:
-                print(f"[CLIENT] Reanudando: {len(uploaded_chunks)}/{total_chunks} chunks ya subidos")
-        except Exception:
-            pass  # Si falla, empezar desde cero
+            session_data = response.json()
+            datanode_session = {
+                "session_id": session_data["session_id"],
+                "url": dn_url,
+                "token": dn_token,
+                "datanode_id": dn_id
+            }
+            print(f"[CLIENT] [UPLOAD_CHUNKED] ✅ Sesión iniciada en {dn_id}: {session_data['session_id']}")
+        except Exception as e:
+            return False, f"No se pudo inicializar sesión en DataNode {dn_id}: {e}"
         
-        # 3. Subir chunks
+        # 3. Subir chunks directamente al DataNode primario
+        print(f"[CLIENT] [UPLOAD_CHUNKED] 🔄 Paso 3/4: Subiendo chunks al DataNode primario ({total_chunks} total)...")
+        chunks_uploaded = 0
+        
         for chunk_index in range(total_chunks):
-            # Saltar chunks ya subidos
-            if chunk_index in uploaded_chunks:
-                progress_pct = ((chunk_index + 1) / total_chunks) * 100
-                if progress_callback:
-                    progress_callback(progress_pct, f"Chunk {chunk_index + 1}/{total_chunks} (ya subido)")
-                continue
-            
             # Calcular posición y tamaño del chunk
             start = chunk_index * CHUNK_SIZE
             end = min(start + CHUNK_SIZE, file_size)
             chunk_data = file_bytes[start:end]
             chunk_hash = calculate_file_hash(chunk_data)
             
-            # Subir chunk con reintentos
+            # Subir chunk al DataNode primario con reintentos
             max_retries = 3
             success = False
             
             for retry in range(max_retries):
                 try:
                     response = requests.post(
-                        f"{leader_url}/upload/{upload_id}/chunk/{chunk_index}",
+                        f"{datanode_session['url']}/client/upload/session/{datanode_session['session_id']}/chunk/{chunk_index}",
                         files={"chunk": (f"chunk_{chunk_index}", chunk_data)},
                         data={"chunk_hash": chunk_hash},
-                        headers=get_auth_headers(),
-                        timeout=120
+                        headers={"Authorization": f"Bearer {datanode_session['token']}"},
+                        timeout=2000
                     )
                     response.raise_for_status()
                     success = True
@@ -710,43 +918,96 @@ def upload_file_chunked(
                 except Exception as e:
                     if retry < max_retries - 1:
                         wait_time = 2 ** retry
-                        if progress_callback:
-                            progress_callback(
-                                ((chunk_index) / total_chunks) * 100,
-                                f"Reintentando chunk {chunk_index + 1} en {wait_time}s..."
-                            )
                         time.sleep(wait_time)
                     else:
-                        return False, f"Error en chunk {chunk_index + 1}: {e}"
+                        return False, f"Error subiendo chunk {chunk_index + 1}: {e}"
             
             if not success:
                 return False, f"No se pudo subir chunk {chunk_index + 1}"
             
             # Actualizar progreso
+            chunks_uploaded += 1
             progress_pct = ((chunk_index + 1) / total_chunks) * 100
             if progress_callback:
                 progress_callback(
                     progress_pct,
                     f"Subiendo chunk {chunk_index + 1}/{total_chunks} ({progress_pct:.1f}%)"
                 )
+            if (chunk_index + 1) % 10 == 0 or chunk_index == total_chunks - 1:
+                print(f"[CLIENT] [UPLOAD_CHUNKED] 📊 Progreso: {chunk_index + 1}/{total_chunks} chunks ({progress_pct:.1f}%)")
         
-        # 4. Finalizar upload
+        print(f"[CLIENT] [UPLOAD_CHUNKED] ✅ Todos los chunks subidos: {chunks_uploaded}/{total_chunks}")
+        
+        # 4. Finalizar upload en el DataNode primario
+        print(f"[CLIENT] [UPLOAD_CHUNKED] 🔄 Paso 4/4: Finalizando upload en DataNode primario...")
         if progress_callback:
-            progress_callback(100, "Ensamblando archivo y enviando a DataNodes...")
+            progress_callback(95, "Finalizando upload...")
         
-        response = requests.post(
-            f"{leader_url}/upload/{upload_id}/finalize",
-            headers=get_auth_headers(),
-            timeout=300
-        )
-        response.raise_for_status()
-        data = response.json()
+        finalize_start = time.time()
+        try:
+            response = requests.post(
+                f"{datanode_session['url']}/client/upload/session/{datanode_session['session_id']}/finalize",
+                headers={"Authorization": f"Bearer {datanode_session['token']}"},
+                timeout=2000
+            )
+            response.raise_for_status()
+            result = response.json()
+            print(f"[CLIENT] [UPLOAD_CHUNKED] ✅ Upload finalizado en {dn_id}: {result.get('message', 'OK')}")
+        except requests.HTTPError as e:
+            error_detail = "unknown"
+            if e.response is not None:
+                try:
+                    error_data = e.response.json()
+                    error_detail = error_data.get("detail", str(e))
+                except:
+                    error_detail = e.response.text or str(e)
+            return False, f"Error finalizando upload en {dn_id}: {error_detail}"
+        except Exception as e:
+            return False, f"Error finalizando upload en {dn_id}: {e}"
         
-        return True, f"Archivo subido correctamente (ID: {data['file_id']}, {data['replicas_stored']} réplicas)"
+        # 5. Notificar al NameNode que el upload está completo (replicación eventual se hará después)
+        print(f"[CLIENT] [UPLOAD_CHUNKED] 🔄 Paso 5/5: Notificando al NameNode (replicación eventual después)...")
+        if progress_callback:
+            progress_callback(100, "Completando upload...")
         
+        try:
+            response = requests.post(
+                f"{leader_url}/upload/{upload_id}/finalize",
+                headers=get_auth_headers(),
+                timeout=2000
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            print(f"[CLIENT] [UPLOAD_CHUNKED] ⚠️  Error notificando al NameNode: {e}, pero el archivo ya está en el DataNode primario")
+            # El archivo ya está en el DataNode, así que consideramos el upload exitoso
+            data = {"file_id": "unknown", "replicas_stored": 1}
+        
+        elapsed = time.time() - start_time
+        finalize_time = time.time() - finalize_start
+        file_id = data.get('file_id', 'unknown')
+        replicas = data.get('replicas_stored', 1)
+        
+        print(f"[CLIENT] [UPLOAD_CHUNKED] ✅ Upload completado exitosamente")
+        print(f"[CLIENT] [UPLOAD_CHUNKED] 📊 Resumen: file_id={file_id}, réplicas_iniciales={replicas}, tiempo_total={elapsed:.2f}s, finalización={finalize_time:.2f}s")
+        print(f"[CLIENT] [UPLOAD_CHUNKED] ℹ️  La replicación eventual a otros DataNodes se realizará en background")
+        
+        return True, f"Archivo subido correctamente (ID: {file_id}, replicación eventual en progreso)"
+        
+    except requests.HTTPError as e:
+        elapsed = time.time() - start_time
+        status_code = e.response.status_code if e.response else "unknown"
+        print(f"[CLIENT] [UPLOAD_CHUNKED] ❌ Error HTTP {status_code}: {e} (tiempo: {elapsed:.2f}s)")
+        return False, f"Error de red: {e}"
     except requests.RequestException as e:
+        elapsed = time.time() - start_time
+        print(f"[CLIENT] [UPLOAD_CHUNKED] ❌ Error de conexión: {e} (tiempo: {elapsed:.2f}s)")
         return False, f"Error de red: {e}"
     except Exception as e:
+        elapsed = time.time() - start_time
+        print(f"[CLIENT] [UPLOAD_CHUNKED] ❌ Error inesperado: {e} (tiempo: {elapsed:.2f}s)")
+        import traceback
+        traceback.print_exc()
         return False, f"Error inesperado: {e}"
 
 
@@ -768,7 +1029,17 @@ def upload_file_legacy(
     Returns:
         (success, message): Tupla con éxito y mensaje
     """
+    import time
+    start_time = time.time()
+    file_size = len(file_bytes)
+    user = st.session_state.logged_in_user or "unknown"
+    
+    print(f"[CLIENT] [UPLOAD_LEGACY] 📤 Iniciando upload legacy: {filename}")
+    print(f"[CLIENT] [UPLOAD_LEGACY] 📊 Tamaño: {file_size:,} bytes, tags: {tags}, usuario: {user}")
+    print(f"[CLIENT] [UPLOAD_LEGACY] 📍 Líder: {leader_url}")
+    
     try:
+        print(f"[CLIENT] [UPLOAD_LEGACY] 📤 Enviando archivo completo a {leader_url}/add")
         response = requests.post(
             f"{leader_url}/add",
             files={"file": (filename, file_bytes)},
@@ -779,9 +1050,23 @@ def upload_file_legacy(
         response.raise_for_status()
         data = response.json()
         
-        return True, f"Archivo subido correctamente (ID: {data['file_id']}, {data['replicas_stored']} réplicas)"
+        elapsed = time.time() - start_time
+        file_id = data.get('file_id', 'unknown')
+        replicas = data.get('replicas_stored', 0)
         
+        print(f"[CLIENT] [UPLOAD_LEGACY] ✅ Upload completado exitosamente")
+        print(f"[CLIENT] [UPLOAD_LEGACY] 📊 Resumen: file_id={file_id}, réplicas={replicas}, tiempo={elapsed:.2f}s")
+        
+        return True, f"Archivo subido correctamente (ID: {file_id}, {replicas} réplicas)"
+        
+    except requests.HTTPError as e:
+        elapsed = time.time() - start_time
+        status_code = e.response.status_code if e.response else "unknown"
+        print(f"[CLIENT] [UPLOAD_LEGACY] ❌ Error HTTP {status_code}: {e} (tiempo: {elapsed:.2f}s)")
+        return False, f"Error: {e}"
     except requests.RequestException as e:
+        elapsed = time.time() - start_time
+        print(f"[CLIENT] [UPLOAD_LEGACY] ❌ Error de conexión: {e} (tiempo: {elapsed:.2f}s)")
         return False, f"Error: {e}"
 
 # --- Mostrar lista ---
@@ -971,6 +1256,9 @@ if files:
                 st.warning("Selecciona al menos un archivo.")
             else:
                 # Guardar archivos para descargar fuera del formulario
+                user = st.session_state.logged_in_user or "unknown"
+                print(f"[CLIENT] [DOWNLOAD] 📥 Usuario {user} inició descarga de {len(selected_in_page)} archivo(s)")
+                print(f"[CLIENT] [DOWNLOAD] 📋 Archivos seleccionados: {', '.join(selected_in_page)}")
                 st.session_state.files_to_download = selected_in_page.copy()
                 st.rerun()
 
@@ -979,31 +1267,21 @@ if files:
         st.markdown("### 📥 Descargar archivos seleccionados")
         files_to_remove = []
         for file_name in st.session_state.files_to_download:
-            file_path, error = get_file_content(file_name)
-            if file_path and os.path.exists(file_path):
-                # Leer el archivo desde la carpeta downloads/
-                try:
-                    with open(file_path, 'rb') as f:
-                        file_content = f.read()
-                    
-                    col1, col2 = st.columns([3, 1])
-                    with col1:
-                        st.download_button(
-                            label=f"📥 Descargar {file_name}",
-                            data=file_content,
-                            file_name=file_name,
-                            mime="application/octet-stream",
-                            key=f"download_{file_name}_{page_idx}",
-                            use_container_width=True
-                        )
-                        # Mostrar ruta donde se guardó
-                        st.caption(f"💾 Guardado en: {file_path}")
-                    with col2:
-                        if st.button("❌", key=f"remove_{file_name}_{page_idx}", help="Quitar de la lista"):
-                            files_to_remove.append(file_name)
-                except IOError as e:
-                    st.error(f"❌ Error leyendo archivo guardado '{file_name}': {e}")
-                    files_to_remove.append(file_name)
+            file_content, error = get_file_content(file_name)
+            if file_content:
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.download_button(
+                        label=f"📥 Descargar {file_name}",
+                        data=file_content,
+                        file_name=file_name,
+                        mime="application/octet-stream",
+                        key=f"download_{file_name}_{page_idx}",
+                        use_container_width=True
+                    )
+                with col2:
+                    if st.button("❌", key=f"remove_{file_name}_{page_idx}", help="Quitar de la lista"):
+                        files_to_remove.append(file_name)
             else:
                 st.error(f"❌ Error al obtener '{file_name}': {error}")
                 files_to_remove.append(file_name)
@@ -1141,7 +1419,7 @@ if st.session_state.modal == "add_file":
                                     
                                     if success:
                                         st.success(f"✅ {file.name}: {message}")
-                                    success_count += 1
+                                        success_count += 1
                                     else:
                                         st.error(f"❌ {file.name}: {message}")
                                         error_count += 1
@@ -1192,24 +1470,45 @@ elif st.session_state.modal == "add_tags":
                 elif not new_tags.strip():
                     st.warning("Debes ingresar al menos una nueva etiqueta.")
                 else:
+                    import time
+                    add_tags_start = time.time()
+                    user = st.session_state.logged_in_user or "unknown"
+                    print(f"[CLIENT] [ADD_TAGS] 🔖 Agregando etiquetas (usuario: {user})")
+                    print(f"[CLIENT] [ADD_TAGS] 📋 Query tags: {query_tags}, Nuevas tags: {new_tags}")
+                    
                     leader_url, error = get_leader_url()
                     if not leader_url:
+                        print(f"[CLIENT] [ADD_TAGS] ❌ No se pudo obtener líder: {error}")
                         st.error(error or "No hay líder disponible")
                     else:
                         params = {"query": query_tags, "new_tags": new_tags}
                         try:
+                            print(f"[CLIENT] [ADD_TAGS] 📍 Líder obtenido: {leader_url}")
+                            print(f"[CLIENT] [ADD_TAGS] 📤 Enviando petición a {leader_url}/add-tags con params={params}")
                             response = requests.post(
                                 f"{leader_url}/add-tags",
                                 params=params,
-                                headers=get_auth_headers()
+                                headers=get_auth_headers(),
+                                timeout=30
                             )
                             response.raise_for_status()
                             data = response.json()
+                            elapsed = time.time() - add_tags_start
                             if data.get("success"):
+                                files_affected = data.get("files_affected", 0)
+                                print(f"[CLIENT] [ADD_TAGS] ✅ Etiquetas agregadas exitosamente: {files_affected} archivos afectados (tiempo: {elapsed:.2f}s)")
                                 st.success("Etiquetas agregadas correctamente.")
                             else:
+                                print(f"[CLIENT] [ADD_TAGS] ⚠️  No se encontraron archivos que coincidan (tiempo: {elapsed:.2f}s)")
                                 st.warning("No se encontraron archivos que coincidan.")
+                        except requests.HTTPError as e:
+                            elapsed = time.time() - add_tags_start
+                            status_code = e.response.status_code if e.response else "unknown"
+                            print(f"[CLIENT] [ADD_TAGS] ❌ Error HTTP {status_code}: {e} (tiempo: {elapsed:.2f}s)")
+                            st.error(f"Error: {e}")
                         except requests.RequestException as e:
+                            elapsed = time.time() - add_tags_start
+                            print(f"[CLIENT] [ADD_TAGS] ❌ Error de conexión: {e} (tiempo: {elapsed:.2f}s)")
                             st.error(f"Error: {e}")
                     st.session_state.modal = None
                     st.session_state.refresh_needed = True
@@ -1229,24 +1528,45 @@ elif st.session_state.modal == "del_tags":
                 elif not del_tags.strip():
                     st.warning("Debes ingresar las etiquetas que deseas eliminar.")
                 else:
+                    import time
+                    del_tags_start = time.time()
+                    user = st.session_state.logged_in_user or "unknown"
+                    print(f"[CLIENT] [DELETE_TAGS] 🔖 Eliminando etiquetas (usuario: {user})")
+                    print(f"[CLIENT] [DELETE_TAGS] 📋 Query tags: {query_tags}, Tags a eliminar: {del_tags}")
+                    
                     leader_url, error = get_leader_url()
                     if not leader_url:
+                        print(f"[CLIENT] [DELETE_TAGS] ❌ No se pudo obtener líder: {error}")
                         st.error(error or "No hay líder disponible")
                     else:
                         params = {"query": query_tags, "del_tags": del_tags}
                         try:
+                            print(f"[CLIENT] [DELETE_TAGS] 📍 Líder obtenido: {leader_url}")
+                            print(f"[CLIENT] [DELETE_TAGS] 📤 Enviando petición a {leader_url}/delete-tags con params={params}")
                             response = requests.post(
                                 f"{leader_url}/delete-tags",
                                 params=params,
-                                headers=get_auth_headers()
+                                headers=get_auth_headers(),
+                                timeout=30
                             )
                             response.raise_for_status()
                             data = response.json()
+                            elapsed = time.time() - del_tags_start
                             if data.get("success"):
+                                files_affected = data.get("files_affected", 0)
+                                print(f"[CLIENT] [DELETE_TAGS] ✅ Etiquetas eliminadas exitosamente: {files_affected} archivos afectados (tiempo: {elapsed:.2f}s)")
                                 st.success("Etiquetas eliminadas correctamente.")
                             else:
+                                print(f"[CLIENT] [DELETE_TAGS] ⚠️  No se encontraron archivos que coincidan (tiempo: {elapsed:.2f}s)")
                                 st.warning("No se encontraron archivos que coincidan.")
+                        except requests.HTTPError as e:
+                            elapsed = time.time() - del_tags_start
+                            status_code = e.response.status_code if e.response else "unknown"
+                            print(f"[CLIENT] [DELETE_TAGS] ❌ Error HTTP {status_code}: {e} (tiempo: {elapsed:.2f}s)")
+                            st.error(f"Error: {e}")
                         except requests.RequestException as e:
+                            elapsed = time.time() - del_tags_start
+                            print(f"[CLIENT] [DELETE_TAGS] ❌ Error de conexión: {e} (tiempo: {elapsed:.2f}s)")
                             st.error(f"Error: {e}")
                     st.session_state.modal = None
                     st.session_state.refresh_needed = True
@@ -1263,24 +1583,45 @@ elif st.session_state.modal == "del_files":
                 if not tags.strip():
                     st.warning("Debes ingresar las etiquetas de los archivos que deseas eliminar.")
                 else:
+                    import time
+                    del_files_start = time.time()
+                    user = st.session_state.logged_in_user or "unknown"
+                    print(f"[CLIENT] [DELETE_FILES] 🗑️  Eliminando archivos (usuario: {user})")
+                    print(f"[CLIENT] [DELETE_FILES] 📋 Tags: {tags}")
+                    
                     leader_url, error = get_leader_url()
                     if not leader_url:
+                        print(f"[CLIENT] [DELETE_FILES] ❌ No se pudo obtener líder: {error}")
                         st.error(error or "No hay líder disponible")
                     else:
                         params = {"tags": tags}
                         try:
+                            print(f"[CLIENT] [DELETE_FILES] 📍 Líder obtenido: {leader_url}")
+                            print(f"[CLIENT] [DELETE_FILES] 📤 Enviando petición DELETE a {leader_url}/delete con params={params}")
                             response = requests.delete(
                                 f"{leader_url}/delete",
                                 params=params,
-                                headers=get_auth_headers()
+                                headers=get_auth_headers(),
+                                timeout=60
                             )
                             response.raise_for_status()
                             data = response.json()
+                            elapsed = time.time() - del_files_start
                             if data.get("success"):
+                                files_deleted = data.get("files_deleted", 0)
+                                print(f"[CLIENT] [DELETE_FILES] ✅ Archivos eliminados exitosamente: {files_deleted} archivos (tiempo: {elapsed:.2f}s)")
                                 st.success("Archivos eliminados correctamente.")
                             else:
+                                print(f"[CLIENT] [DELETE_FILES] ⚠️  No se encontraron archivos con esas etiquetas (tiempo: {elapsed:.2f}s)")
                                 st.warning("No se encontraron archivos con esas etiquetas.")
+                        except requests.HTTPError as e:
+                            elapsed = time.time() - del_files_start
+                            status_code = e.response.status_code if e.response else "unknown"
+                            print(f"[CLIENT] [DELETE_FILES] ❌ Error HTTP {status_code}: {e} (tiempo: {elapsed:.2f}s)")
+                            st.error(f"Error: {e}")
                         except requests.RequestException as e:
+                            elapsed = time.time() - del_files_start
+                            print(f"[CLIENT] [DELETE_FILES] ❌ Error de conexión: {e} (tiempo: {elapsed:.2f}s)")
                             st.error(f"Error: {e}")
                     st.session_state.modal = None
                     st.session_state.refresh_needed = True

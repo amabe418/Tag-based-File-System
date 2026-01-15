@@ -162,11 +162,14 @@ cluster_lock = threading.Lock()
 # Configuración
 HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", "30"))
 LEADER_HEARTBEAT_INTERVAL = int(os.getenv("LEADER_HEARTBEAT_INTERVAL", "5"))
-ELECTION_TIMEOUT = int(os.getenv("ELECTION_TIMEOUT", "15"))
+ELECTION_TIMEOUT = int(os.getenv("ELECTION_TIMEOUT", "30"))  # Aumentado de 15s a 30s para reducir falsos positivos
 NAMENODE_PORT = int(os.getenv("NAMENODE_PORT", "8010"))
 # Configuración de Gossip
 GOSSIP_INTERVAL = int(os.getenv("GOSSIP_INTERVAL", "5"))  # Intervalo entre rondas de gossip (segundos)
 GOSSIP_FANOUT = int(os.getenv("GOSSIP_FANOUT", "2"))  # Número de peers a contactar en cada ronda
+# Timeout para marcar peers como suspected/dead (aumentado para reducir falsos positivos)
+PEER_FAILURE_TIMEOUT = int(os.getenv("PEER_FAILURE_TIMEOUT", "60"))  # Aumentado de 30s a 60s
+HEARTBEAT_REQUEST_TIMEOUT = int(os.getenv("HEARTBEAT_REQUEST_TIMEOUT", "5"))  # Aumentado de 2s a 5s
 
 # Parsear lista de peers desde variable de entorno
 PEERS_ENV = os.getenv("PEERS", "")
@@ -248,15 +251,15 @@ def save_operation_to_log(operation: OperationLog, node_id: str = None):
     Fase 2: Log persistente para reconciliación después de particionamiento.
     """
     import json
-    from namenode.database import get_db_path, get_connection, close_connection, db_lock
+    from namenode.database import get_operations_db_path, get_connection, close_connection, operations_db_lock
     
     if node_id is None:
         node_id = NODE_ID
     
-    db_path = get_db_path(node_id)
+    db_path = get_operations_db_path(node_id)
     
-    with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id)
+    with operations_db_lock:
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id, db_type="operations")
         try:
             cursor.execute("""
                 INSERT INTO operation_log (operation, data, term, timestamp, node_id)
@@ -282,16 +285,16 @@ def load_operation_log(node_id: str = None) -> List[OperationLog]:
     Fase 2: Cargar log al iniciar para reconstruir estado.
     """
     import json
-    from namenode.database import get_db_path, get_connection, close_connection, db_lock
+    from namenode.database import get_operations_db_path, get_connection, close_connection, operations_db_lock
     
     if node_id is None:
         node_id = NODE_ID
     
-    db_path = get_db_path(node_id)
+    db_path = get_operations_db_path(node_id)
     operations = []
     
-    with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id)
+    with operations_db_lock:
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id, db_type="operations")
         try:
             cursor.execute("""
                 SELECT operation, data, term, timestamp, node_id
@@ -385,14 +388,14 @@ def update_peer_status(peer_id: str, alive: bool):
         else:
             # Si ha pasado mucho tiempo sin ver al peer, marcarlo como suspected o dead
             time_since_seen = time.time() - peer_info["last_seen"]
-            PEER_FAILURE_TIMEOUT = 30  # 30 segundos
+            # Usar el timeout configurado globalmente (60s por defecto)
             if time_since_seen > PEER_FAILURE_TIMEOUT:
                 if peer_info["status"] == "alive":
                     peer_info["status"] = "suspected"
-                    print(f"[NAMENODE] [GOSSIP] Peer {peer_id} marcado como suspected (sin contacto por {time_since_seen:.1f}s)")
+                    print(f"[NAMENODE] [GOSSIP] Peer {peer_id} marcado como suspected (sin contacto por {time_since_seen:.1f}s, timeout={PEER_FAILURE_TIMEOUT}s)")
                 elif peer_info["status"] == "suspected" and time_since_seen > (PEER_FAILURE_TIMEOUT * 2):
                     peer_info["status"] = "dead"
-                    print(f"[NAMENODE] [GOSSIP] Peer {peer_id} marcado como dead (sin contacto por {time_since_seen:.1f}s)")
+                    print(f"[NAMENODE] [GOSSIP] Peer {peer_id} marcado como dead (sin contacto por {time_since_seen:.1f}s, timeout={PEER_FAILURE_TIMEOUT * 2}s)")
     
     # Disparar reconciliación si se detectó reunificación
     if reunited_peers:
@@ -655,18 +658,77 @@ def gossip_loop():
                             leader_status = cluster_state["peer_status"][leader_id].get("status")
                             time_since_seen = time.time() - cluster_state["peer_status"][leader_id].get("last_seen", 0)
                             
-                            # Si el líder está marcado como "dead" o ha estado "suspected" por mucho tiempo
+                            # ANTES de iniciar elección, verificar directamente si el líder responde
+                            # Esto previene falsos positivos de gossip
+                            should_start_election = False
+                            
                             if leader_status == "dead":
-                                print(f"[NAMENODE] [GOSSIP] 🗳️  Líder {leader_id} detectado como dead mediante gossip, iniciando elección...")
-                                cluster_state["leader_id"] = None
-                                cluster_state["last_heartbeat_time"] = 0
-                                # Iniciar elección en un hilo separado para no bloquear gossip
-                                threading.Thread(target=start_election, daemon=True).start()
+                                # Verificar directamente antes de iniciar elección
+                                print(f"[NAMENODE] [GOSSIP] ⚠️  Líder {leader_id} detectado como dead mediante gossip ({time_since_seen:.1f}s), verificando directamente...")
+                                try:
+                                    leader_url = get_peer_url(leader_id)
+                                    response = requests.get(f"{leader_url}/", timeout=3)
+                                    if response.status_code == 200:
+                                        data = response.json()
+                                        if data.get("is_leader"):
+                                            # El líder está vivo, actualizar estado
+                                            print(f"[NAMENODE] [GOSSIP] ✅ Líder {leader_id} está vivo, actualizando estado en gossip")
+                                            update_peer_status(leader_id, True)
+                                            with cluster_lock:
+                                                cluster_state["last_heartbeat_time"] = time.time()
+                                            should_start_election = False
+                                        else:
+                                            should_start_election = True
+                                    else:
+                                        should_start_election = True
+                                except Exception as e:
+                                    # Solo iniciar elección si ha pasado mucho tiempo
+                                    if time_since_seen > (PEER_FAILURE_TIMEOUT * 2):
+                                        print(f"[NAMENODE] [GOSSIP] ❌ Líder {leader_id} no responde después de {time_since_seen:.1f}s: {e}")
+                                        should_start_election = True
+                                    else:
+                                        print(f"[NAMENODE] [GOSSIP] ⚠️  Líder {leader_id} no responde temporalmente, esperando más tiempo...")
+                                        should_start_election = False
+                                
+                                if should_start_election:
+                                    print(f"[NAMENODE] [GOSSIP] 🗳️  Líder {leader_id} confirmado como dead, iniciando elección...")
+                                    cluster_state["leader_id"] = None
+                                    cluster_state["last_heartbeat_time"] = 0
+                                    threading.Thread(target=start_election, daemon=True).start()
+                            
                             elif leader_status == "suspected" and time_since_seen > (ELECTION_TIMEOUT * 1.5):
-                                print(f"[NAMENODE] [GOSSIP] 🗳️  Líder {leader_id} suspected por {time_since_seen:.1f}s, iniciando elección...")
-                                cluster_state["leader_id"] = None
-                                cluster_state["last_heartbeat_time"] = 0
-                                threading.Thread(target=start_election, daemon=True).start()
+                                # Verificar directamente antes de iniciar elección
+                                print(f"[NAMENODE] [GOSSIP] ⚠️  Líder {leader_id} suspected por {time_since_seen:.1f}s, verificando directamente...")
+                                try:
+                                    leader_url = get_peer_url(leader_id)
+                                    response = requests.get(f"{leader_url}/", timeout=3)
+                                    if response.status_code == 200:
+                                        data = response.json()
+                                        if data.get("is_leader"):
+                                            # El líder está vivo, actualizar estado
+                                            print(f"[NAMENODE] [GOSSIP] ✅ Líder {leader_id} está vivo, actualizando estado en gossip")
+                                            update_peer_status(leader_id, True)
+                                            with cluster_lock:
+                                                cluster_state["last_heartbeat_time"] = time.time()
+                                            should_start_election = False
+                                        else:
+                                            should_start_election = True
+                                    else:
+                                        should_start_election = True
+                                except Exception as e:
+                                    # Solo iniciar elección si ha pasado mucho tiempo
+                                    if time_since_seen > (ELECTION_TIMEOUT * 2):
+                                        print(f"[NAMENODE] [GOSSIP] ❌ Líder {leader_id} no responde después de {time_since_seen:.1f}s: {e}")
+                                        should_start_election = True
+                                    else:
+                                        print(f"[NAMENODE] [GOSSIP] ⚠️  Líder {leader_id} no responde temporalmente, esperando más tiempo...")
+                                        should_start_election = False
+                                
+                                if should_start_election:
+                                    print(f"[NAMENODE] [GOSSIP] 🗳️  Líder {leader_id} confirmado como inaccesible, iniciando elección...")
+                                    cluster_state["leader_id"] = None
+                                    cluster_state["last_heartbeat_time"] = 0
+                                    threading.Thread(target=start_election, daemon=True).start()
                 
         except Exception as e:
             print(f"[NAMENODE] [GOSSIP] ⚠️  Error en gossip loop: {type(e).__name__}: {e}")
@@ -1793,7 +1855,7 @@ def leader_heartbeat_loop():
                         "active_followers": []  # Se actualizará después
                     },
                     headers={"Authorization": f"Bearer {service_token}"},
-                    timeout=2
+                    timeout=HEARTBEAT_REQUEST_TIMEOUT  # Usar timeout configurado (5s por defecto)
                 )
                 if response.status_code == 200:
                     update_peer_status(peer, True)
@@ -1818,12 +1880,16 @@ def leader_heartbeat_loop():
                         "active_followers": active_followers
                     },
                     headers={"Authorization": f"Bearer {service_token}"},
-                    timeout=2
+                    timeout=HEARTBEAT_REQUEST_TIMEOUT  # Usar timeout configurado (5s por defecto)
                 )
                 if response.status_code == 200:
                     update_peer_status(peer, True)
             except Exception:
                 update_peer_status(peer, False)
+        
+        # IMPORTANTE: El líder debe actualizar su propio estado en peer_status
+        # Esto previene que los seguidores lo marquen como "dead" en gossip
+        update_peer_status(leader_id, True)
         
         with cluster_lock:
             cluster_state["last_heartbeat_time"] = time.time()
@@ -1866,13 +1932,50 @@ def follower_heartbeat_check():
                 leader_status = cluster_state["peer_status"][leader_id].get("status")
         
         # Verificar si el líder está marcado como "dead" o "suspected" en gossip
+        # PERO verificar directamente antes de iniciar elección para evitar falsos positivos
         if leader_id and leader_status in ["dead", "suspected"]:
-            print(f"[NAMENODE] ⚠️  Líder {leader_id} detectado como {leader_status} mediante gossip, iniciando elección...")
-            with cluster_lock:
-                cluster_state["leader_id"] = None
-                cluster_state["last_heartbeat_time"] = 0  # Resetear para forzar elección
-            start_election()
-            continue
+            print(f"[NAMENODE] ⚠️  Líder {leader_id} detectado como {leader_status} mediante gossip, verificando directamente...")
+            # Verificar directamente si el líder responde antes de iniciar elección
+            try:
+                leader_url = get_peer_url(leader_id)
+                response = requests.get(f"{leader_url}/", timeout=3)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("is_leader"):
+                        # El líder está vivo, actualizar estado
+                        print(f"[NAMENODE] ✅ Líder {leader_id} está vivo, actualizando estado en gossip")
+                        update_peer_status(leader_id, True)
+                        with cluster_lock:
+                            cluster_state["last_heartbeat_time"] = time.time()
+                        continue
+                    else:
+                        print(f"[NAMENODE] ❌ Líder {leader_id} no es líder según su respuesta")
+                        with cluster_lock:
+                            cluster_state["leader_id"] = None
+                            cluster_state["last_heartbeat_time"] = 0
+                        start_election()
+                        continue
+                else:
+                    print(f"[NAMENODE] ❌ Líder {leader_id} no responde correctamente (HTTP {response.status_code})")
+                    with cluster_lock:
+                        cluster_state["leader_id"] = None
+                        cluster_state["last_heartbeat_time"] = 0
+                    start_election()
+                    continue
+            except Exception as e:
+                # Solo iniciar elección si ha pasado mucho tiempo sin contacto
+                time_since_seen = time.time() - cluster_state["peer_status"][leader_id].get("last_seen", 0)
+                if time_since_seen > (PEER_FAILURE_TIMEOUT * 2):
+                    print(f"[NAMENODE] ❌ Líder {leader_id} inaccesible después de {time_since_seen:.1f}s: {e}")
+                    print(f"[NAMENODE] 🗳️  Iniciando elección...")
+                    with cluster_lock:
+                        cluster_state["leader_id"] = None
+                        cluster_state["last_heartbeat_time"] = 0
+                    start_election()
+                    continue
+                else:
+                    print(f"[NAMENODE] ⚠️  Líder {leader_id} no responde temporalmente ({time_since_seen:.1f}s), esperando más tiempo...")
+                    continue
         
         if leader_id:
             # Si han pasado más de ELECTION_TIMEOUT sin heartbeat, verificar conectividad
@@ -1948,10 +2051,12 @@ async def lifespan(app: FastAPI):
     print(f"[NAMENODE] 🚀 Nodo iniciado: {node_id}")
     print(f"[NAMENODE] ⏱️  [CONFIG] Tiempos de reconciliación configurados:")
     print(f"[NAMENODE] ⏱️  [CONFIG]   - GOSSIP_INTERVAL: {GOSSIP_INTERVAL}s (intervalo entre rondas de gossip)")
-    print(f"[NAMENODE] ⏱️  [CONFIG]   - PEER_FAILURE_TIMEOUT: 30s (tiempo para marcar como suspected)")
-    print(f"[NAMENODE] ⏱️  [CONFIG]   - PEER_DEAD_TIMEOUT: 60s (tiempo para marcar como dead)")
+    print(f"[NAMENODE] ⏱️  [CONFIG]   - PEER_FAILURE_TIMEOUT: {PEER_FAILURE_TIMEOUT}s (tiempo para marcar como suspected)")
+    print(f"[NAMENODE] ⏱️  [CONFIG]   - PEER_DEAD_TIMEOUT: {PEER_FAILURE_TIMEOUT * 2}s (tiempo para marcar como dead)")
+    print(f"[NAMENODE] ⏱️  [CONFIG]   - HEARTBEAT_REQUEST_TIMEOUT: {HEARTBEAT_REQUEST_TIMEOUT}s (timeout para peticiones de heartbeat)")
+    print(f"[NAMENODE] ⏱️  [CONFIG]   - ELECTION_TIMEOUT: {ELECTION_TIMEOUT}s (tiempo sin heartbeat antes de iniciar elección)")
     print(f"[NAMENODE] ⏱️  [CONFIG]   - Tiempo mínimo para detectar reunificación: ~5s (próximo gossip)")
-    print(f"[NAMENODE] ⏱️  [CONFIG]   - Tiempo para marcar peer como dead: 60s sin contacto")
+    print(f"[NAMENODE] ⏱️  [CONFIG]   - Tiempo para marcar peer como dead: {PEER_FAILURE_TIMEOUT * 2}s sin contacto")
     print(f"[NAMENODE] ⏱️  [CONFIG]   - Tiempo esperado para reconciliación completa: 10-30s (depende de operaciones)")
     
     with cluster_lock:
@@ -2064,9 +2169,71 @@ async def lifespan(app: FastAPI):
     gossip_thread.start()
     print(f"[NAMENODE] [GOSSIP] Loop de gossip iniciado (interval={GOSSIP_INTERVAL}s, fanout={GOSSIP_FANOUT})")
     
+    # Inicializar OperationStateManager para persistencia de operaciones
+    from namenode.operation_state_manager import init_operation_state_manager
+    op_state_manager = init_operation_state_manager(cluster_state["node_id"])
+    
+    # Inicializar cache de DataNodes (pre-cargar desde BD)
+    from namenode.datanode_cache import get_datanode_cache
+    datanode_cache = get_datanode_cache(node_id_db=cluster_state["node_id"])
+    datanode_cache.refresh_now()  # Pre-cargar todos los DataNodes
+    print(f"[NAMENODE] ✅ Cache de DataNodes inicializado")
+    print(f"[NAMENODE] [OPERATION_STATE] Manager de estado persistente inicializado")
+    
+    # Conectar ChunkedUploadManager con OperationStateManager
+    chunked_upload_manager.set_operation_manager(op_state_manager)
+    chunked_upload_manager.node_id = cluster_state["node_id"]
+    
+    # Recuperar sesiones de upload incompletas (en hilo separado para no bloquear startup)
+    def recover_sessions_async():
+        """Recupera sesiones en un hilo separado para no bloquear el startup"""
+        try:
+            print(f"[NAMENODE] [RECOVERY] Recuperando sesiones de upload incompletas...")
+            recovered_sessions = chunked_upload_manager.recover_all_sessions()
+            if recovered_sessions:
+                print(f"[NAMENODE] [RECOVERY] ✅ {len(recovered_sessions)} sesiones de upload recuperadas")
+                for session in recovered_sessions:
+                    print(f"  - {session.upload_id}: {len(session.uploaded_chunks)}/{session.total_chunks} chunks recibidos")
+            else:
+                print(f"[NAMENODE] [RECOVERY] No hay sesiones incompletas para recuperar")
+        except Exception as e:
+            print(f"[NAMENODE] [RECOVERY] ⚠️  Error recuperando sesiones: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    recovery_thread = threading.Thread(target=recover_sessions_async, daemon=True)
+    recovery_thread.start()
+    
     # Iniciar limpieza automática de uploads antiguos
     chunked_upload_manager.start_cleanup_thread(max_age_hours=24)
     print(f"[NAMENODE] [CHUNKED_UPLOAD] Manager iniciado con limpieza automática (24h)")
+    
+    # Iniciar limpieza automática de operaciones antiguas y huérfanas
+    def cleanup_operations_loop():
+        """Limpia operaciones completadas antiguas cada 6 horas y huérfanas cada 30 minutos"""
+        last_full_cleanup = time.time()
+        while True:
+            time.sleep(30 * 60)  # 30 minutos
+            if is_leader():
+                try:
+                    # Limpiar operaciones huérfanas (cada 30 min)
+                    op_state_manager.cleanup_orphaned_operations(inactivity_timeout_minutes=10)
+                except Exception as e:
+                    print(f"[NAMENODE] Error limpiando operaciones huérfanas: {e}")
+            
+            # Limpiar operaciones antiguas cada 6 horas
+            current_time = time.time()
+            if current_time - last_full_cleanup >= 6 * 3600:
+                if is_leader():
+                    try:
+                        op_state_manager.cleanup_old_operations(max_age_hours=24, completed_only=True)
+                        last_full_cleanup = current_time
+                    except Exception as e:
+                        print(f"[NAMENODE] Error en limpieza de operaciones antiguas: {e}")
+    
+    cleanup_thread = threading.Thread(target=cleanup_operations_loop, daemon=True, name="operation-cleanup")
+    cleanup_thread.start()
+    print(f"[NAMENODE] [OPERATION_STATE] Hilo de limpieza de operaciones iniciado")
     
     # Hilo para monitorear DataNodes inactivos y re-replicar archivos (solo en el líder)
     def datanode_monitor_loop():
@@ -2115,9 +2282,17 @@ async def lifespan(app: FastAPI):
     datanode_monitor_thread = threading.Thread(target=datanode_monitor_loop, daemon=True)
     datanode_monitor_thread.start()
     
-    # Intentar elección inicial después de un delay
-    time.sleep(5)
-    start_election()
+    # Intentar elección inicial después de un delay (en hilo separado para no bloquear startup)
+    def delayed_startup_election():
+        """Inicia elección después de un delay, sin bloquear el startup"""
+        time.sleep(5)
+        print(f"[NAMENODE] [STARTUP] Iniciando elección inicial después de delay...")
+        start_election()
+    
+    startup_election_thread = threading.Thread(target=delayed_startup_election, daemon=True)
+    startup_election_thread.start()
+    
+    print(f"[NAMENODE] [STARTUP] ✅ Startup completado, todos los hilos iniciados")
     
     yield
     
@@ -2701,12 +2876,13 @@ def init_chunked_upload(
     file_hash: str = Form(...),
     file_size: int = Form(...),
     tags: str = Form(...),
-    chunk_size: int = Form(10 * 1024 * 1024),  # 10 MB por defecto
+    chunk_size: int = Form(5 * 1024 * 1024),  # 5 MB por defecto
     current_user: User = Depends(require_permission(Permission.WRITE_FILES))
 ):
     """
     Inicia una sesión de upload por chunks.
     Permite subir archivos grandes dividiéndolos en bloques.
+    Ahora devuelve URLs de DataNodes para upload directo.
     """
     print(f"[NAMENODE] POST /upload/init: filename={filename}, size={file_size}, chunks={chunk_size}")
     
@@ -2735,6 +2911,20 @@ def init_chunked_upload(
     if not is_leader():
         raise HTTPException(status_code=503, detail="No hay líder disponible")
     
+    # Asignar UN SOLO DataNode para la carga inicial (replicación eventual después)
+    file_hash_clean = file_hash.replace("sha256:", "")
+    datanode_ids = assign_replicas(file_hash_clean, file_size, node_id_db=NODE_ID)
+    
+    if not datanode_ids:
+        raise HTTPException(
+            status_code=503,
+            detail="No hay DataNodes disponibles"
+        )
+    
+    # Usar solo el PRIMER DataNode para la carga inicial
+    primary_datanode_id = datanode_ids[0]
+    print(f"[NAMENODE] Asignando DataNode primario para carga: {primary_datanode_id} (replicación eventual después)")
+    
     # Crear sesión de upload
     upload_id = str(uuid.uuid4())
     
@@ -2749,11 +2939,41 @@ def init_chunked_upload(
             user_id=current_user.username
         )
         
+        # Generar token temporal y URL para UN SOLO DataNode
+        from security.service_auth import generate_client_upload_token
+        from namenode.datanode_manager import get_datanode
+        
+        dn_info = get_datanode(primary_datanode_id, node_id_db=NODE_ID)
+        if not dn_info:
+            raise HTTPException(
+                status_code=503,
+                detail=f"DataNode {primary_datanode_id} no encontrado"
+            )
+        
+        url = dn_info["url"]
+        if not url.startswith("http"):
+            url = f"http://{url}:{dn_info['port']}"
+        
+        # Generar token temporal (válido por 15 minutos)
+        token = generate_client_upload_token(
+            user_id=current_user.username,
+            file_hash=file_hash_clean,
+            datanode_id=primary_datanode_id,
+            expires_minutes=15
+        )
+        
+        datanode_urls = [{
+            "datanode_id": primary_datanode_id,
+            "url": url,
+            "token": token
+        }]
+        
         return {
             "upload_id": upload_id,
             "total_chunks": session.total_chunks,
             "chunk_size": chunk_size,
-            "message": f"Sesión de upload creada. Envía {session.total_chunks} chunks."
+            "datanode_urls": datanode_urls,
+            "message": f"Sesión de upload creada. Sube {session.total_chunks} chunks directamente a los DataNodes."
         }
     except Exception as e:
         print(f"[NAMENODE] Error creando sesión de upload: {e}")
@@ -2786,8 +3006,13 @@ def get_upload_status(
         raise HTTPException(status_code=503, detail="No hay líder disponible")
     
     session = chunked_upload_manager.get_session(upload_id)
+    
+    # Si no está en memoria, intentar recuperar desde estado persistente
     if not session:
-        raise HTTPException(status_code=404, detail="Sesión de upload no encontrada")
+        print(f"[NAMENODE] Sesión {upload_id} no en memoria, intentando recuperar desde BD...")
+        session = chunked_upload_manager.recover_session(upload_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Sesión de upload no encontrada")
     
     # Verificar que el usuario es el dueño de la sesión
     if session.user_id != current_user.username:
@@ -2835,8 +3060,13 @@ async def upload_chunk(
         raise HTTPException(status_code=503, detail="No hay líder disponible")
     
     session = chunked_upload_manager.get_session(upload_id)
+    
+    # Si no está en memoria, intentar recuperar desde estado persistente
     if not session:
-        raise HTTPException(status_code=404, detail="Sesión de upload no encontrada")
+        print(f"[NAMENODE] Sesión {upload_id} no en memoria, intentando recuperar desde BD...")
+        session = chunked_upload_manager.recover_session(upload_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Sesión de upload no encontrada")
     
     # Verificar que el usuario es el dueño de la sesión
     if session.user_id != current_user.username:
@@ -2869,7 +3099,8 @@ async def finalize_chunked_upload(
     current_user: User = Depends(require_permission(Permission.WRITE_FILES))
 ):
     """
-    Finaliza el upload: ensambla los chunks y envía el archivo a los DataNodes.
+    Finaliza el upload: valida que el archivo está en los DataNodes y actualiza metadatos.
+    El archivo ya fue subido directamente por el cliente a los DataNodes.
     """
     # Redirigir al líder si no somos el líder
     leader_url = get_leader_url()
@@ -2888,32 +3119,22 @@ async def finalize_chunked_upload(
         raise HTTPException(status_code=503, detail="No hay líder disponible")
     
     session = chunked_upload_manager.get_session(upload_id)
+    
+    # Si no está en memoria, intentar recuperar desde estado persistente
     if not session:
-        raise HTTPException(status_code=404, detail="Sesión de upload no encontrada")
+        print(f"[NAMENODE] Sesión {upload_id} no en memoria, intentando recuperar desde BD...")
+        session = chunked_upload_manager.recover_session(upload_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Sesión de upload no encontrada")
     
     # Verificar que el usuario es el dueño de la sesión
     if session.user_id != current_user.username:
         raise HTTPException(status_code=403, detail="No autorizado para esta sesión")
     
-    # Verificar que todos los chunks están presentes
-    if not session.is_complete:
-        missing = session.total_chunks - len(session.uploaded_chunks)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Upload incompleto: faltan {missing} chunks de {session.total_chunks}"
-        )
-    
-    # Ensamblar archivo
-    print(f"[NAMENODE] Ensamblando archivo {session.filename} ({session.total_chunks} chunks)...")
-    file_content = chunked_upload_manager.assemble_file(upload_id)
-    
-    if not file_content:
-        raise HTTPException(status_code=500, detail="Error ensamblando archivo o hash no coincide")
-    
-    file_size = len(file_content)
+    file_size = session.file_size
     file_hash = session.file_hash.replace("sha256:", "")
     
-    print(f"[NAMENODE] Archivo ensamblado: {file_size} bytes, hash verificado")
+    print(f"[NAMENODE] Finalizando upload: {session.filename} ({file_size:,} bytes, hash: {file_hash[:16]}...)")
     
     # Parsear tags
     tag_list = [t.strip() for t in session.tags.split(",") if t.strip()]
@@ -2933,90 +3154,110 @@ async def finalize_chunked_upload(
     )
     
     if not file_id:
-        chunked_upload_manager.cleanup_session(upload_id)
+        # Marcar como fallida en estado persistente
+        from namenode.operation_state_manager import get_operation_state_manager
+        try:
+            op_manager = get_operation_state_manager()
+            op_manager.complete_operation(upload_id, success=False)
+            op_manager.update_progress(upload_id, {'error': 'No se pudo agregar metadatos'})
+        except:
+            pass
+        chunked_upload_manager.cleanup_session(upload_id, mark_completed=False)
         raise HTTPException(status_code=400, detail="No se pudo agregar metadatos")
     
-    # Asignar réplicas a DataNodes
-    datanode_ids = assign_replicas(file_hash, file_size, node_id_db=NODE_ID)
+    # Obtener los DataNodes donde el cliente subió el archivo (de la sesión o descubrir)
+    from namenode.datanode_manager import get_datanode, discover_file_replicas
     
-    if not datanode_ids:
-        delete_file_metadata(file_id, node_id=NODE_ID)
-        chunked_upload_manager.cleanup_session(upload_id)
-        raise HTTPException(
-            status_code=503,
-            detail="No hay suficientes DataNodes disponibles"
-        )
+    # Intentar descubrir en qué DataNodes está el archivo
+    discovered_replicas = discover_file_replicas(file_hash, file_id, node_id_db=NODE_ID)
     
-    # Enviar archivo a DataNodes (usando chunked transfer para archivos grandes)
-    from namenode.datanode_manager import get_datanode
+    # Obtener lista completa de DataNodes asignados para replicación eventual
+    all_assigned_datanodes = assign_replicas(file_hash, file_size, node_id_db=NODE_ID)
     
-    success_count = 0
-    successful_datanodes = []
-    min_required_replicas = min(2, len(datanode_ids))
+    if not discovered_replicas:
+        # Si no se puede descubrir, usar los DataNodes asignados originalmente
+        if not all_assigned_datanodes:
+            delete_file_metadata(file_id, node_id=NODE_ID)
+            chunked_upload_manager.cleanup_session(upload_id, mark_completed=False)
+            raise HTTPException(
+                status_code=503,
+                detail="No se pudo encontrar el archivo en ningún DataNode"
+            )
+        successful_datanodes = [all_assigned_datanodes[0]]  # Solo el primario está confirmado
+    else:
+        successful_datanodes = [r["datanode_id"] for r in discovered_replicas]
     
-    # Determinar si usar chunked transfer (para archivos > 50 MB)
-    use_chunked_transfer = file_size > (50 * 1024 * 1024)
-    
-    if use_chunked_transfer:
-        print(f"[NAMENODE] Usando chunked transfer para archivo grande ({file_size:,} bytes)")
-    
-    for dn_id in datanode_ids:
-        dn_info = get_datanode(dn_id, node_id_db=NODE_ID)
-        if not dn_info:
-            continue
-        
-        url = dn_info["url"]
-        if not url.startswith("http"):
-            url = f"http://{url}:{dn_info['port']}"
-        
-        try:
-            # Generar token de servicio
-            try:
-                service_token = generate_service_token(cluster_state["node_id"], "service")
-            except Exception:
-                service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
-            
-            print(f"[NAMENODE] Enviando archivo a {dn_id}...")
-            
-            # Enviar por chunks o legacy según el tamaño
-            if use_chunked_transfer:
-                success, message = send_file_to_datanode_chunked(
-                    datanode_url=url,
-                    file_id=file_hash,
-                    file_content=file_content,
-                    service_token=service_token
-                )
-            else:
-                success, message = send_file_to_datanode_legacy(
-                    datanode_url=url,
-                    file_id=file_hash,
-                    filename=session.filename,
-                    file_content=file_content,
-                    service_token=service_token
-                )
-            
-            if success:
-                print(f"[NAMENODE] ✓ Archivo enviado exitosamente a {dn_id}: {message}")
-                success_count += 1
-                successful_datanodes.append(dn_id)
-            else:
-                print(f"[NAMENODE] ✗ Error enviando a {dn_id}: {message}")
-            
-        except Exception as e:
-            print(f"[NAMENODE] Error enviando a {dn_id}: {e}")
-    
-    # Verificar que se guardó en suficientes DataNodes
-    if success_count < min_required_replicas:
-        # Rollback
-        delete_file_metadata(file_id, node_id=NODE_ID)
-        chunked_upload_manager.cleanup_session(upload_id)
-        raise HTTPException(
-            status_code=507,
-            detail=f"Solo se almacenó en {success_count} DataNodes (mínimo: {min_required_replicas})"
-        )
-    
-    # Guardar asignación de réplicas
+    # Guardar asignación de réplicas (solo el DataNode primario por ahora)
     save_file_replicas(file_id, successful_datanodes, node_id_db=NODE_ID)
+    
+    # Iniciar replicación eventual en background (no bloquea la respuesta)
+    def replicate_eventually():
+        """Replica el archivo a otros DataNodes en background"""
+        try:
+            print(f"[NAMENODE] Iniciando replicación eventual para file_id={file_id}...")
+            # Esperar un poco antes de replicar para no sobrecargar
+            time.sleep(2)
+            
+            # Obtener DataNodes adicionales para replicación
+            additional_datanodes = all_assigned_datanodes[1:] if all_assigned_datanodes and len(all_assigned_datanodes) > 1 else []
+            if not additional_datanodes:
+                # Si no hay más DataNodes asignados, obtener nuevos
+                additional_datanodes = assign_replicas(
+                    file_hash, 
+                    file_size, 
+                    node_id_db=NODE_ID,
+                    exclude_datanodes=successful_datanodes
+                )
+            
+            if additional_datanodes:
+                from namenode.datanode_transfer import send_chunks_from_datanode
+                from namenode.datanode_manager import get_datanode
+                
+                source_dn_info = get_datanode(successful_datanodes[0], node_id_db=NODE_ID)
+                if source_dn_info:
+                    source_url = source_dn_info["url"]
+                    if not source_url.startswith("http"):
+                        source_url = f"http://{source_url}:{source_dn_info['port']}"
+                    
+                    # Generar token de servicio
+                    try:
+                        service_token = generate_service_token(cluster_state["node_id"], "service")
+                    except Exception:
+                        service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+                    
+                    for target_dn_id in additional_datanodes[:2]:  # Máximo 2 réplicas adicionales
+                        target_dn_info = get_datanode(target_dn_id, node_id_db=NODE_ID)
+                        if not target_dn_info:
+                            continue
+                        
+                        target_url = target_dn_info["url"]
+                        if not target_url.startswith("http"):
+                            target_url = f"http://{target_url}:{target_dn_info['port']}"
+                        
+                        try:
+                            print(f"[NAMENODE] Replicando {file_hash[:16]}... desde {successful_datanodes[0]} a {target_dn_id}...")
+                            success, message = send_chunks_from_datanode(
+                                source_datanode_url=source_url,
+                                target_datanode_url=target_url,
+                                file_id=file_hash,
+                                service_token=service_token
+                            )
+                            
+                            if success:
+                                print(f"[NAMENODE] ✅ Réplica eventual completada: {target_dn_id} - {message}")
+                                # Actualizar réplicas en la base de datos
+                                save_file_replicas(file_id, [target_dn_id], node_id_db=NODE_ID)
+                            else:
+                                print(f"[NAMENODE] ⚠️  Réplica eventual falló en {target_dn_id}: {message}")
+                        except Exception as e:
+                            print(f"[NAMENODE] ⚠️  Error en replicación eventual a {target_dn_id}: {e}")
+        except Exception as e:
+            print(f"[NAMENODE] ⚠️  Error en replicación eventual: {e}")
+    
+    # Iniciar replicación eventual en thread separado
+    replication_thread = threading.Thread(target=replicate_eventually, daemon=True)
+    replication_thread.start()
+    print(f"[NAMENODE] Replicación eventual iniciada en background para file_id={file_id}")
     
     # Replicar operación a otros MetaNameNodes
     operation = OperationLog(
@@ -3026,7 +3267,7 @@ async def finalize_chunked_upload(
             "tags": tag_list,
             "size": file_size,
             "hash": f"sha256:{file_hash}",
-            "datanode_ids": datanode_ids,
+            "datanode_ids": successful_datanodes,
             "user_id": current_user.username
         },
         term=cluster_state["term"],
@@ -3039,10 +3280,28 @@ async def finalize_chunked_upload(
     save_operation_to_log(operation, NODE_ID)
     replicate_to_peers(operation)
     
-    # Limpiar sesión
-    chunked_upload_manager.cleanup_session(upload_id)
+    # Marcar operación como completada en el estado persistente
+    from namenode.operation_state_manager import get_operation_state_manager
+    try:
+        op_manager = get_operation_state_manager()
+        op_manager.complete_operation(upload_id, success=True)
+        op_manager.update_progress(
+            upload_id,
+            {
+                'replicas_stored': len(successful_datanodes),
+                'replicas': successful_datanodes,
+                'completed_at': time.time(),
+                'file_id': file_id,
+                'file_hash': file_hash
+            }
+        )
+    except Exception as e:
+        print(f"[NAMENODE] ⚠️  Error actualizando estado persistente: {e}")
     
-    print(f"[NAMENODE] Upload finalizado: {session.filename} ({success_count} réplicas)")
+    # Limpiar sesión
+    chunked_upload_manager.cleanup_session(upload_id, mark_completed=False)  # Ya marcado arriba
+    
+    print(f"[NAMENODE] Upload finalizado: {session.filename} ({len(successful_datanodes)} réplicas)")
     
     return {
         "success": True,
@@ -3050,7 +3309,7 @@ async def finalize_chunked_upload(
         "file_id": file_id,
         "file_hash": file_hash,
         "replicas": successful_datanodes,
-        "replicas_stored": success_count
+        "replicas_stored": len(successful_datanodes)
     }
 
 
@@ -3079,15 +3338,29 @@ def cancel_chunked_upload(
         raise HTTPException(status_code=503, detail="No hay líder disponible")
     
     session = chunked_upload_manager.get_session(upload_id)
+    
+    # Si no está en memoria, intentar recuperar desde estado persistente
     if not session:
-        raise HTTPException(status_code=404, detail="Sesión de upload no encontrada")
+        print(f"[NAMENODE] Sesión {upload_id} no en memoria, intentando recuperar desde BD...")
+        session = chunked_upload_manager.recover_session(upload_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Sesión de upload no encontrada")
     
     # Verificar que el usuario es el dueño de la sesión
     if session.user_id != current_user.username:
         raise HTTPException(status_code=403, detail="No autorizado para esta sesión")
     
+    # Marcar como cancelada en estado persistente
+    from namenode.operation_state_manager import get_operation_state_manager
+    try:
+        op_manager = get_operation_state_manager()
+        op_manager.complete_operation(upload_id, success=False)
+        op_manager.update_progress(upload_id, {'error': 'Cancelado por el usuario'})
+    except:
+        pass
+    
     # Limpiar sesión
-    chunked_upload_manager.cleanup_session(upload_id)
+    chunked_upload_manager.cleanup_session(upload_id, mark_completed=False)
     
     return {
         "success": True,
@@ -3119,14 +3392,96 @@ def list_active_uploads(
     if not is_leader():
         raise HTTPException(status_code=503, detail="No hay líder disponible")
     
-    # Obtener todas las sesiones y filtrar por usuario
+    # Obtener todas las sesiones en memoria
     all_sessions = chunked_upload_manager.get_all_sessions()
     user_sessions = [s for s in all_sessions if s["user_id"] == current_user.username]
+    
+    # También consultar operaciones persistentes de upload
+    from namenode.operation_state_manager import get_operation_state_manager
+    try:
+        op_manager = get_operation_state_manager()
+        persistent_ops = op_manager.get_operations_by_state(
+            operation_type='upload',
+            user_id=current_user.username,
+            state=None
+        )
+        
+        # Filtrar solo las incompletas
+        incomplete_ops = [op for op in persistent_ops if op.state not in ('completed', 'failed')]
+        
+        # Agregar operaciones persistentes que no están en memoria
+        for op in incomplete_ops:
+            # Verificar si ya está en user_sessions
+            if not any(s['upload_id'] == op.operation_id for s in user_sessions):
+                # Intentar recuperar la sesión
+                session = chunked_upload_manager.recover_session(op.operation_id)
+                if session:
+                    user_sessions.append(session.to_dict())
+    except Exception as e:
+        print(f"[NAMENODE] Error consultando operaciones persistentes: {e}")
     
     return {
         "active_uploads": user_sessions,
         "total": len(user_sessions)
     }
+
+
+@app.get("/operations/active")
+def get_active_operations(
+    operation_type: Optional[str] = Query(None),
+    current_user: User = Depends(require_permission(Permission.READ_FILES))
+):
+    """
+    Obtiene todas las operaciones activas (incompletas) del usuario
+    
+    Args:
+        operation_type: Filtrar por tipo ('upload', 'replicate', 'delete')
+    """
+    if not is_leader():
+        leader_url = get_leader_url()
+        if leader_url:
+            try:
+                response = requests.get(
+                    f"{leader_url}/operations/active",
+                    params={"operation_type": operation_type} if operation_type else None,
+                    timeout=30
+                )
+                response.raise_for_status()
+                return response.json()
+            except Exception as e:
+                raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    from namenode.operation_state_manager import get_operation_state_manager
+    try:
+        op_manager = get_operation_state_manager()
+        operations = op_manager.get_operations_by_state(
+            state=None,  # Todas las que no están completadas/fallidas
+            operation_type=operation_type,
+            user_id=current_user.username
+        )
+        
+        # Filtrar solo las incompletas
+        incomplete = [op for op in operations if op.state not in ('completed', 'failed')]
+        
+        return {
+            "operations": [
+                {
+                    "operation_id": op.operation_id,
+                    "operation_type": op.operation_type,
+                    "state": op.state,
+                    "progress": op.progress_data,
+                    "metadata": op.metadata,
+                    "created_at": op.created_at,
+                    "last_updated": op.last_updated,
+                    "retry_count": op.retry_count
+                }
+                for op in incomplete
+            ],
+            "total": len(incomplete)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error obteniendo operaciones: {e}")
 
 
 # ========== ENDPOINT ORIGINAL /add (MANTENIDO PARA COMPATIBILIDAD) ==========
@@ -3279,7 +3634,7 @@ async def add_file_compat(
         print(f"[NAMENODE] Enviando archivo a {len(datanode_urls)} DataNodes (intento {attempt + 1}/{max_attempts})...")
         
         # Determinar si usar chunked transfer
-        use_chunked_transfer = file_size > (50 * 1024 * 1024)
+        use_chunked_transfer = file_size > (5 * 1024 * 1024)
         if use_chunked_transfer:
             print(f"[NAMENODE] Usando chunked transfer para archivo grande ({file_size:,} bytes)")
         
@@ -3616,14 +3971,15 @@ def download_file_compat(
     file_name: str,
     current_user: User = Depends(require_permission(Permission.READ_FILES)),
     authorization: Optional[str] = Header(None, alias="Authorization"),
-    range_header: Optional[str] = Header(None, alias="Range")
+    range_header: Optional[str] = Header(None, alias="Range"),
+    direct: Optional[bool] = None  # Si es True, devuelve URLs directas en lugar de proxy
 ):
     """
-    Endpoint de compatibilidad: descarga de archivo desde DataNodes con soporte para HTTP Range.
-    Busca el archivo por nombre, obtiene sus réplicas y descarga desde un DataNode disponible.
-    Soporta descarga parcial via Range header para archivos grandes.
+    Endpoint de descarga de archivo.
+    Si direct=True, devuelve URLs de DataNodes con tokens temporales para descarga directa.
+    Si direct=False o no se especifica, actúa como proxy (compatibilidad).
     """
-    print(f"[NAMENODE] GET /download/{file_name} (nodo: {NODE_ID}, range: {range_header})")
+    print(f"[NAMENODE] GET /download/{file_name} (nodo: {NODE_ID}, range: {range_header}, direct: {direct})")
     
     # Verificar si somos el líder
     if not is_leader():
@@ -3637,10 +3993,14 @@ def download_file_compat(
                 headers["Authorization"] = authorization
             if range_header:
                 headers["Range"] = range_header
+            params = {}
+            if direct is not None:
+                params["direct"] = direct
             try:
                 response = requests.get(
                     f"{leader_url}/download/{file_name}",
                     headers=headers,
+                    params=params,
                     timeout=30,
                     allow_redirects=True  # Seguir redirecciones automáticamente
                 )
@@ -3713,7 +4073,52 @@ def download_file_compat(
     for r in replicas:
         print(f"[NAMENODE]   - {r['datanode_id']} ({r['replica_type']}): {r['url']}")
     
-    # Intentar leer desde las réplicas en orden de prioridad (con fallback)
+    # Si se solicita descarga directa, devolver URLs con tokens temporales
+    if direct:
+        from security.service_auth import generate_client_download_token
+        from namenode.datanode_manager import get_datanode
+        
+        datanode_urls = []
+        for replica in replicas:
+            dn_id = replica["datanode_id"]
+            dn_info = get_datanode(dn_id, node_id_db=NODE_ID)
+            if not dn_info:
+                continue
+            
+            url = replica["url"]
+            if not url.startswith("http"):
+                url = f"http://{url}:{dn_info['port']}"
+            
+            # Generar token temporal (válido por 15 minutos)
+            token = generate_client_download_token(
+                user_id=current_user.username,
+                file_hash=file_hash,
+                datanode_id=dn_id,
+                expires_minutes=15
+            )
+            
+            datanode_urls.append({
+                "datanode_id": dn_id,
+                "url": f"{url}/client/download/{file_hash}",
+                "token": token,
+                "replica_type": replica.get("replica_type", "unknown")
+            })
+        
+        if not datanode_urls:
+            raise HTTPException(
+                status_code=503,
+                detail="No se pudieron obtener URLs de DataNodes"
+            )
+        
+        return {
+            "file_name": file_name,
+            "file_hash": file_hash,
+            "file_id": file_id,
+            "datanode_urls": datanode_urls,
+            "message": "Usa estas URLs para descargar directamente desde los DataNodes"
+        }
+    
+    # Modo proxy (compatibilidad): Intentar leer desde las réplicas en orden de prioridad (con fallback)
     last_error = None
     for replica in replicas:
         datanode_url = replica["url"]
@@ -4030,11 +4435,29 @@ def internal_heartbeat(
     
     with cluster_lock:
         peers_before_update = cluster_state["peers"].copy()
+        current_node_id = cluster_state["node_id"]
+        
+        # IMPORTANTE: Si este nodo ES el líder (recibiendo heartbeat de sí mismo o de otro líder con term mayor),
+        # NO cambiar is_leader a False
+        is_current_node_leader = (current_node_id == leader_id)
+        
         if term >= cluster_state["term"]:
             cluster_state["term"] = term
             cluster_state["leader_id"] = leader_id
-            cluster_state["is_leader"] = False
             cluster_state["last_heartbeat_time"] = time.time()
+            
+            # Solo establecer is_leader = False si este nodo NO es el líder
+            # Si este nodo es el líder, mantener is_leader = True
+            if not is_current_node_leader:
+                cluster_state["is_leader"] = False
+                print(f"[NAMENODE] 💓 [HEARTBEAT] Este nodo ({current_node_id}) NO es el líder, estableciendo is_leader=False")
+            else:
+                # Este nodo es el líder, asegurar que is_leader sea True
+                if not cluster_state["is_leader"]:
+                    print(f"[NAMENODE] 💓 [HEARTBEAT] ⚠️  Este nodo ({current_node_id}) es el líder pero is_leader era False, corrigiendo...")
+                    cluster_state["is_leader"] = True
+                else:
+                    print(f"[NAMENODE] 💓 [HEARTBEAT] Este nodo ({current_node_id}) es el líder, manteniendo is_leader=True")
         
         # Actualizar lista de peers desde el líder
         # El líder conoce todos los peers del clúster, así que actualizamos nuestra lista
@@ -4203,11 +4626,11 @@ def internal_gossip(
         cluster_state["peers"] = list(set(cluster_state["peers"]))
         
         # Actualizar información del líder si el peer remoto es líder o conoce un líder
+        current_node_id = cluster_state["node_id"]
+        
         if exchange.is_leader and exchange.leader_id == sender_id:
             # El peer remoto es el líder
-            # Solo actualizar si el nodo actual NO es el líder
-            # (es decir, el sender_id es diferente del node_id y el nodo actual no se considera líder)
-            if sender_id != cluster_state["node_id"]:
+            if sender_id != current_node_id:
                 # El sender_id es un nodo diferente, actualizar para reconocerlo como líder
                 if cluster_state["leader_id"] != sender_id:
                     print(f"[NAMENODE] [GOSSIP] Líder actualizado desde gossip: {sender_id}")
@@ -4215,15 +4638,24 @@ def internal_gossip(
                     cluster_state["is_leader"] = False
             else:
                 # El nodo actual es el líder (sender_id == node_id), asegurarse de que is_leader sea True
+                # IMPORTANTE: El líder nunca debe cambiar su propio is_leader a False basándose en gossip
                 if not cluster_state["is_leader"] or cluster_state["leader_id"] != sender_id:
+                    print(f"[NAMENODE] [GOSSIP] ⚠️  Nodo actual es el líder pero is_leader era False, corrigiendo...")
                     print(f"[NAMENODE] [GOSSIP] Nodo actual es el líder, estableciendo is_leader=True, leader_id={sender_id}")
                     cluster_state["is_leader"] = True
                     cluster_state["leader_id"] = sender_id
         elif exchange.leader_id and exchange.leader_id != cluster_state["leader_id"]:
             # El peer remoto conoce un líder diferente
-            if not cluster_state["is_leader"]:
+            # IMPORTANTE: Si este nodo ES el líder, NO cambiar su estado basándose en lo que otros dicen
+            if not cluster_state["is_leader"] and exchange.leader_id != current_node_id:
                 print(f"[NAMENODE] [GOSSIP] Líder conocido actualizado desde gossip: {exchange.leader_id}")
                 cluster_state["leader_id"] = exchange.leader_id
+            elif cluster_state["is_leader"] and exchange.leader_id != current_node_id:
+                # Este nodo es el líder, pero otro nodo reporta un líder diferente
+                # Verificar directamente antes de cambiar
+                print(f"[NAMENODE] [GOSSIP] ⚠️  Este nodo es el líder pero {sender_id} reporta líder diferente ({exchange.leader_id}), ignorando (el líder no cambia su estado por gossip)")
+                # No cambiar automáticamente, solo registrar la discrepancia
+                # El follower_heartbeat_check o gossip_loop verificarán directamente
         
         # Asegurar consistencia: si el nodo actual es el líder (leader_id == node_id), is_leader debe ser True
         if cluster_state["leader_id"] == cluster_state["node_id"] and not cluster_state["is_leader"]:

@@ -78,7 +78,7 @@ def get_namenode_leader_url() -> Optional[str]:
             headers = {"Authorization": f"Bearer {token}"}
             url = f"{registry_url}/servers/active"
             print(f"[REGISTRY_CLIENT] Consultando registry: {url}")
-            response = requests.get(url, headers=headers, timeout=5)
+            response = requests.get(url, headers=headers, timeout=10)  # Aumentado de 5 a 10 segundos
             
             if response.status_code == 401 or response.status_code == 403:
                 print(f"[REGISTRY_CLIENT] ❌ Error de autenticación consultando registry {registry_url}/servers/active: status={response.status_code}, response={response.text}")
@@ -101,7 +101,7 @@ def get_namenode_leader_url() -> Optional[str]:
                     # Consultar el endpoint / del namenode para obtener el líder
                     try:
                         print(f"[REGISTRY_CLIENT] Consultando namenode: {server_url}/")
-                        namenode_response = requests.get(f"{server_url}/", timeout=5)
+                        namenode_response = requests.get(f"{server_url}/", timeout=10)  # Aumentado de 5 a 10 segundos
                         
                         if namenode_response.status_code == 401 or namenode_response.status_code == 403:
                             print(f"[REGISTRY_CLIENT] ❌ Error de autenticación consultando namenode {server_url}/: status={namenode_response.status_code}, response={namenode_response.text}")
@@ -164,7 +164,7 @@ class DataNodeRegistryClient:
         for registry_url in self.registry_urls:
             try:
                 url = f"{registry_url}{endpoint}"
-                response = requests.request(method, url, timeout=5, **kwargs)
+                response = requests.request(method, url, timeout=10, **kwargs)  # Aumentado de 5 a 10 segundos
                 response.raise_for_status()
                 return response
             except requests.RequestException as e:
@@ -206,7 +206,7 @@ class DataNodeRegistryClient:
                     "free_space": storage_info["free_space"]
                 },
                 headers={"Authorization": f"Bearer {token}"},
-                timeout=10
+                timeout=20  # Aumentado de 10 a 20 segundos para dar más tiempo al namenode
             )
             response.raise_for_status()
             
@@ -249,7 +249,7 @@ class DataNodeRegistryClient:
                     "total_space": storage_info["total_space"]
                 },
                 headers={"Authorization": f"Bearer {token}"},
-                timeout=5
+                timeout=15  # Aumentado de 5 a 15 segundos para dar más tiempo al namenode
             )
             
             if response.status_code == 401 or response.status_code == 403:

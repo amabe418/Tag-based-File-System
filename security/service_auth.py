@@ -154,3 +154,85 @@ def validate_service_request(service_id: str, token: str) -> bool:
     
     return False
 
+
+def generate_client_upload_token(user_id: str, file_hash: str, datanode_id: str, expires_minutes: int = 15) -> str:
+    """
+    Genera un token temporal para que un cliente pueda subir directamente a un DataNode
+    
+    Args:
+        user_id: ID del usuario que está subiendo
+        file_hash: Hash del archivo que se está subiendo
+        datanode_id: ID del DataNode destino
+        expires_minutes: Minutos hasta que expire el token (default: 15)
+    
+    Returns:
+        Token JWT firmado
+    """
+    payload = {
+        "sub": f"client-upload-{user_id}",
+        "service_type": "client_upload",
+        "user_id": user_id,
+        "file_hash": file_hash,
+        "datanode_id": datanode_id,
+        "iat": datetime.utcnow(),
+        "exp": datetime.utcnow() + timedelta(minutes=expires_minutes)
+    }
+    
+    token = jwt.encode(payload, SERVICE_SECRET_KEY, algorithm="HS256")
+    return token
+
+
+def generate_client_download_token(user_id: str, file_hash: str, datanode_id: str, expires_minutes: int = 15) -> str:
+    """
+    Genera un token temporal para que un cliente pueda descargar directamente desde un DataNode
+    
+    Args:
+        user_id: ID del usuario que está descargando
+        file_hash: Hash del archivo que se está descargando
+        datanode_id: ID del DataNode fuente
+        expires_minutes: Minutos hasta que expire el token (default: 15)
+    
+    Returns:
+        Token JWT firmado
+    """
+    payload = {
+        "sub": f"client-download-{user_id}",
+        "service_type": "client_download",
+        "user_id": user_id,
+        "file_hash": file_hash,
+        "datanode_id": datanode_id,
+        "iat": datetime.utcnow(),
+        "exp": datetime.utcnow() + timedelta(minutes=expires_minutes)
+    }
+    
+    token = jwt.encode(payload, SERVICE_SECRET_KEY, algorithm="HS256")
+    return token
+
+
+def verify_client_token(token: str, expected_type: str = None) -> Optional[Dict]:
+    """
+    Verifica un token de cliente (upload o download)
+    
+    Args:
+        token: Token JWT a verificar
+        expected_type: Tipo esperado ("client_upload" o "client_download")
+    
+    Returns:
+        Payload del token si es válido, None en caso contrario
+    """
+    try:
+        payload = jwt.decode(token, SERVICE_SECRET_KEY, algorithms=["HS256"])
+        
+        # Verificar que es un token de cliente
+        service_type = payload.get("service_type")
+        if service_type not in ["client_upload", "client_download"]:
+            return None
+        
+        # Si se especifica un tipo esperado, verificar que coincida
+        if expected_type and service_type != expected_type:
+            return None
+        
+        return payload
+    except jwt.JWTError:
+        return None
+

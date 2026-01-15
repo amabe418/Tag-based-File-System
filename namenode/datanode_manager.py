@@ -6,6 +6,7 @@ import time
 import requests
 from typing import List, Optional, Dict, Tuple
 from namenode.database import get_db_path, get_connection, close_connection, db_lock
+from namenode.datanode_cache import get_datanode_cache
 
 
 def register_datanode(node_id: str, url: str, port: int, ip: Optional[str], 
@@ -18,12 +19,16 @@ def register_datanode(node_id: str, url: str, port: int, ip: Optional[str],
     """
     db_path = get_db_path(node_id_db)
     
+    # Preparar datos fuera del lock
+    current_time = time.time()
+    update_params = (url, port, ip, total_space, free_space, current_time, node_id)
+    insert_params = (node_id, url, port, ip, total_space, free_space, current_time)
+    
+    # Solo mantener el lock durante la operación de BD
     with db_lock:
         conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
         
         try:
-            current_time = time.time()
-            
             # Verificar si ya existe
             cursor.execute("SELECT node_id FROM datanodes WHERE node_id = ?", (node_id,))
             exists = cursor.fetchone()
@@ -35,24 +40,38 @@ def register_datanode(node_id: str, url: str, port: int, ip: Optional[str],
                     SET url = ?, port = ?, ip = ?, total_space = ?, free_space = ?, 
                         last_heartbeat = ?, status = 'active'
                     WHERE node_id = ?
-                """, (url, port, ip, total_space, free_space, current_time, node_id))
+                """, update_params)
             else:
                 # Insertar nuevo DataNode
                 cursor.execute("""
                     INSERT INTO datanodes (node_id, url, port, ip, total_space, free_space, last_heartbeat, status, draining)
                     VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 0)
-                """, (node_id, url, port, ip, total_space, free_space, current_time))
+                """, insert_params)
             
             conn.commit()
-            print(f"[DATANODE_MANAGER] DataNode registrado/actualizado: {node_id} -> {url}:{port}")
-            return True
-            
         except Exception as e:
             conn.rollback()
             print(f"[DATANODE_MANAGER] Error al registrar DataNode {node_id}: {e}")
             return False
         finally:
             close_connection(conn)
+    
+    # Actualizar cache fuera del lock de BD
+    print(f"[DATANODE_MANAGER] DataNode registrado/actualizado: {node_id} -> {url}:{port}")
+    cache = get_datanode_cache(node_id_db)
+    cache.update(node_id, {
+        "node_id": node_id,
+        "url": url,
+        "port": port,
+        "ip": ip,
+        "total_space": total_space,
+        "free_space": free_space,
+        "last_heartbeat": current_time,
+        "status": "active",
+        "draining": False
+    })
+    
+    return True
 
 
 def update_datanode_heartbeat(node_id: str, free_space: int, total_space: int, 
@@ -65,41 +84,61 @@ def update_datanode_heartbeat(node_id: str, free_space: int, total_space: int,
     """
     db_path = get_db_path(node_id_db)
     
+    # Preparar datos fuera del lock
+    current_time = time.time()
+    update_params = (free_space, total_space, current_time, node_id)
+    
+    # Solo mantener el lock durante la operación de BD
     with db_lock:
         conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
         
         try:
-            current_time = time.time()
-            
             cursor.execute("""
                 UPDATE datanodes 
                 SET free_space = ?, total_space = ?, last_heartbeat = ?, status = 'active'
                 WHERE node_id = ?
-            """, (free_space, total_space, current_time, node_id))
+            """, update_params)
             
             if cursor.rowcount == 0:
                 print(f"[DATANODE_MANAGER] DataNode {node_id} no encontrado para heartbeat")
-                close_connection(conn)
                 return False
             
             conn.commit()
-            return True
-            
         except Exception as e:
             conn.rollback()
             print(f"[DATANODE_MANAGER] Error al actualizar heartbeat de {node_id}: {e}")
             return False
         finally:
             close_connection(conn)
+    
+    # Actualizar cache fuera del lock de BD
+    cache = get_datanode_cache(node_id_db)
+    cache.update(node_id, {
+        "free_space": free_space,
+        "total_space": total_space,
+        "last_heartbeat": current_time,
+        "status": "active"
+    })
+    
+    return True
 
 
 def get_datanode(node_id: str, node_id_db: str = None) -> Optional[Dict]:
     """
     Obtiene información de un DataNode específico.
+    Usa cache en memoria para evitar locks de BD.
     
     Returns:
         Diccionario con información del DataNode, o None si no existe
     """
+    # Intentar obtener del cache primero (sin lock de BD)
+    cache = get_datanode_cache(node_id_db)
+    datanode = cache.get(node_id)
+    
+    if datanode:
+        return datanode.copy()  # Retornar copia para evitar modificaciones
+    
+    # Si no está en cache, cargar desde BD (fallback)
     db_path = get_db_path(node_id_db)
     
     with db_lock:
@@ -117,7 +156,7 @@ def get_datanode(node_id: str, node_id_db: str = None) -> Optional[Dict]:
             if not row:
                 return None
             
-            return {
+            result = {
                 "node_id": row[0],
                 "url": row[1],
                 "port": row[2],
@@ -129,6 +168,11 @@ def get_datanode(node_id: str, node_id_db: str = None) -> Optional[Dict]:
                 "registered_at": row[8],
                 "draining": bool(row[9]) if row[9] is not None else False
             }
+            
+            # Actualizar cache para próxima vez
+            cache.update(node_id, result)
+            
+            return result
         finally:
             close_connection(conn)
 
@@ -188,6 +232,7 @@ def list_datanodes(status: Optional[str] = None, node_id_db: str = None) -> List
 def get_active_datanodes(node_id_db: str = None, exclude_draining: bool = True) -> List[Dict]:
     """
     Obtiene lista de DataNodes activos ordenados por espacio libre (descendente).
+    Usa cache en memoria para evitar locks de BD.
     
     Args:
         exclude_draining: Si True, excluye DataNodes en proceso de drenaje
@@ -195,47 +240,9 @@ def get_active_datanodes(node_id_db: str = None, exclude_draining: bool = True) 
     Returns:
         Lista de DataNodes activos
     """
-    db_path = get_db_path(node_id_db)
-    
-    with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
-        
-        try:
-            if exclude_draining:
-                cursor.execute("""
-                    SELECT node_id, url, port, ip, total_space, free_space, 
-                           last_heartbeat, status, registered_at, draining
-                    FROM datanodes 
-                    WHERE status = 'active' AND (draining = 0 OR draining IS NULL)
-                    ORDER BY free_space DESC
-                """)
-            else:
-                cursor.execute("""
-                    SELECT node_id, url, port, ip, total_space, free_space, 
-                           last_heartbeat, status, registered_at, draining
-                    FROM datanodes 
-                    WHERE status = 'active'
-                    ORDER BY free_space DESC
-                """)
-            
-            results = []
-            for row in cursor.fetchall():
-                results.append({
-                    "node_id": row[0],
-                    "url": row[1],
-                    "port": row[2],
-                    "ip": row[3],
-                    "total_space": row[4],
-                    "free_space": row[5],
-                    "last_heartbeat": row[6],
-                    "status": row[7],
-                    "registered_at": row[8],
-                    "draining": bool(row[9]) if row[9] is not None else False
-                })
-            
-            return results
-        finally:
-            close_connection(conn)
+    # Obtener del cache (sin lock de BD)
+    cache = get_datanode_cache(node_id_db)
+    return cache.get_active(exclude_draining=exclude_draining)
 
 
 def assign_replicas(file_hash: str, file_size: int, node_id_db: str = None, 
@@ -716,17 +723,36 @@ def rereplicate_file(file_id: int, file_hash: str, failed_datanode_id: str,
         except Exception:
             service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
         
-        # Leer archivo desde la réplica existente
-        response = requests.get(
-            f"{source_url}/retrieve/{file_hash}",
-            headers={"Authorization": f"Bearer {service_token}"},
-            timeout=30
-        )
-        response.raise_for_status()
-        file_content = response.content
-        file_size = len(file_content)
+        # Verificar si el archivo está almacenado como chunks en el DataNode fuente
+        # Intentar obtener información de chunks primero
+        has_chunks = False
+        file_content = None
+        file_size = 0
         
-        print(f"[DATANODE_MANAGER] Archivo leído desde {source_replica['datanode_id']} ({file_size} bytes)")
+        try:
+            response = requests.get(
+                f"{source_url}/chunks/{file_hash}/info",
+                headers={"Authorization": f"Bearer {service_token}"},
+                timeout=30
+            )
+            response.raise_for_status()
+            chunks_info = response.json()
+            file_size = chunks_info["total_size"]
+            has_chunks = chunks_info["chunk_count"] > 0
+            
+            print(f"[DATANODE_MANAGER] Archivo tiene {chunks_info['chunk_count']} chunks en {source_replica['datanode_id']} ({file_size:,} bytes)")
+        except:
+            # Si no tiene chunks, leer como archivo completo
+            has_chunks = False
+            response = requests.get(
+                f"{source_url}/retrieve/{file_hash}",
+                headers={"Authorization": f"Bearer {service_token}"},
+                timeout=30
+            )
+            response.raise_for_status()
+            file_content = response.content
+            file_size = len(file_content)
+            print(f"[DATANODE_MANAGER] Archivo leído como completo desde {source_replica['datanode_id']} ({file_size:,} bytes)")
         
         # Obtener lista de DataNodes a excluir (los que ya tienen réplicas y el que falló)
         existing_datanode_ids = [r["datanode_id"] for r in replicas]
@@ -765,40 +791,59 @@ def rereplicate_file(file_id: int, file_hash: str, failed_datanode_id: str,
         except Exception:
             service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
         
-        # Enviar archivo al nuevo DataNode (usar chunked si es grande)
-        use_chunked = file_size > (50 * 1024 * 1024)
-        
-        if use_chunked:
-            print(f"[DATANODE_MANAGER] Usando chunked transfer para re-replicación ({file_size:,} bytes)")
+        # Enviar archivo al nuevo DataNode
+        # Si tiene chunks, transferir directamente sin ensamblar
+        if has_chunks:
+            print(f"[DATANODE_MANAGER] Transfiriendo chunks directamente desde {source_replica['datanode_id']} a {new_datanode_id}")
             from namenode.datanode_transfer import send_file_to_datanode_chunked
             
             success, message = send_file_to_datanode_chunked(
                 datanode_url=new_datanode_url,
                 file_id=file_hash,
-                file_content=file_content,
-                service_token=service_token
+                service_token=service_token,
+                source_datanode_url=source_url
             )
             
             if not success:
-                print(f"[DATANODE_MANAGER] Error en chunked transfer: {message}")
+                print(f"[DATANODE_MANAGER] Error transfiriendo chunks: {message}")
                 return False
             
-            print(f"[DATANODE_MANAGER] Archivo re-replicado a {new_datanode_id} (chunked)")
+            print(f"[DATANODE_MANAGER] Chunks transferidos exitosamente a {new_datanode_id}")
         else:
-            # Método legacy para archivos pequeños
-            files = {"file": ("replica", file_content)}
-            data = {"file_id": file_hash}
+            # Archivo completo: usar método tradicional o chunked según tamaño
+            use_chunked = file_size > (5 * 1024 * 1024)
             
-            response = requests.post(
-                f"{new_datanode_url}/store",
-                files=files,
-                data=data,
-                headers={"Authorization": f"Bearer {service_token}"},
-                timeout=120
-            )
-            response.raise_for_status()
-        
-            print(f"[DATANODE_MANAGER] Archivo re-replicado a {new_datanode_id}")
+            if use_chunked:
+                print(f"[DATANODE_MANAGER] Usando chunked transfer para re-replicación ({file_size:,} bytes)")
+                from namenode.datanode_transfer import send_file_to_datanode_chunked
+                
+                success, message = send_file_to_datanode_chunked(
+                    datanode_url=new_datanode_url,
+                    file_id=file_hash,
+                    file_content=file_content,
+                    service_token=service_token
+                )
+                
+                if not success:
+                    print(f"[DATANODE_MANAGER] Error en chunked transfer: {message}")
+                    return False
+                
+                print(f"[DATANODE_MANAGER] Archivo re-replicado a {new_datanode_id} (chunked)")
+            else:
+                # Método legacy para archivos pequeños
+                files = {"file": ("replica", file_content)}
+                data = {"file_id": file_hash}
+                
+                response = requests.post(
+                    f"{new_datanode_url}/store",
+                    files=files,
+                    data=data,
+                    headers={"Authorization": f"Bearer {service_token}"},
+                    timeout=120
+                )
+                response.raise_for_status()
+            
+                print(f"[DATANODE_MANAGER] Archivo re-replicado a {new_datanode_id}")
         
         # Actualizar asignación de réplicas (reemplazar el DataNode fallido)
         # Obtener el tipo de réplica que tenía el DataNode fallido
@@ -869,6 +914,9 @@ def mark_datanode_inactive(node_id: str, node_id_db: str = None) -> bool:
             conn.commit()
             if cursor.rowcount > 0:
                 print(f"[DATANODE_MANAGER] DataNode {node_id} marcado como inactivo")
+                # Actualizar cache
+                cache = get_datanode_cache(node_id_db)
+                cache.update(node_id, {"status": "inactive"})
                 return True
             return False
             
@@ -902,6 +950,9 @@ def mark_datanode_draining(node_id: str, node_id_db: str = None) -> bool:
             conn.commit()
             if cursor.rowcount > 0:
                 print(f"[DATANODE_MANAGER] DataNode {node_id} marcado para drenaje")
+                # Actualizar cache
+                cache = get_datanode_cache(node_id_db)
+                cache.update(node_id, {"draining": True})
                 return True
             return False
             
@@ -935,6 +986,9 @@ def unmark_datanode_draining(node_id: str, node_id_db: str = None) -> bool:
             conn.commit()
             if cursor.rowcount > 0:
                 print(f"[DATANODE_MANAGER] DataNode {node_id} desmarcado del drenaje")
+                # Actualizar cache
+                cache = get_datanode_cache(node_id_db)
+                cache.update(node_id, {"draining": False})
                 return True
             return False
             
@@ -1035,6 +1089,11 @@ def detect_inactive_datanodes(timeout_seconds: int = 30, node_id_db: str = None)
             
             if inactive_ids:
                 conn.commit()
+                
+                # Actualizar cache
+                cache = get_datanode_cache(node_id_db)
+                for node_id in inactive_ids:
+                    cache.update(node_id, {"status": "inactive"})
             
             return inactive_ids
             

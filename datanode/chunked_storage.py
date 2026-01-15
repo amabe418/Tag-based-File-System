@@ -133,7 +133,9 @@ class ChunkedStorageManager:
         # Crear directorio temporal
         os.makedirs(session.get_temp_dir(), exist_ok=True)
         
-        print(f"[CHUNKED_STORAGE] Sesión creada: {session_id} - file_id={file_id} ({total_chunks} chunks)")
+        file_size_mb = expected_file_size / (1024 * 1024)
+        chunk_size_mb = chunk_size / (1024 * 1024)
+        print(f"[CHUNKED_STORAGE] 📦 Sesión creada | session_id={session_id[:8]} | file_id={file_id[:16]}... | archivo={file_size_mb:.2f} MB | chunks={total_chunks} | chunk_size={chunk_size_mb:.2f} MB")
         
         return session
     
@@ -185,16 +187,19 @@ class ChunkedStorageManager:
                 path=chunk_path
             )
         
-        print(f"[CHUNKED_STORAGE] Chunk {chunk_index + 1}/{session.total_chunks} recibido para {session_id} ({session.progress_percentage:.1f}%)")
+        chunk_size_mb = len(chunk_data) / (1024 * 1024)
+        print(f"[CHUNKED_STORAGE] ✅ Chunk {chunk_index + 1}/{session.total_chunks} recibido | file_id={session.file_id[:16]}... | tamaño={chunk_size_mb:.2f} MB | progreso={session.progress_percentage:.1f}% | session={session_id[:8]}")
         
         return True
     
     def assemble_and_store(self, session_id: str) -> bool:
         """
-        Ensambla todos los chunks y mueve el archivo a su ubicación final
+        Mueve los chunks directamente al almacenamiento final sin ensamblar.
+        Los chunks se mantienen separados para evitar tener que particionar
+        cada vez que se envía el archivo.
         
         Returns:
-            True si se ensambló y guardó correctamente, False en caso contrario
+            True si se guardaron correctamente, False en caso contrario
         """
         session = self.get_session(session_id)
         if not session:
@@ -203,47 +208,54 @@ class ChunkedStorageManager:
         
         if not session.is_complete:
             missing = session.total_chunks - len(session.received_chunks)
-            print(f"[CHUNKED_STORAGE] Sesión incompleta: faltan {missing} chunks")
+            received = sorted(session.received_chunks)
+            print(f"[CHUNKED_STORAGE] ❌ Sesión incompleta: faltan {missing} chunks de {session.total_chunks}")
+            print(f"[CHUNKED_STORAGE] Chunks recibidos: {received}")
+            print(f"[CHUNKED_STORAGE] Chunks esperados: {list(range(session.total_chunks))}")
             return False
         
-        assembled_path = session.get_assembled_path()
-        
-        print(f"[CHUNKED_STORAGE] Ensamblando {session.total_chunks} chunks para file_id={session.file_id}...")
+        file_size_mb = sum(chunk_info.size for chunk_info in session.chunks.values()) / (1024 * 1024)
+        print(f"[CHUNKED_STORAGE] 🔄 Moviendo {session.total_chunks} chunks ({file_size_mb:.2f} MB total) a almacenamiento final | file_id={session.file_id[:16]}...")
         
         try:
-            # Ensamblar archivo
-            with open(assembled_path, 'wb') as outfile:
-                for chunk_index in range(session.total_chunks):
-                    chunk_info = session.chunks[chunk_index]
-                    with open(chunk_info.path, 'rb') as infile:
-                        outfile.write(infile.read())
+            from datanode.storage import store_chunks
             
-            # Leer archivo completo y verificar hash
-            with open(assembled_path, 'rb') as f:
-                file_content = f.read()
+            # Preparar información de chunks para guardar
+            chunks_info = {}
+            for chunk_index in range(session.total_chunks):
+                chunk_info = session.chunks[chunk_index]
+                
+                # Leer chunk desde ubicación temporal
+                with open(chunk_info.path, 'rb') as f:
+                    chunk_data = f.read()
+                
+                chunks_info[chunk_index] = (chunk_data, chunk_info.hash)
             
-            calculated_hash = hashlib.sha256(file_content).hexdigest()
-            
-            if calculated_hash != session.file_id:
-                print(f"[CHUNKED_STORAGE] ❌ Hash del archivo no coincide")
-                print(f"  Esperado: {session.file_id}")
-                print(f"  Calculado: {calculated_hash}")
-                return False
-            
-            print(f"[CHUNKED_STORAGE] ✅ Archivo ensamblado y verificado: {session.file_id} ({len(file_content)} bytes)")
-            
-            # Mover archivo a ubicación final usando storage.store_file
-            from datanode.storage import store_file
-            
-            if store_file(session.file_id, file_content):
-                print(f"[CHUNKED_STORAGE] ✅ Archivo guardado en almacenamiento final: {session.file_id}")
+            # Guardar chunks directamente en storage
+            if store_chunks(session.file_id, chunks_info):
+                # Verificar integridad: ensamblar temporalmente para verificar hash
+                # Ordenar por chunk_index (clave) para asegurar el orden correcto
+                assembled_content = b''.join([chunks_info[i][0] for i in sorted(chunks_info.keys())])
+                calculated_hash = hashlib.sha256(assembled_content).hexdigest()
+                
+                if calculated_hash != session.file_id:
+                    print(f"[CHUNKED_STORAGE] ❌ Hash del archivo no coincide después de guardar chunks")
+                    print(f"  Esperado: {session.file_id}")
+                    print(f"  Calculado: {calculated_hash}")
+                    # Eliminar chunks guardados
+                    from datanode.storage import delete_file
+                    delete_file(session.file_id)
+                    return False
+                
+                file_size_mb = len(assembled_content) / (1024 * 1024)
+                print(f"[CHUNKED_STORAGE] ✅ {len(chunks_info)} chunks guardados y verificados | file_id={session.file_id[:16]}... | tamaño={file_size_mb:.2f} MB | hash={session.file_id[:16]}...")
                 return True
             else:
-                print(f"[CHUNKED_STORAGE] ❌ Error guardando archivo en almacenamiento final")
+                print(f"[CHUNKED_STORAGE] ❌ Error guardando chunks en almacenamiento final")
                 return False
             
         except Exception as e:
-            print(f"[CHUNKED_STORAGE] Error ensamblando archivo: {e}")
+            print(f"[CHUNKED_STORAGE] Error guardando chunks: {e}")
             import traceback
             traceback.print_exc()
             return False

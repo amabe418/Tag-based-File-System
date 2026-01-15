@@ -403,25 +403,99 @@ def gossip_loop():
 
 
 def cleanup_inactive_servers():
-    """Hilo que limpia servidores que no han enviado heartbeat"""
+    """Hilo que limpia servidores que no han enviado heartbeat o no responden HTTP"""
     while True:
         time.sleep(CLEANUP_INTERVAL)
         
         current_time = time.time()
+        inactive = []
+        
+        # Obtener lista de servidores a verificar (con lock mínimo)
         with servers_lock:
-            inactive = []
-            for server_id, info in list(servers.items()):
-                time_since_heartbeat = current_time - info["last_heartbeat"]
-                if time_since_heartbeat > HEARTBEAT_TIMEOUT:
-                    inactive.append(server_id)
-                    print(f"[REGISTRY] Servidor inactivo detectado: {server_id}")
+            servers_to_check = [(sid, info.copy()) for sid, info in servers.items()]
+        
+        # Verificar servidores fuera del lock para no bloquear
+        for server_id, info in servers_to_check:
+            time_since_heartbeat = current_time - info["last_heartbeat"]
             
-            for server_id in inactive:
-                servers[server_id]["status"] = "inactive"
-                # Incrementar versión cuando se marca como inactivo
-                servers[server_id]["version"] = servers[server_id].get("version", 0) + 1
+            # Verificar si no ha enviado heartbeat recientemente
+            if time_since_heartbeat > HEARTBEAT_TIMEOUT:
+                inactive.append(server_id)
+                print(f"[REGISTRY] Servidor inactivo detectado (sin heartbeat): {server_id} ({time_since_heartbeat:.1f}s sin heartbeat)")
+                continue
             
-            if inactive:
+            # IMPORTANTE: También verificar que el servicio HTTP esté respondiendo
+            # Esto detecta casos donde el proceso de registro funciona pero el servicio web no
+            server_url = info.get("url", "")
+            if not server_url.startswith("http"):
+                # Construir URL completa
+                if ":" in server_url:
+                    server_url = f"http://{server_url}"
+                else:
+                    # Intentar detectar el puerto basándose en el tipo de servidor
+                    if "namenode" in server_id.lower():
+                        server_url = f"http://{server_url}:8010"
+                    elif "datanode" in server_id.lower():
+                        server_url = f"http://{server_url}:8020"
+                    else:
+                        server_url = f"http://{server_url}:8010"  # Default
+            
+            # Verificar conectividad HTTP
+            http_responding = False
+            try:
+                response = requests.get(f"{server_url}/", timeout=3)
+                if response.status_code == 200:
+                    http_responding = True
+            except requests.RequestException as e:
+                http_responding = False
+                # El servidor no responde HTTP, pero ha enviado heartbeat recientemente
+                # Esto indica que el proceso de registro funciona pero el servicio web no
+                # Necesitamos verificar múltiples veces antes de marcar como inactivo
+                with servers_lock:
+                    if server_id in servers:
+                        server_info = servers[server_id]
+                        http_check_key = f"last_http_check"
+                        http_failures_key = f"http_failures"
+                        
+                        if http_check_key not in server_info:
+                            server_info[http_check_key] = current_time
+                            server_info[http_failures_key] = 1
+                        else:
+                            last_http_check = server_info.get(http_check_key, 0)
+                            http_failures = server_info.get(http_failures_key, 0)
+                            
+                            # Si ha fallado múltiples veces y ha pasado suficiente tiempo
+                            if http_failures >= 2 and (current_time - last_http_check) > 15:
+                                inactive.append(server_id)
+                                print(f"[REGISTRY] Servidor inactivo detectado (no responde HTTP): {server_id}")
+                                print(f"[REGISTRY]   Último heartbeat: {time_since_heartbeat:.1f}s atrás")
+                                print(f"[REGISTRY]   Fallos HTTP consecutivos: {http_failures}")
+                                print(f"[REGISTRY]   Error HTTP: {e}")
+                            else:
+                                # Incrementar contador de fallos
+                                server_info[http_failures_key] = http_failures + 1
+                                server_info[http_check_key] = current_time
+            
+            # Si el servidor responde correctamente, resetear contadores
+            if http_responding:
+                with servers_lock:
+                    if server_id in servers:
+                        server_info = servers[server_id]
+                        if "http_failures" in server_info:
+                            del server_info["http_failures"]
+                        if "last_http_check" in server_info:
+                            del server_info["last_http_check"]
+        
+        # Actualizar estado de servidores inactivos
+        if inactive:
+            with servers_lock:
+                for server_id in inactive:
+                    if server_id in servers:
+                        servers[server_id]["status"] = "inactive"
+                        # Incrementar versión cuando se marca como inactivo
+                        servers[server_id]["version"] = servers[server_id].get("version", 0) + 1
+                        print(f"[REGISTRY] Servidor {server_id} marcado como inactivo")
+                
                 # Incrementar versión del estado del cluster
                 with cluster_lock:
                     cluster_state["version"] += 1

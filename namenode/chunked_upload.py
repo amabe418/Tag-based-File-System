@@ -90,18 +90,25 @@ class ChunkedUploadManager:
     """
     Gestiona sesiones de upload por chunks
     Thread-safe para operaciones concurrentes
+    Con persistencia de estado para recuperación después de reinicios
     """
     
-    def __init__(self):
+    def __init__(self, node_id: str = None):
         self.sessions: Dict[str, UploadSession] = {}
         self.lock = threading.Lock()
         self._ensure_temp_dir()
         self._cleanup_old_sessions_thread = None
         self._running = False
+        self.node_id = node_id
+        self._operation_manager = None
     
     def _ensure_temp_dir(self):
         """Asegura que el directorio temporal existe"""
         os.makedirs(UPLOAD_TEMP_DIR, exist_ok=True)
+    
+    def set_operation_manager(self, manager):
+        """Establece el manager de estado de operaciones"""
+        self._operation_manager = manager
     
     def start_cleanup_thread(self, max_age_hours: int = 24):
         """Inicia hilo de limpieza de sesiones antiguas"""
@@ -164,6 +171,27 @@ class ChunkedUploadManager:
         # Crear directorio temporal
         os.makedirs(session.get_temp_dir(), exist_ok=True)
         
+        # Persistir estado de la operación
+        if self._operation_manager:
+            self._operation_manager.create_operation(
+                operation_id=upload_id,
+                operation_type='upload',
+                user_id=user_id,
+                metadata={
+                    'filename': filename,
+                    'file_hash': file_hash,
+                    'file_size': file_size,
+                    'tags': tags,
+                    'chunk_size': chunk_size,
+                    'total_chunks': session.total_chunks
+                },
+                progress_data={
+                    'total_chunks': session.total_chunks,
+                    'uploaded_chunks': [],
+                    'progress_percentage': 0.0
+                }
+            )
+        
         print(f"[CHUNKED_UPLOAD] Sesión creada: {upload_id} - {filename} ({session.total_chunks} chunks)")
         
         return session
@@ -217,6 +245,34 @@ class ChunkedUploadManager:
                 path=chunk_path,
                 received_at=time.time()
             )
+        
+        # Actualizar progreso persistente (cada 5 chunks o siempre para chunks importantes)
+        if self._operation_manager and (chunk_index % 5 == 0 or chunk_index == session.total_chunks - 1):
+            uploaded_chunks = list(session.uploaded_chunks)
+            self._operation_manager.update_progress(
+                upload_id,
+                {
+                    'uploaded_chunks': uploaded_chunks,
+                    'progress_percentage': session.progress_percentage,
+                    'current_chunk': chunk_index,
+                    'last_chunk_received_at': time.time()
+                },
+                force_log=(chunk_index == session.total_chunks - 1)  # Log al último chunk
+            )
+        
+        # Actualizar estado si es el primer chunk o el último
+        if self._operation_manager:
+            if chunk_index == 0:
+                self._operation_manager.update_operation_state(upload_id, 'in_progress')
+            elif session.is_complete:
+                self._operation_manager.update_operation_state(
+                    upload_id,
+                    'in_progress',  # Aún no completado, solo chunks recibidos
+                    progress_data={
+                        'all_chunks_received': True,
+                        'ready_for_assembly': True
+                    }
+                )
         
         print(f"[CHUNKED_UPLOAD] Chunk {chunk_index + 1}/{session.total_chunks} guardado para {upload_id} ({session.progress_percentage:.1f}%)")
         
@@ -275,11 +331,21 @@ class ChunkedUploadManager:
             traceback.print_exc()
             return None
     
-    def cleanup_session(self, upload_id: str):
-        """Elimina una sesión y sus archivos temporales"""
+    def cleanup_session(self, upload_id: str, mark_completed: bool = True):
+        """
+        Elimina una sesión y sus archivos temporales
+        
+        Args:
+            upload_id: ID de la sesión
+            mark_completed: Si True, marca la operación como completada antes de limpiar
+        """
         session = self.get_session(upload_id)
         if not session:
             return
+        
+        # Marcar como completada en el estado persistente
+        if self._operation_manager and mark_completed:
+            self._operation_manager.complete_operation(upload_id, success=True)
         
         # Eliminar directorio temporal
         temp_dir = session.get_temp_dir()
@@ -297,12 +363,101 @@ class ChunkedUploadManager:
         
         print(f"[CHUNKED_UPLOAD] Sesión limpiada: {upload_id}")
     
-    def cleanup_old_sessions(self, max_age_seconds: float = 86400):
+    def recover_session(self, upload_id: str) -> Optional[UploadSession]:
         """
-        Limpia sesiones antiguas que no se han completado
+        Recupera una sesión desde el estado persistente
+        
+        Args:
+            upload_id: ID de la sesión a recuperar
+        
+        Returns:
+            UploadSession recuperada o None si no existe o no se puede recuperar
+        """
+        if not self._operation_manager:
+            return None
+        
+        # Obtener estado persistente
+        op_state = self._operation_manager.get_operation(upload_id)
+        if not op_state:
+            return None
+        
+        # Verificar que los chunks aún existen en disco
+        temp_dir = os.path.join(UPLOAD_TEMP_DIR, upload_id)
+        if not os.path.exists(temp_dir):
+            print(f"[CHUNKED_UPLOAD] ⚠️  No se puede recuperar {upload_id}: directorio temporal no existe")
+            return None
+        
+        # Reconstruir sesión desde metadata
+        metadata = op_state.metadata
+        progress = op_state.progress_data
+        
+        session = UploadSession(
+            upload_id=upload_id,
+            filename=metadata.get('filename', 'unknown'),
+            file_hash=metadata.get('file_hash', ''),
+            file_size=metadata.get('file_size', 0),
+            tags=metadata.get('tags', ''),
+            chunk_size=metadata.get('chunk_size', 5 * 1024 * 1024),
+            user_id=op_state.user_id or 'system',
+            started_at=op_state.created_at
+        )
+        
+        # Reconstruir información de chunks recibidos
+        uploaded_chunks = progress.get('uploaded_chunks', [])
+        for chunk_idx in uploaded_chunks:
+            chunk_path = os.path.join(temp_dir, f"chunk_{chunk_idx:06d}")
+            if os.path.exists(chunk_path):
+                chunk_size = os.path.getsize(chunk_path)
+                session.chunks[chunk_idx] = ChunkInfo(
+                    index=chunk_idx,
+                    hash='',  # Se recalculará si es necesario
+                    size=chunk_size,
+                    received=True,
+                    path=chunk_path,
+                    received_at=op_state.last_updated
+                )
+        
+        # Agregar a sesiones activas
+        with self.lock:
+            self.sessions[upload_id] = session
+        
+        print(f"[CHUNKED_UPLOAD] ✅ Sesión recuperada: {upload_id} | {len(uploaded_chunks)}/{session.total_chunks} chunks")
+        
+        return session
+    
+    def recover_all_sessions(self) -> List[UploadSession]:
+        """
+        Recupera todas las sesiones incompletas desde el estado persistente
+        
+        Returns:
+            Lista de UploadSession recuperadas
+        """
+        if not self._operation_manager:
+            return []
+        
+        # Obtener todas las operaciones de upload incompletas
+        incomplete_ops = self._operation_manager.get_operations_by_state(
+            operation_type='upload',
+            state=None  # Obtener todas
+        )
+        
+        incomplete_ops = [op for op in incomplete_ops if op.state not in ('completed', 'failed')]
+        
+        recovered = []
+        for op in incomplete_ops:
+            session = self.recover_session(op.operation_id)
+            if session:
+                recovered.append(session)
+        
+        return recovered
+    
+    def cleanup_old_sessions(self, max_age_seconds: float = 86400, inactivity_timeout: float = 300.0):
+        """
+        Limpia sesiones antiguas que no se han completado o están inactivas
         
         Args:
             max_age_seconds: Edad máxima en segundos (default: 24 horas)
+            inactivity_timeout: Tiempo sin actividad para considerar huérfana (default: 5 minutos)
         """
         current_time = time.time()
         to_cleanup = []
@@ -310,13 +465,27 @@ class ChunkedUploadManager:
         with self.lock:
             for upload_id, session in self.sessions.items():
                 age = current_time - session.started_at
+                
+                # Calcular tiempo desde último chunk recibido
+                last_chunk_time = max(
+                    (chunk.received_at for chunk in session.chunks.values() if chunk.received_at),
+                    default=session.started_at
+                )
+                inactivity = current_time - last_chunk_time
+                
+                # Limpiar si:
+                # 1. Es muy antigua (más de max_age_seconds)
+                # 2. Está inactiva por más de inactivity_timeout y no está completa
                 if age > max_age_seconds:
-                    to_cleanup.append(upload_id)
+                    to_cleanup.append((upload_id, "antigua"))
+                elif inactivity > inactivity_timeout and not session.is_complete:
+                    to_cleanup.append((upload_id, "inactiva"))
         
         if to_cleanup:
-            print(f"[CHUNKED_UPLOAD] Limpiando {len(to_cleanup)} sesiones antiguas...")
-            for upload_id in to_cleanup:
-                self.cleanup_session(upload_id)
+            print(f"[CHUNKED_UPLOAD] 🧹 Limpiando {len(to_cleanup)} sesiones huérfanas...")
+            for upload_id, reason in to_cleanup:
+                print(f"  - {upload_id[:16]}... ({reason})")
+                self.cleanup_session(upload_id, mark_completed=False)
     
     def get_all_sessions(self) -> List[dict]:
         """Obtiene información de todas las sesiones activas"""

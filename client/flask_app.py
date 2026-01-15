@@ -307,9 +307,9 @@ def api_download(filename):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route("/api/delete/<filename>", methods=["DELETE"])
-def api_delete(filename):
-    """Elimina un archivo."""
+@app.route("/api/delete/<int:file_id>", methods=["DELETE"])
+def api_delete(file_id):
+    """Elimina un archivo por su ID."""
     token = request.headers.get("Authorization", "").replace("Bearer ", "")
     
     leader_url, error = get_leader_url()
@@ -318,15 +318,131 @@ def api_delete(filename):
     
     try:
         response = requests.delete(
-            f"{leader_url}/delete/{filename}",
+            f"{leader_url}/delete-by-id/{file_id}",
             headers=get_auth_headers(token),
             timeout=30
         )
         
         if response.status_code == 200:
-            return jsonify({"success": True, "message": f"Archivo '{filename}' eliminado"})
+            data = response.json()
+            return jsonify({"success": data.get("success", True), "message": data.get("message", "Archivo eliminado")})
         else:
-            error_msg = response.json().get("detail", "Error al eliminar")
+            try:
+                error_msg = response.json().get("detail", "Error al eliminar")
+            except:
+                error_msg = f"Error HTTP {response.status_code}"
+            return jsonify({"success": False, "error": error_msg}), response.status_code
+            
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/add-tags", methods=["POST"])
+def api_add_tags():
+    """Agrega etiquetas a archivos."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    data = request.json
+    
+    query_tags = data.get("query_tags", "")
+    new_tags = data.get("new_tags", "")
+    
+    if not query_tags or not new_tags:
+        return jsonify({"success": False, "error": "Se requieren etiquetas de búsqueda y nuevas etiquetas"}), 400
+    
+    leader_url, error = get_leader_url()
+    if not leader_url:
+        return jsonify({"success": False, "error": f"No hay líder disponible: {error}"}), 503
+    
+    try:
+        response = requests.post(
+            f"{leader_url}/add-tags",
+            params={"query": query_tags, "new_tags": new_tags},
+            headers=get_auth_headers(token),
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            return jsonify({"success": True, "message": "Etiquetas agregadas correctamente"})
+        else:
+            try:
+                error_msg = response.json().get("detail", f"Error HTTP {response.status_code}")
+            except:
+                error_msg = f"Error HTTP {response.status_code}"
+            return jsonify({"success": False, "error": error_msg}), response.status_code
+            
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/delete-tags", methods=["POST"])
+def api_delete_tags():
+    """Elimina etiquetas de archivos."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    data = request.json
+    
+    query_tags = data.get("query_tags", "")
+    del_tags = data.get("del_tags", "")
+    
+    if not query_tags or not del_tags:
+        return jsonify({"success": False, "error": "Se requieren etiquetas de búsqueda y etiquetas a eliminar"}), 400
+    
+    leader_url, error = get_leader_url()
+    if not leader_url:
+        return jsonify({"success": False, "error": f"No hay líder disponible: {error}"}), 503
+    
+    try:
+        response = requests.post(
+            f"{leader_url}/delete-tags",
+            params={"query": query_tags, "del_tags": del_tags},
+            headers=get_auth_headers(token),
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            return jsonify({"success": True, "message": "Etiquetas eliminadas correctamente"})
+        else:
+            try:
+                error_msg = response.json().get("detail", f"Error HTTP {response.status_code}")
+            except:
+                error_msg = f"Error HTTP {response.status_code}"
+            return jsonify({"success": False, "error": error_msg}), response.status_code
+            
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/delete-by-tags", methods=["DELETE"])
+def api_delete_by_tags():
+    """Elimina archivos que tienen EXACTAMENTE las etiquetas especificadas."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    tags = request.args.get("tags", "")
+    
+    if not tags:
+        return jsonify({"success": False, "error": "Se requieren etiquetas"}), 400
+    
+    leader_url, error = get_leader_url()
+    if not leader_url:
+        return jsonify({"success": False, "error": f"No hay líder disponible: {error}"}), 503
+    
+    try:
+        # Usar endpoint de coincidencia exacta
+        response = requests.delete(
+            f"{leader_url}/delete-exact",
+            params={"tags": tags},
+            headers=get_auth_headers(token),
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            deleted = data.get("deleted", 0)
+            message = data.get("message", f"{deleted} archivo(s) eliminado(s)")
+            return jsonify({"success": data.get("success", deleted > 0), "message": message})
+        else:
+            try:
+                error_msg = response.json().get("detail", f"Error HTTP {response.status_code}")
+            except:
+                error_msg = f"Error HTTP {response.status_code}"
             return jsonify({"success": False, "error": error_msg}), response.status_code
             
     except Exception as e:

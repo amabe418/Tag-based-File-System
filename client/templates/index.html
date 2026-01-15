@@ -108,6 +108,54 @@
                 <div id="upload-status" style="margin-top: 10px; color: #aaa;"></div>
             </div>
 
+            <!-- Tag Operations Card -->
+            <div class="card">
+                <div class="card-header-collapsible" onclick="toggleTagOperations()">
+                    <h2 class="card-title">🏷️ Gestión de Etiquetas</h2>
+                    <span class="collapse-icon" id="tag-ops-icon">▶</span>
+                </div>
+                
+                <div class="tag-operations" id="tag-operations" style="display: none;">
+                    <!-- Agregar etiquetas -->
+                    <div class="tag-op-section">
+                        <h3>➕ Agregar etiquetas</h3>
+                        <div class="form-group">
+                            <label>Archivos con etiquetas:</label>
+                            <input type="text" id="add-tags-query" placeholder="etiqueta1, etiqueta2">
+                        </div>
+                        <div class="form-group">
+                            <label>Nuevas etiquetas a agregar:</label>
+                            <input type="text" id="add-tags-new" placeholder="nueva1, nueva2">
+                        </div>
+                        <button class="btn btn-primary" onclick="addTags()">Agregar etiquetas</button>
+                    </div>
+                    
+                    <!-- Eliminar etiquetas -->
+                    <div class="tag-op-section">
+                        <h3>➖ Eliminar etiquetas</h3>
+                        <div class="form-group">
+                            <label>Archivos con etiquetas:</label>
+                            <input type="text" id="del-tags-query" placeholder="etiqueta1, etiqueta2">
+                        </div>
+                        <div class="form-group">
+                            <label>Etiquetas a eliminar:</label>
+                            <input type="text" id="del-tags-remove" placeholder="eliminar1, eliminar2">
+                        </div>
+                        <button class="btn btn-danger" onclick="removeTags()">Eliminar etiquetas</button>
+                    </div>
+                    
+                    <!-- Eliminar archivos por etiquetas -->
+                    <div class="tag-op-section">
+                        <h3>🗑️ Eliminar archivos por etiquetas</h3>
+                        <div class="form-group">
+                            <label>Etiquetas de archivos a eliminar:</label>
+                            <input type="text" id="del-files-tags" placeholder="etiqueta1, etiqueta2">
+                        </div>
+                        <button class="btn btn-danger" onclick="deleteFilesByTags()">Eliminar archivos</button>
+                    </div>
+                </div>
+            </div>
+
             <!-- Files Card -->
             <div class="card">
                 <h2 class="card-title">Mis Archivos</h2>

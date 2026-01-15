@@ -185,7 +185,7 @@ function renderFiles(files) {
                 <td>
                     <div class="file-actions">
                         <button class="btn btn-primary btn-icon" onclick="downloadFile('${escapeHtml(name)}')" title="Descargar">📥</button>
-                        <button class="btn btn-danger btn-icon" onclick="deleteFile('${escapeHtml(name)}')" title="Eliminar">🗑️</button>
+                        <button class="btn btn-danger btn-icon" onclick="deleteFileById(${file.id})" title="Eliminar">🗑️</button>
                     </div>
                 </td>
             </tr>
@@ -363,17 +363,17 @@ function downloadFile(filename) {
 
 // ============ DELETE ============
 
-async function deleteFile(filename) {
-    if (!confirm(`¿Eliminar "${filename}"?`)) return;
-
+async function deleteFileById(fileId) {
+    console.log('[TBFS] deleteFileById llamada con:', fileId);
+    
     try {
-        const response = await fetch(`/api/delete/${encodeURIComponent(filename)}`, {
+        const response = await fetch(`/api/delete/${fileId}`, {
             method: 'DELETE',
             headers: { 'Authorization': `Bearer ${authToken}` }
         });
-
+        
         const data = await response.json();
-
+        
         if (data.success) {
             showMessage('main', data.message, 'success');
             loadFiles();
@@ -381,7 +381,8 @@ async function deleteFile(filename) {
             showMessage('main', data.error, 'error');
         }
     } catch (error) {
-        showMessage('main', 'Error al eliminar', 'error');
+        console.error('[TBFS] Error:', error);
+        showMessage('main', 'Error al eliminar archivo', 'error');
     }
 }
 
@@ -420,6 +421,134 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// ============ TAG OPERATIONS ============
+
+function toggleTagOperations() {
+    const container = document.getElementById('tag-operations');
+    const icon = document.getElementById('tag-ops-icon');
+    
+    if (container.style.display === 'none') {
+        container.style.display = 'grid';
+        icon.classList.add('open');
+    } else {
+        container.style.display = 'none';
+        icon.classList.remove('open');
+    }
+}
+
+async function addTags() {
+    const queryTags = document.getElementById('add-tags-query').value.trim();
+    const newTags = document.getElementById('add-tags-new').value.trim();
+    
+    if (!queryTags || !newTags) {
+        showMessage('main', 'Debes especificar las etiquetas de búsqueda y las nuevas etiquetas', 'error');
+        return;
+    }
+    
+    try {
+        const response = await fetch('/api/add-tags', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ query_tags: queryTags, new_tags: newTags })
+        });
+        
+        const data = await response.json();
+        
+        if (data.success) {
+            showMessage('main', data.message, 'success');
+            document.getElementById('add-tags-query').value = '';
+            document.getElementById('add-tags-new').value = '';
+            loadFiles();
+        } else {
+            showMessage('main', data.error, 'error');
+        }
+    } catch (error) {
+        showMessage('main', 'Error al agregar etiquetas', 'error');
+    }
+}
+
+async function removeTags() {
+    const queryTags = document.getElementById('del-tags-query').value.trim();
+    const delTags = document.getElementById('del-tags-remove').value.trim();
+    
+    if (!queryTags || !delTags) {
+        showMessage('main', 'Debes especificar las etiquetas de búsqueda y las etiquetas a eliminar', 'error');
+        return;
+    }
+    
+    try {
+        const response = await fetch('/api/delete-tags', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ query_tags: queryTags, del_tags: delTags })
+        });
+        
+        const data = await response.json();
+        
+        if (data.success) {
+            showMessage('main', data.message, 'success');
+            document.getElementById('del-tags-query').value = '';
+            document.getElementById('del-tags-remove').value = '';
+            loadFiles();
+        } else {
+            showMessage('main', data.error, 'error');
+        }
+    } catch (error) {
+        showMessage('main', 'Error al eliminar etiquetas', 'error');
+    }
+}
+
+async function deleteFilesByTags() {
+    console.log('[TBFS] deleteFilesByTags llamada');
+    
+    const tagsInput = document.getElementById('del-files-tags');
+    console.log('[TBFS] Input element:', tagsInput);
+    
+    if (!tagsInput) {
+        console.error('[TBFS] No se encontró el elemento del-files-tags');
+        showMessage('main', 'Error interno: campo no encontrado', 'error');
+        return;
+    }
+    
+    const tags = tagsInput.value.trim();
+    console.log('[TBFS] Tags ingresadas:', tags);
+    
+    if (!tags) {
+        showMessage('main', 'Debes especificar las etiquetas de los archivos a eliminar', 'error');
+        return;
+    }
+    
+    console.log('[TBFS] Enviando petición DELETE...');
+    
+    try {
+        const response = await fetch(`/api/delete-by-tags?tags=${encodeURIComponent(tags)}`, {
+            method: 'DELETE',
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        
+        console.log('[TBFS] Respuesta status:', response.status);
+        const data = await response.json();
+        console.log('[TBFS] Respuesta data:', data);
+        
+        if (data.success) {
+            showMessage('main', data.message, 'success');
+            tagsInput.value = '';
+            loadFiles();
+        } else {
+            showMessage('main', data.error, 'error');
+        }
+    } catch (error) {
+        console.error('[TBFS] Error:', error);
+        showMessage('main', 'Error al eliminar archivos: ' + error.message, 'error');
+    }
 }
 
 // Verificar estado cada 30 segundos

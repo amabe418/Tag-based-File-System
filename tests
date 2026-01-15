@@ -1,0 +1,12 @@
+Test 1:
+Crear una primera generación de nodos. 
+Hacer que el líder cambie tumbando al líder actual.
+Una vez que se seleccione el nuevo líder, tumbar los seguidores.
+Crear un nodo nuevo, este debe reconocer al líder.
+Crear par de nodos más
+Tumbar al líder.
+Entre los nodos de segunda generación debe encontrarse el nuevo líder.
+TENER EN CUENTA QUE DURANTE TODO ESTE PROCESO LA INFORMACIÓN QUE SE INTRODUZCA DEBE LLEGAR A LA GENERACIÓN NUEVA.
+
+Problemas encontrados aqui:
+Los namenodes no están replicando los usuarios que se crean, de forma que al hacer la primera variación de líder en la primera generación, intentar hacer login con un usuario que se creo bajo el mandato del primer líder no será posible con el segundo.

@@ -1,7 +1,7 @@
 import os
 import requests
 import streamlit as st
-import pandas as pd
+# import pandas as pd
 import math
 import random
 import time
@@ -11,6 +11,8 @@ from namenode_client import namenode_client
 
 # Configuración
 NAMENODE_PORT = int(os.getenv("NAMENODE_PORT", "8010"))
+USE_CHUNKED_UPLOAD_THRESHOLD = int(os.getenv("CHUNKED_UPLOAD_THRESHOLD", 5 * 1024 * 1024))  # 5MB por defecto
+CHUNK_SIZE = 5 * 1024 * 1024  # 5MB por chunk
 
 # Imprimir información de namenodes descubiertos al inicio
 namenode_client.print_namenodes()
@@ -288,6 +290,7 @@ def get_auth_headers():
         return {"Authorization": f"Bearer {st.session_state.auth_token}"}
     return {}
 
+# Region Aplicacion
 st.set_page_config(page_title="Tag-based File System", layout="wide")
 st.markdown("---")
 st.title("📂 Tag-based File System")
@@ -326,6 +329,7 @@ if not st.session_state.auth_token:
 
     else:
         st.subheader("Crear cuenta")
+        st
         with st.form("signup_form"):
             su_username = st.text_input("Usuario:", key="signup_username")
             su_password = st.text_input("Contraseña:", type="password", key="signup_password")
@@ -997,17 +1001,17 @@ if files:
     end_idx = start_idx + ITEMS_PER_PAGE
     visible_files = files[start_idx:end_idx]
 
-    # Crear DataFrame con los archivos visibles
-    df_data = []
-    for f in visible_files:
-        file_name = f.get("name", "")
-        tags = f.get("tags", "")
-        df_data.append({
-            "Nombre": file_name,
-            "Etiquetas": tags if tags else "(sin etiquetas)"
-        })
+    # # Crear DataFrame con los archivos visibles
+    # df_data = []
+    # for f in visible_files:
+    #     file_name = f.get("name", "")
+    #     tags = f.get("tags", "")
+    #     df_data.append({
+    #         "Nombre": file_name,
+    #         "Etiquetas": tags if tags else "(sin etiquetas)"
+    #     })
     
-    df = pd.DataFrame(df_data)
+    # df = pd.DataFrame(df_data)
     
     # Mostrar etiqueta de paginación antes de la tabla
     st.markdown(
@@ -1015,116 +1019,47 @@ if files:
         unsafe_allow_html=True
     )
     
-    # Mostrar tabla con data_editor para permitir selección
-    st.markdown("### 📋 Tabla de archivos")
+    # Mostrar tabla de archivos compacta
+    st.markdown("### 📋 Archivos")
     
-    # Preparar DataFrame con columna de selección según estado actual
-    df_with_selection = df.copy()
-    selection_column = [f.get("name") in st.session_state.selected_files for f in visible_files]
-    df_with_selection["Seleccionar"] = selection_column
-
-    # Obtener versión de tabla para esta página (para forzar reinicialización de widget)
     page_idx = st.session_state.current_page
-    page_ver = st.session_state.table_version.get(page_idx, 0)
+    
+    # Estilo compacto para la tabla
+    st.markdown("""
+    <style>
+    .compact-table .stButton button { padding: 0.1rem 0.5rem; min-height: 1.5rem; }
+    .compact-table [data-testid="stDownloadButton"] button { padding: 0.1rem 0.5rem; min-height: 1.5rem; }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    with st.container():
+        # Encabezados
+        cols = st.columns([4, 4, 1])
+        cols[0].markdown("**Nombre**")
+        cols[1].markdown("**Etiquetas**")
+        cols[2].markdown("**Descargar**")
+        st.markdown("---")
+        
 
-    # Form: cambios dentro no provocan rerun hasta enviar
-    with st.form(f"file_table_form_{page_idx}", clear_on_submit=False):
-        edited_df = st.data_editor(
-            df_with_selection,
-            column_config={
-                "Nombre": st.column_config.TextColumn(
-                    "Nombre del archivo",
-                    width="large",
-                ),
-                "Etiquetas": st.column_config.TextColumn(
-                    "Etiquetas",
-                    width="large",
-                ),
-                "Seleccionar": st.column_config.CheckboxColumn(
-                    "Seleccionar",
-                    help="Marca los archivos que deseas descargar",
-                    default=False,
-                ),
-            },
-            hide_index=True,
-            use_container_width=True,
-            key=f"file_table_{page_idx}_{page_ver}",
-            num_rows="fixed"
-        )
-
-        col_select_all, col_deselect_all, col_download_selected = st.columns([1.5, 1.5, 2])
-        select_all = col_select_all.form_submit_button("✅ Seleccionar todos", use_container_width=True, disabled=not is_connected)
-        deselect_all = col_deselect_all.form_submit_button("❌ Deseleccionar todos", use_container_width=True, disabled=not is_connected)
-        download_clicked = col_download_selected.form_submit_button("📥 Descargar seleccionados", use_container_width=True, type="primary", disabled=not is_connected)
-
-        # Manejo de envíos del formulario
-        if select_all:
-            for f in visible_files:
-                st.session_state.selected_files.add(f.get("name"))
-            st.session_state.table_version[page_idx] = page_ver + 1  # forzar reinicio del widget
-            st.rerun()
-
-        if deselect_all:
-            # Quitar de la selección todos los visibles y forzar reinicio del widget
-            visible_names = [f.get("name") for f in visible_files]
-            for name in visible_names:
-                st.session_state.selected_files.discard(name)
-            st.session_state.table_version[page_idx] = page_ver + 1  # forzar reinicio del widget
-            st.rerun()
-
-        if download_clicked:
-            # Sincronizar selección desde el editor
-            for _, row in edited_df.iterrows():
-                file_name = row["Nombre"]
-                is_selected = bool(row["Seleccionar"])
-                if is_selected:
-                    st.session_state.selected_files.add(file_name)
-                else:
-                    st.session_state.selected_files.discard(file_name)
-
-            selected_in_page = [row["Nombre"] for _, row in edited_df.iterrows() if bool(row["Seleccionar"]) ]
-            if not selected_in_page:
-                st.warning("Selecciona al menos un archivo.")
-            else:
-                # Guardar archivos para descargar fuera del formulario
-                user = st.session_state.logged_in_user or "unknown"
-                print(f"[CLIENT] [DOWNLOAD] 📥 Usuario {user} inició descarga de {len(selected_in_page)} archivo(s)")
-                print(f"[CLIENT] [DOWNLOAD] 📋 Archivos seleccionados: {', '.join(selected_in_page)}")
-                st.session_state.files_to_download = selected_in_page.copy()
-                st.rerun()
-
-    # Mostrar botones de descarga fuera del formulario
-    if st.session_state.files_to_download:
-        st.markdown("### 📥 Descargar archivos seleccionados")
-        files_to_remove = []
-        for file_name in st.session_state.files_to_download:
+        # Filas compactas
+        for idx, file_info in enumerate(visible_files):
+            file_name = file_info.get("name", "Sin nombre")
+            tags_data = file_info.get("tags", [])
+            file_tags = ", ".join(str(t) for t in tags_data) if isinstance(tags_data, list) else str(tags_data)
+            
+            cols = st.columns([4, 4, 1])
+            cols[0].text(file_name)
+            cols[1].text(file_tags if file_tags else "-")
+            
+            # Botón de descarga
             file_content, error = get_file_content(file_name)
-            if file_content:
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.download_button(
-                        label=f"📥 Descargar {file_name}",
-                        data=file_content,
-                        file_name=file_name,
-                        mime="application/octet-stream",
-                        key=f"download_{file_name}_{page_idx}",
-                        use_container_width=True
-                    )
-                with col2:
-                    if st.button("❌", key=f"remove_{file_name}_{page_idx}", help="Quitar de la lista"):
-                        files_to_remove.append(file_name)
+            
+            if file_content and is_connected:
+                cols[2].download_button("📥", data=file_content, file_name=file_name, 
+                    mime="application/octet-stream", key=f"dl_{page_idx}_{idx}")
             else:
-                st.error(f"❌ Error al obtener '{file_name}': {error}")
-                files_to_remove.append(file_name)
-        
-        # Remover archivos de la lista
-        for file_name in files_to_remove:
-            if file_name in st.session_state.files_to_download:
-                st.session_state.files_to_download.remove(file_name)
-        
-        if st.button("🗑️ Limpiar lista de descargas", key="clear_downloads"):
-            st.session_state.files_to_download = []
-            st.rerun()
+                cols[2].button("📥", key=f"dl_{page_idx}_{idx}", disabled=True)
+            st.markdown("---")
 
     # --- Controles de paginación ---
     st.markdown("<br>", unsafe_allow_html=True)

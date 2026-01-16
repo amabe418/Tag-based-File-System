@@ -16,7 +16,7 @@ from security.models import User, Role, Permission, UserLogin, UserCreate, Passw
 # Configuración JWT
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "60"))
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))  # 8 horas por defecto asi evitamos que el token expire en el medio de una operacion
 
 # Configuración de hash de contraseñas
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")

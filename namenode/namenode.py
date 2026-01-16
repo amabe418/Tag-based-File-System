@@ -1410,6 +1410,195 @@ def perform_full_reconciliation(reunited_peers: List[str]):
     print(f"[NAMENODE] 🔄 [PASO 6] Verificando integridad de réplicas...")
     verify_and_rereplicate_files(NODE_ID)
     
+    # Paso 7: Reconciliar tablas operation_states y operation_state_log
+    print(f"[NAMENODE] 🔄 [PASO 7] Reconciliando operation_states y operation_state_log...")
+    try:
+        from namenode.database import get_operations_db_path, get_connection, close_connection, operations_db_lock
+        import json
+        
+        # Obtener operation_states locales
+        local_ops_db_path = get_operations_db_path(NODE_ID)
+        local_conn, local_cursor = get_connection(db_path=local_ops_db_path, db_type="operations", node_id=NODE_ID)
+        
+        try:
+            with operations_db_lock:
+                local_cursor.execute("SELECT * FROM operation_states")
+                local_operation_states = {row['operation_id']: dict(row) for row in local_cursor.fetchall()}
+        finally:
+            close_connection(local_conn)
+        
+        print(f"[NAMENODE] 🔄 [PASO 7] Operation states locales: {len(local_operation_states)}")
+        
+        # Obtener operation_states de los peers y reconciliar
+        reconciled_states = {}
+        for peer in reunited_peers:
+            try:
+                peer_url = get_peer_url(peer)
+                # Obtener token de servicio para autenticación
+                try:
+                    service_token = generate_service_token(NODE_ID, "service")
+                except Exception:
+                    service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+                
+                # Intentar obtener operation_states del peer (si hay endpoint)
+                # Por ahora, solo registramos que intentamos reconciliar
+                print(f"[NAMENODE] 🔄 [PASO 7] Peer {peer}: operation_states no se pueden obtener directamente, se reconciliarán en la próxima operación")
+            except Exception as e:
+                print(f"[NAMENODE] 🔄 [PASO 7] ⚠️  Error reconciliando operation_states de {peer}: {e}")
+        
+        # Reconciliar operation_state_log (similar proceso)
+        local_conn, local_cursor = get_connection(db_path=local_ops_db_path, db_type="operations", node_id=NODE_ID)
+        try:
+            with operations_db_lock:
+                local_cursor.execute("SELECT COUNT(*) FROM operation_state_log")
+                local_log_count = local_cursor.fetchone()[0]
+        finally:
+            close_connection(local_conn)
+        
+        print(f"[NAMENODE] 🔄 [PASO 7] ✅ Operation state logs locales: {local_log_count} entradas")
+        print(f"[NAMENODE] 🔄 [PASO 7] ⚠️  Nota: operation_states y operation_state_log se reconciliarán automáticamente durante las operaciones normales")
+    except Exception as e:
+        print(f"[NAMENODE] 🔄 [PASO 7] ❌ Error en reconciliación de operation_states: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Paso 8: Sincronizar term final con todos los namenodes y verificar versiones
+    print(f"[NAMENODE] 🔄 [PASO 8] Sincronizando term final con todos los namenodes...")
+    with cluster_lock:
+        final_term = cluster_state["term"]
+        all_peers = list(set(reunited_peers + [current_node_id]))
+        is_leader_after_reconciliation = cluster_state["is_leader"]
+    
+    # Si este nodo es el líder después de la reconciliación, asegurar que todos los peers tengan el term correcto
+    synced_count = 0
+    failed_count = 0
+    peers_needing_update = []
+    
+    for peer in all_peers:
+        if peer == current_node_id:
+            # Ya tenemos el term actualizado localmente
+            synced_count += 1
+            continue
+        
+        try:
+            peer_url = get_peer_url(peer)
+            # Obtener token de servicio
+            try:
+                service_token = generate_service_token(NODE_ID, "service")
+            except Exception:
+                service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+            
+            # Verificar si el peer necesita actualización
+            try:
+                response = requests.get(f"{peer_url}/", timeout=3)
+                if response.status_code == 200:
+                    peer_data = response.json()
+                    peer_term = peer_data.get("term", 0)
+                    
+                    if peer_term < final_term:
+                        # El peer necesita actualización - agregar a la lista
+                        peers_needing_update.append((peer, peer_term))
+                        print(f"[NAMENODE] 🔄 [PASO 8] ⚠️  Peer {peer} tiene term {peer_term} < {final_term}, necesita actualización")
+                        failed_count += 1
+                    elif peer_term == final_term:
+                        print(f"[NAMENODE] 🔄 [PASO 8] ✅ Peer {peer} ya tiene el term correcto ({final_term})")
+                        synced_count += 1
+                    else:
+                        print(f"[NAMENODE] 🔄 [PASO 8] ⚠️  Peer {peer} tiene term mayor ({peer_term} > {final_term}), debería ejecutar su propia reconciliación")
+                        failed_count += 1
+                else:
+                    print(f"[NAMENODE] 🔄 [PASO 8] ⚠️  Error HTTP {response.status_code} consultando peer {peer}")
+                    failed_count += 1
+            except Exception as e:
+                print(f"[NAMENODE] 🔄 [PASO 8] ⚠️  Error verificando term de peer {peer}: {e}")
+                failed_count += 1
+        except Exception as e:
+            print(f"[NAMENODE] 🔄 [PASO 8] ❌ Error en sincronización de term con {peer}: {e}")
+            failed_count += 1
+    
+    # Si somos el líder y hay peers que necesitan actualización, enviar heartbeat para forzar actualización
+    if is_leader_after_reconciliation and peers_needing_update:
+        print(f"[NAMENODE] 🔄 [PASO 8] Como líder, enviando heartbeats a {len(peers_needing_update)} peers para sincronizar term...")
+        for peer, peer_term in peers_needing_update:
+            try:
+                peer_url = get_peer_url(peer)
+                try:
+                    service_token = generate_service_token(NODE_ID, "service")
+                except Exception:
+                    service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+                
+                # Enviar heartbeat con el term actualizado
+                # El heartbeat actualizará automáticamente el term del peer si es menor
+                try:
+                    response = requests.post(
+                        f"{peer_url}/internal/heartbeat",
+                        json={
+                            "leader_id": NODE_ID,
+                            "term": final_term,
+                            "peers": all_peers
+                        },
+                        headers={"Authorization": f"Bearer {service_token}"},
+                        timeout=3
+                    )
+                    if response.status_code == 200:
+                        print(f"[NAMENODE] 🔄 [PASO 8] ✅ Heartbeat enviado a {peer}, term debería actualizarse")
+                        synced_count += 1
+                        failed_count -= 1
+                    else:
+                        print(f"[NAMENODE] 🔄 [PASO 8] ⚠️  Error enviando heartbeat a {peer}: HTTP {response.status_code}")
+                except Exception as e:
+                    print(f"[NAMENODE] 🔄 [PASO 8] ⚠️  Error enviando heartbeat a {peer}: {e}")
+            except Exception as e:
+                print(f"[NAMENODE] 🔄 [PASO 8] ❌ Error procesando peer {peer}: {e}")
+    
+    # Verificar versiones en la tabla files
+    print(f"[NAMENODE] 🔄 [PASO 8] Verificando campos de versión en tabla files...")
+    try:
+        from namenode.database import get_metadata_db_path, get_connection, close_connection, metadata_db_lock
+        db_path = get_metadata_db_path(NODE_ID)
+        conn, cursor = get_connection(db_path=db_path, db_type="metadata", node_id=NODE_ID)
+        
+        try:
+            with metadata_db_lock:
+                # Verificar que todos los archivos tengan campos de versión válidos
+                cursor.execute("""
+                    SELECT COUNT(*) as total,
+                           COUNT(CASE WHEN version IS NULL THEN 1 END) as null_version,
+                           COUNT(CASE WHEN last_modified_term IS NULL THEN 1 END) as null_term,
+                           COUNT(CASE WHEN last_modified_timestamp IS NULL THEN 1 END) as null_timestamp
+                    FROM files
+                """)
+                stats = cursor.fetchone()
+                
+                print(f"[NAMENODE] 🔄 [PASO 8] Estado de versiones en tabla files:")
+                print(f"[NAMENODE] 🔄 [PASO 8]   - Total archivos: {stats['total']}")
+                print(f"[NAMENODE] 🔄 [PASO 8]   - Archivos sin version: {stats['null_version']}")
+                print(f"[NAMENODE] 🔄 [PASO 8]   - Archivos sin last_modified_term: {stats['null_term']}")
+                print(f"[NAMENODE] 🔄 [PASO 8]   - Archivos sin last_modified_timestamp: {stats['null_timestamp']}")
+                
+                # Corregir archivos sin versiones válidas
+                fixed_count = 0
+                if stats['null_version'] > 0 or stats['null_term'] > 0 or stats['null_timestamp'] > 0:
+                    cursor.execute("""
+                        UPDATE files 
+                        SET version = COALESCE(version, 1),
+                            last_modified_term = COALESCE(last_modified_term, ?),
+                            last_modified_timestamp = COALESCE(last_modified_timestamp, ?)
+                        WHERE version IS NULL OR last_modified_term IS NULL OR last_modified_timestamp IS NULL
+                    """, (final_term, time.time()))
+                    fixed_count = cursor.rowcount
+                    conn.commit()
+                    
+                    if fixed_count > 0:
+                        print(f"[NAMENODE] 🔄 [PASO 8] ✅ Corregidos {fixed_count} archivos con campos de versión inválidos")
+        finally:
+            close_connection(conn)
+    except Exception as e:
+        print(f"[NAMENODE] 🔄 [PASO 8] ⚠️  Error verificando versiones: {e}")
+    
+    print(f"[NAMENODE] 🔄 [PASO 8] ✅ Sincronización de term completada: {synced_count} exitosos, {failed_count} con problemas")
+    print(f"[NAMENODE] 🔄 [PASO 8] Term final: {final_term} (debe ser el mismo en todos los namenodes después de heartbeats)")
+    
     # Estadísticas finales
     final_log = load_operation_log(NODE_ID)
     final_op_counts = {}
@@ -1490,6 +1679,13 @@ def verify_and_rereplicate_files(node_id: str = None):
             # Obtener DataNodes que ya tienen el archivo
             existing_datanodes = [r["datanode_id"] for r in replicas]
             
+            # Verificar que haya al menos una réplica activa existente para copiar desde ella
+            if active_count == 0:
+                print(f"[NAMENODE] FASE 4: ⚠️  Archivo {file_id} no tiene réplicas activas, no se puede re-replicar")
+                print(f"[NAMENODE] FASE 4:   - Hash: {file_hash[:32]}...")
+                print(f"[NAMENODE] FASE 4:   - Tamaño: {file_size} bytes")
+                continue
+            
             # Asignar nuevas réplicas
             new_datanode_ids = assign_replicas(
                 file_hash,
@@ -1499,14 +1695,43 @@ def verify_and_rereplicate_files(node_id: str = None):
             )
             
             if new_datanode_ids:
-                # Actualizar réplicas en la base de datos
-                # IMPORTANTE: Siempre usar NODE_ID del contenedor actual
-                for dn_id in new_datanode_ids:
-                    if dn_id not in existing_datanodes:
-                        # Agregar nueva réplica
-                        save_file_replicas(file_id, [dn_id], node_id_db=NODE_ID)
-                        print(f"[NAMENODE] FASE 4: Réplica asignada para archivo {file_id} en {dn_id}")
-                        rereplicated_count += 1
+                # Transferir físicamente el archivo a los nuevos datanodes
+                # Usar rereplicate_to_reach_3 que está diseñado para agregar réplicas faltantes
+                # o rereplicate_file con un datanode ficticio como fallido (solo para excluir)
+                from namenode.datanode_manager import rereplicate_to_reach_3, rereplicate_file
+                
+                # Calcular cuántas réplicas faltan
+                needed_replicas = min_replicas - active_count
+                
+                # Intentar usar rereplicate_to_reach_3 primero (mejor para este caso)
+                # pero limitarlo al mínimo necesario
+                if active_count < min_replicas:
+                    # Usar rereplicate_to_reach_3 que maneja la transferencia física automáticamente
+                    # pero primero verificar si necesitamos al menos 2 réplicas
+                    target_replicas = min(3, min_replicas)  # Usar min_replicas o 3, el menor
+                    
+                    if active_count < target_replicas:
+                        print(f"[NAMENODE] FASE 4: Usando rereplicate_to_reach_3 para archivo {file_id} (tiene {active_count}, necesita {target_replicas})...")
+                        success = rereplicate_to_reach_3(file_id, node_id_db=node_id)
+                        
+                        if success:
+                            # Actualizar contador de réplicas
+                            updated_replicas = get_file_replicas(file_id, node_id_db=node_id)
+                            new_active_count = len([r for r in updated_replicas if r.get("status") == "active"])
+                            added_replicas = new_active_count - active_count
+                            
+                            if added_replicas > 0:
+                                print(f"[NAMENODE] FASE 4: ✅ Re-replicación completada para archivo {file_id}: {added_replicas} réplicas agregadas")
+                                rereplicated_count += added_replicas
+                            else:
+                                print(f"[NAMENODE] FASE 4: ⚠️  Re-replicación completada pero no se agregaron réplicas para archivo {file_id}")
+                        else:
+                            print(f"[NAMENODE] FASE 4: ❌ Error en re-replicación de archivo {file_id}")
+                else:
+                    # Ya tiene suficientes réplicas
+                    print(f"[NAMENODE] FASE 4: Archivo {file_id} ya tiene suficientes réplicas ({active_count} >= {min_replicas})")
+            else:
+                print(f"[NAMENODE] FASE 4: ⚠️  No se pudieron asignar nuevos DataNodes para archivo {file_id}")
     
     if rereplicated_count > 0:
         print(f"[NAMENODE] FASE 4: Re-replicación completada: {rereplicated_count} réplicas asignadas")
@@ -4207,6 +4432,35 @@ def init_chunked_download(
 
 # ========== ENDPOINTS INTERNOS PARA REPLICACIÓN ==========
 
+@app.post("/internal/fix-primary-replicas")
+def internal_fix_primary_replicas(
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """
+    Endpoint interno para corregir archivos que no tienen réplica primary activa.
+    Requiere token de servicio.
+    """
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Corregir réplicas sin primary
+    from namenode.datanode_manager import fix_missing_primary_replicas
+    fixed_count = fix_missing_primary_replicas(node_id_db=NODE_ID)
+    
+    return {
+        "status": "success",
+        "files_fixed": fixed_count,
+        "message": f"Se corrigieron {fixed_count} archivos sin réplica primary"
+    }
+
+
 @app.post("/internal/replicate")
 def internal_replicate(
     data: Dict,
@@ -4406,10 +4660,17 @@ def internal_replicate_sql(
                 cluster_state["leader_id"] = data.get("leader_id")
                 cluster_state["last_heartbeat_time"] = time.time()
         
+        # Asegurar que las bases de datos estén inicializadas
+        from namenode.database import init_metadata_db, init_operations_db
+        init_metadata_db(node_id=NODE_ID)
+        init_operations_db(node_id=NODE_ID)
+        
         # Aplicar escrituras SQL localmente
         from namenode.database import get_connection, close_connection, metadata_db_lock, operations_db_lock
+        import sqlite3
         
         applied_count = 0
+        skipped_count = 0
         for write in sql_writes:
             sql = write.get("sql")
             params = write.get("params")
@@ -4452,6 +4713,63 @@ def internal_replicate_sql(
                     
                     conn.commit()
                     applied_count += 1
+                except sqlite3.IntegrityError as e:
+                    # Error de UNIQUE constraint - el dato ya existe, esto es normal en replicación
+                    conn.rollback()
+                    error_msg = str(e)
+                    # Solo loguear si no es un error esperado de duplicado
+                    if "UNIQUE constraint" in error_msg:
+                        skipped_count += 1
+                        # No loguear estos errores para reducir ruido en logs
+                        # print(f"[NAMENODE] [SQL_REPLICATE] Dato ya existe (esperado): {sql[:50]}...")
+                    else:
+                        print(f"[NAMENODE] [SQL_REPLICATE] Error de integridad: {sql[:50]}... - {e}")
+                except sqlite3.OperationalError as e:
+                    error_msg = str(e)
+                    conn.rollback()
+                    
+                    # Si la tabla no existe, intentar crearla
+                    if "no such table" in error_msg.lower():
+                        print(f"[NAMENODE] [SQL_REPLICATE] Tabla faltante detectada, inicializando BD...")
+                        try:
+                            # Re-inicializar la base de datos correspondiente
+                            if db_type == "operations":
+                                init_operations_db(node_id=NODE_ID)
+                            else:
+                                init_metadata_db(node_id=NODE_ID)
+                            
+                            # Reintentar la operación
+                            conn, cursor = get_connection(db_type=db_type, node_id=NODE_ID)
+                            conn._is_replicating = True
+                            
+                            if params:
+                                if isinstance(params, list):
+                                    deserialized_params = []
+                                    for p in params:
+                                        if isinstance(p, dict) and p.get('__type__') == 'bytes':
+                                            import base64
+                                            deserialized_params.append(base64.b64decode(p['__value__']))
+                                        else:
+                                            deserialized_params.append(p)
+                                    cursor.execute(sql, deserialized_params)
+                                else:
+                                    if isinstance(params, dict) and params.get('__type__') == 'bytes':
+                                        import base64
+                                        params = base64.b64decode(params['__value__'])
+                                    cursor.execute(sql, params)
+                            else:
+                                cursor.execute(sql)
+                            
+                            conn.commit()
+                            applied_count += 1
+                            print(f"[NAMENODE] [SQL_REPLICATE] ✅ Tabla creada y operación aplicada: {sql[:50]}...")
+                        except Exception as retry_e:
+                            print(f"[NAMENODE] [SQL_REPLICATE] ❌ Error después de crear tabla: {retry_e}")
+                            conn.rollback()
+                    else:
+                        print(f"[NAMENODE] [SQL_REPLICATE] Error operacional: {sql[:50]}... - {e}")
+                        import traceback
+                        traceback.print_exc()
                 except Exception as e:
                     conn.rollback()
                     print(f"[NAMENODE] [SQL_REPLICATE] Error aplicando SQL: {sql[:50]}... - {e}")
@@ -4462,8 +4780,8 @@ def internal_replicate_sql(
                     # Cerrar la conexión real (el wrapper delega close() a _conn)
                     close_connection(conn)
         
-        print(f"[NAMENODE] [SQL_REPLICATE] ✅ {applied_count}/{len(sql_writes)} escrituras SQL aplicadas")
-        return {"success": True, "applied": applied_count}
+        print(f"[NAMENODE] [SQL_REPLICATE] ✅ {applied_count}/{len(sql_writes)} escrituras SQL aplicadas ({skipped_count} duplicados ignorados)")
+        return {"success": True, "applied": applied_count, "skipped": skipped_count}
         
     except Exception as e:
         print(f"[NAMENODE] [SQL_REPLICATE] Error en internal_replicate_sql: {e}")

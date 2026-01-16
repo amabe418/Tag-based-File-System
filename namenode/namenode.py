@@ -1572,6 +1572,70 @@ def replicate_to_peers(operation: OperationLog):
     return replicated
 
 
+def replicate_sql_writes(sql_writes: List[Dict], node_id: str = None):
+    """
+    Replica escrituras SQL a los peers del cluster.
+    
+    Args:
+        sql_writes: Lista de diccionarios con 'sql', 'params', y 'db_type'
+        node_id: ID del nodo (opcional)
+    """
+    if node_id is None:
+        node_id = NODE_ID
+    
+    with cluster_lock:
+        peers = cluster_state["peers"].copy()
+        term = cluster_state["term"]
+        leader_id = cluster_state["node_id"]
+    
+    # Si no hay peers o no hay escrituras, no hay nada que replicar
+    if not peers or not sql_writes:
+        return True
+    
+    # Obtener token de servicio para autenticación
+    try:
+        service_token = generate_service_token(cluster_state["node_id"], "service")
+    except Exception as e:
+        print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ Error generando token: {e}, usando token pre-compartido")
+        service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+    
+    success_count = 0
+    for peer in peers:
+        try:
+            peer_url = get_peer_url(peer)
+            response = requests.post(
+                f"{peer_url}/internal/replicate-sql",
+                json={
+                    "sql_writes": sql_writes,
+                    "term": term,
+                    "timestamp": time.time()
+                },
+                headers={"Authorization": f"Bearer {service_token}"},
+                timeout=5
+            )
+            if response.status_code == 200:
+                success_count += 1
+                update_peer_status(peer, True)
+            else:
+                update_peer_status(peer, False)
+                print(f"[NAMENODE] [SQL_REPLICATE] Error replicando a {peer}: {response.status_code}")
+        except Exception as e:
+            update_peer_status(peer, False)
+            print(f"[NAMENODE] [SQL_REPLICATE] Error replicando a {peer}: {e}")
+    
+    # Se necesita mayoría (quorum): al menos 2 de 3 nodos
+    total_nodes = len(peers) + 1
+    quorum = (total_nodes // 2) + 1
+    replicated = success_count + 1 >= quorum
+    
+    if not replicated:
+        print(f"[NAMENODE] [SQL_REPLICATE] WARNING: Solo se replicó a {success_count + 1}/{total_nodes} nodos (quorum: {quorum})")
+    else:
+        print(f"[NAMENODE] [SQL_REPLICATE] ✅ {len(sql_writes)} escrituras SQL replicadas a {success_count + 1} peers")
+    
+    return replicated
+
+
 def request_vote(candidate_id: str, term: int) -> bool:
     """Solicita votos para elección de líder entre los nodos disponibles"""
     with cluster_lock:
@@ -4224,6 +4288,108 @@ def internal_replicate(
         return {"success": True}
     except Exception as e:
         print(f"[NAMENODE] Error en internal_replicate: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "message": str(e)}
+
+
+@app.post("/internal/replicate-sql")
+def internal_replicate_sql(
+    data: Dict,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """Endpoint interno para recibir replicación de escrituras SQL del líder"""
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene de otro namenode
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not (service_id.startswith("namenode-") or service_id.startswith("tbfs-namenode-")):
+        raise HTTPException(status_code=403, detail="Solo namenodes pueden replicar")
+    
+    try:
+        sql_writes = data.get("sql_writes", [])
+        term = data.get("term")
+        timestamp = data.get("timestamp")
+        
+        with cluster_lock:
+            current_term = cluster_state["term"]
+            
+            # Actualizar término si es mayor
+            if term > current_term:
+                cluster_state["term"] = term
+                cluster_state["is_leader"] = False
+                cluster_state["leader_id"] = data.get("leader_id")
+                cluster_state["last_heartbeat_time"] = time.time()
+        
+        # Aplicar escrituras SQL localmente
+        from namenode.database import get_connection, close_connection, metadata_db_lock, operations_db_lock
+        
+        applied_count = 0
+        for write in sql_writes:
+            sql = write.get("sql")
+            params = write.get("params")
+            db_type = write.get("db_type", "metadata")
+            
+            if not sql:
+                continue
+            
+            # Seleccionar lock según tipo de BD
+            db_lock_to_use = operations_db_lock if db_type == "operations" else metadata_db_lock
+            
+            with db_lock_to_use:
+                conn, cursor = get_connection(db_type=db_type, node_id=NODE_ID)
+                try:
+                    # Marcar que estamos replicando para evitar loop infinito
+                    # La conexión es un ReplicatingConnection, así que podemos setear el flag
+                    conn._is_replicating = True
+                    
+                    # Deserializar parámetros si es necesario
+                    if params:
+                        # Si params es una lista, ejecutar con parámetros
+                        if isinstance(params, list):
+                            # Deserializar bytes si es necesario
+                            deserialized_params = []
+                            for p in params:
+                                if isinstance(p, dict) and p.get('__type__') == 'bytes':
+                                    import base64
+                                    deserialized_params.append(base64.b64decode(p['__value__']))
+                                else:
+                                    deserialized_params.append(p)
+                            cursor.execute(sql, deserialized_params)
+                        else:
+                            # Parámetro único
+                            if isinstance(params, dict) and params.get('__type__') == 'bytes':
+                                import base64
+                                params = base64.b64decode(params['__value__'])
+                            cursor.execute(sql, params)
+                    else:
+                        cursor.execute(sql)
+                    
+                    conn.commit()
+                    applied_count += 1
+                except Exception as e:
+                    conn.rollback()
+                    print(f"[NAMENODE] [SQL_REPLICATE] Error aplicando SQL: {sql[:50]}... - {e}")
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    conn._is_replicating = False
+                    # Cerrar la conexión real (el wrapper delega close() a _conn)
+                    close_connection(conn)
+        
+        print(f"[NAMENODE] [SQL_REPLICATE] ✅ {applied_count}/{len(sql_writes)} escrituras SQL aplicadas")
+        return {"success": True, "applied": applied_count}
+        
+    except Exception as e:
+        print(f"[NAMENODE] [SQL_REPLICATE] Error en internal_replicate_sql: {e}")
         import traceback
         traceback.print_exc()
         return {"success": False, "message": str(e)}

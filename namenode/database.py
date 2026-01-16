@@ -6,6 +6,8 @@ import sqlite3
 import os
 import threading
 import time
+import json
+from queue import Queue
 
 # Locks separados para cada base de datos (evita bloqueos cruzados)
 # Usar ReadWriteLock para permitir múltiples lecturas simultáneas
@@ -37,12 +39,65 @@ db_lock = metadata_db_lock
 metadata_rw_lock = _metadata_rw_lock
 operations_rw_lock = _operations_rw_lock
 
+# Cola global para replicación asíncrona de escrituras SQL
+_sql_replication_queue = Queue()
+_replication_thread_started = False
+_replication_thread_lock = threading.Lock()
+
 # NODE_ID del contenedor actual - solo este nodo debe tener su carpeta de datos
 _CURRENT_NODE_ID = os.getenv("NODE_ID", "namenode-1")
 
 def _get_current_node_id() -> str:
     """Obtiene el NODE_ID del contenedor actual"""
     return _CURRENT_NODE_ID
+
+def _start_replication_thread_if_needed():
+    """Inicia el hilo de replicación asíncrona si no está iniciado"""
+    global _replication_thread_started
+    with _replication_thread_lock:
+        if not _replication_thread_started:
+            _replication_thread_started = True
+            thread = threading.Thread(target=_replication_worker, daemon=True)
+            thread.start()
+            print("[DATABASE] Hilo de replicación asíncrona iniciado")
+
+
+def _replication_worker():
+    """Worker thread que procesa la cola de replicación SQL de forma asíncrona"""
+    print("[DATABASE] Worker de replicación SQL iniciado")
+    while True:
+        try:
+            # Esperar hasta 1 segundo por un item (timeout para permitir shutdown graceful)
+            try:
+                item = _sql_replication_queue.get(timeout=1)
+            except Exception:
+                continue
+            
+            sql_writes = item.get('sql_writes', [])
+            node_id = item.get('node_id')
+            
+            if not sql_writes:
+                continue
+            
+            try:
+                from namenode.namenode import replicate_sql_writes, is_leader
+                # Solo replicar si aún somos líder (puede haber cambiado)
+                if is_leader():
+                    replicate_sql_writes(sql_writes, node_id)
+                else:
+                    print(f"[DATABASE] Saltando replicación - ya no somos líder")
+            except Exception as e:
+                print(f"[DATABASE] Error en worker de replicación: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            _sql_replication_queue.task_done()
+        except Exception as e:
+            print(f"[DATABASE] Error crítico en worker de replicación: {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(0.1)  # Pequeña pausa antes de continuar
+
 
 def get_db_path(node_id: str = None) -> str:
     """Obtiene la ruta de la base de datos de METADATOS para este nodo"""
@@ -73,9 +128,145 @@ def get_operations_db_path(node_id: str = None) -> str:
     return os.path.join(data_dir, "namenode_operations.db")
 
 
+class ReplicatingConnection:
+    """
+    Wrapper de conexión que intercepta commits y replica escrituras automáticamente.
+    """
+    def __init__(self, conn, cursor, db_type: str, node_id: str):
+        self._conn = conn
+        self._cursor = cursor
+        self._db_type = db_type
+        self._node_id = node_id
+        self._pending_writes = []  # Batch de escrituras para replicar
+        self._is_replicating = False  # Flag para evitar loops infinitos
+    
+    def commit(self):
+        """Hace commit local y programa replicación asíncrona de escrituras pendientes"""
+        # Commit local (no bloquea)
+        self._conn.commit()
+        
+        # Programar replicación asíncrona si hay escrituras pendientes
+        if self._pending_writes and not self._is_replicating:
+            try:
+                from namenode.namenode import is_leader
+                if is_leader():
+                    # Enviar a cola para replicación asíncrona (no bloquea)
+                    _start_replication_thread_if_needed()
+                    _sql_replication_queue.put({
+                        'sql_writes': self._pending_writes.copy(),
+                        'node_id': self._node_id
+                    })
+            except Exception as e:
+                print(f"[DATABASE] Error programando replicación: {e}")
+            finally:
+                self._pending_writes = []
+    
+    # Delegar todos los demás métodos a la conexión real
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class ReplicatingCursor:
+    """
+    Wrapper de cursor que intercepta escrituras y las replica automáticamente.
+    Solo replica cuando el nodo es líder y la operación es una escritura (INSERT/UPDATE/DELETE).
+    """
+    def __init__(self, cursor, conn_wrapper, db_type: str, node_id: str):
+        self._cursor = cursor
+        self._conn_wrapper = conn_wrapper  # Referencia al wrapper de conexión
+        self._db_type = db_type
+        self._node_id = node_id
+    
+    def execute(self, sql, params=None):
+        """Ejecuta SQL y captura escrituras para replicación"""
+        # Normalizar SQL para detectar escrituras
+        sql_upper = sql.strip().upper()
+        
+        # Detectar si es escritura (INSERT, UPDATE, DELETE, REPLACE)
+        is_write = any(sql_upper.startswith(cmd) for cmd in ['INSERT', 'UPDATE', 'DELETE', 'REPLACE'])
+        
+        # Ejecutar en BD local
+        if params:
+            result = self._cursor.execute(sql, params)
+        else:
+            result = self._cursor.execute(sql)
+        
+        # Si es escritura, somos líder, y no estamos replicando, agregar a batch
+        if is_write and not self._conn_wrapper._is_replicating:
+            try:
+                # Verificar si somos líder (importar aquí para evitar circular imports)
+                from namenode.namenode import is_leader
+                if is_leader():
+                    # Serializar parámetros para replicación
+                    params_serialized = None
+                    if params:
+                        # Convertir parámetros a formato serializable
+                        if isinstance(params, (list, tuple)):
+                            params_serialized = [self._serialize_param(p) for p in params]
+                        else:
+                            params_serialized = self._serialize_param(params)
+                    
+                    self._conn_wrapper._pending_writes.append({
+                        'sql': sql,
+                        'params': params_serialized,
+                        'db_type': self._db_type
+                    })
+            except Exception as e:
+                # Si falla la verificación de líder, continuar sin replicar
+                # (puede pasar durante inicialización)
+                pass
+        
+        return result
+    
+    def executemany(self, sql, params_seq):
+        """Ejecuta SQL múltiples veces con diferentes parámetros"""
+        # Para executemany, replicar cada ejecución individual
+        results = []
+        for params in params_seq:
+            result = self.execute(sql, params)
+            results.append(result)
+        return results
+    
+    def _serialize_param(self, param):
+        """Serializa un parámetro para replicación"""
+        if param is None:
+            return None
+        elif isinstance(param, (int, float, str, bool)):
+            return param
+        elif isinstance(param, bytes):
+            # Convertir bytes a base64 para serialización JSON
+            import base64
+            return {'__type__': 'bytes', '__value__': base64.b64encode(param).decode('utf-8')}
+        else:
+            # Intentar convertir a string
+            return str(param)
+    
+    # Delegar todos los demás métodos al cursor real
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+    
+    def fetchone(self):
+        return self._cursor.fetchone()
+    
+    def fetchall(self):
+        return self._cursor.fetchall()
+    
+    def fetchmany(self, size=None):
+        return self._cursor.fetchmany(size)
+    
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+    
+    @property
+    def lastrowid(self):
+        return self._cursor.lastrowid
+
+
 def get_connection(db_path: str = None, node_id: str = None, db_type: str = "metadata"):
     """
     Abre una conexión a la base de datos y devuelve (conn, cursor).
+    El cursor está envuelto para replicación automática de escrituras.
     
     Args:
         db_path: Ruta específica de la BD (opcional)
@@ -97,7 +288,15 @@ def get_connection(db_path: str = None, node_id: str = None, db_type: str = "met
     conn.execute("PRAGMA busy_timeout = 5000")  # 5 segundos máximo de espera
     conn.row_factory = sqlite3.Row  # Para acceder por nombre de columna
     cursor = conn.cursor()
-    return conn, cursor
+    
+    # Envolver conexión y cursor para replicación automática
+    # Obtener node_id actual si no se proporciona
+    if node_id is None:
+        node_id = _get_current_node_id()
+    
+    replicating_conn = ReplicatingConnection(conn, cursor, db_type, node_id)
+    replicating_cursor = ReplicatingCursor(cursor, replicating_conn, db_type, node_id)
+    return replicating_conn, replicating_cursor
 
 
 def init_db(db_path: str = None, node_id: str = None):

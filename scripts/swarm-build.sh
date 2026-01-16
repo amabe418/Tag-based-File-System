@@ -37,8 +37,8 @@ show_help() {
 FORCE_REBUILD=false
 case "$1" in
     -r|--rebuild)
-        FORCE_REBUILD=true
-        echo "⚠️  Modo de reconstrucción forzada activado"
+    FORCE_REBUILD=true
+    echo "⚠️  Modo de reconstrucción forzada activado"
         ;;
     -h|--help)
         show_help

@@ -188,10 +188,14 @@ def api_upload():
     
     try:
         filename = secure_filename(file.filename)
+        print(f"[FLASK] Recibiendo archivo: {filename}")
+        
+        # Leer contenido del archivo (esto puede tardar para archivos grandes)
+        print(f"[FLASK] Leyendo contenido del archivo en memoria...")
         file_content = file.read()
         file_size = len(file_content)
         
-        print(f"[FLASK] Subiendo archivo: {filename} ({file_size} bytes)")
+        print(f"[FLASK] Archivo leído: {filename} ({file_size} bytes)")
         
         # Usar método directo para archivos pequeños, chunked para grandes
         # Asegurar que tags no esté vacío (usar "general" por defecto)
@@ -232,11 +236,15 @@ def api_upload():
                 return jsonify({"success": False, "error": str(error_msg)}), response.status_code
         else:
             # Subida por chunks - transferencia directa a DataNode
+            print(f"[FLASK] Archivo grande detectado ({file_size} bytes > {CHUNK_SIZE} bytes), usando upload por chunks")
+            print(f"[FLASK] Calculando hash del archivo...")
             file_hash_hex = hashlib.sha256(file_content).hexdigest()
             file_hash = f"sha256:{file_hash_hex}"
             total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+            print(f"[FLASK] Hash calculado: {file_hash[:32]}..., total_chunks: {total_chunks}")
             
             # 1. Iniciar upload en NameNode (crea metadatos, asigna DataNode, genera token)
+            print(f"[FLASK] Iniciando upload en NameNode: {leader_url}/upload/init")
             init_response = requests.post(
                 f"{leader_url}/upload/init",
                 data={
@@ -252,6 +260,7 @@ def api_upload():
             
             if init_response.status_code != 200:
                 error_msg = init_response.json().get("detail", "Error iniciando upload") if init_response.status_code < 500 else "Error del servidor"
+                print(f"[FLASK] ❌ Error iniciando upload en NameNode: HTTP {init_response.status_code}, {error_msg}")
                 return jsonify({"success": False, "error": error_msg}), init_response.status_code
             
             upload_data = init_response.json()
@@ -261,7 +270,7 @@ def api_upload():
             file_id = upload_data.get("file_id")  # Puede ser None hasta que finalice
             file_hash = upload_data["file_hash"]
             
-            print(f"[FLASK] Upload iniciado: upload_id={upload_id}, datanode={datanode_url}, file_id={file_id if file_id else 'None (se creará al finalizar)'}, file_hash={file_hash[:32]}...")
+            print(f"[FLASK] ✅ Upload iniciado en NameNode: upload_id={upload_id}, datanode={datanode_url}, file_id={file_id if file_id else 'None (se creará al finalizar)'}, file_hash={file_hash[:32]}...")
             
             # Inicializar progreso ANTES de empezar a subir chunks
             with progress_lock:
@@ -278,6 +287,9 @@ def api_upload():
             # Función para ejecutar la subida en un hilo separado
             def upload_chunks_thread():
                 try:
+                    print(f"[FLASK] [THREAD] Iniciando thread de upload para upload_id={upload_id}")
+                    print(f"[FLASK] [THREAD] Conectando a DataNode: {datanode_url}")
+                    
                     # 2. Iniciar sesión en DataNode
                     datanode_payload = {
                         "file_id": file_hash,
@@ -285,12 +297,14 @@ def api_upload():
                         "chunk_size": CHUNK_SIZE,
                         "file_size": file_size
                     }
+                    print(f"[FLASK] [THREAD] Iniciando sesión en DataNode...")
                     datanode_init_response = requests.post(
                         f"{datanode_url}/client/upload/init",
                         data=datanode_payload,
                         headers={"Authorization": f"Bearer {client_token}"},
                         timeout=30
                     )
+                    print(f"[FLASK] [THREAD] Respuesta de DataNode: HTTP {datanode_init_response.status_code}")
                     
                     if datanode_init_response.status_code != 200:
                         error_msg = datanode_init_response.json().get("detail", "Error iniciando sesión en DataNode")
@@ -420,8 +434,10 @@ def api_upload():
                             upload_progress[upload_id]["error"] = str(e)
             
             # Iniciar subida en hilo separado
+            print(f"[FLASK] Iniciando hilo de subida para upload_id={upload_id}")
             upload_thread = threading.Thread(target=upload_chunks_thread, daemon=True)
             upload_thread.start()
+            print(f"[FLASK] Hilo de subida iniciado, retornando upload_id al frontend")
             
             # Retornar inmediatamente con upload_id para que el frontend pueda consultar progreso
             # Nota: file_id será None hasta que finalice el upload

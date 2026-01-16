@@ -416,10 +416,12 @@ def delete_file_metadata(file_id: int, node_id: str = None, user_id: str = None,
     # Primero obtener la información del archivo (con bloqueo mínimo)
     file_name = None
     file_hash = None
+    hash_value = None
     
     with db_lock:
         conn, cursor = get_connection(db_path=db_path, node_id=node_id)
         try:
+            # Obtener información del archivo
             if user_id:
                 cursor.execute("SELECT name, hash FROM files WHERE id = ? AND user_id = ?", (file_id, user_id))
             else:
@@ -433,16 +435,13 @@ def delete_file_metadata(file_id: int, node_id: str = None, user_id: str = None,
             
             # Extraer hash sin prefijo "sha256:"
             file_hash = hash_value[7:] if hash_value.startswith("sha256:") else hash_value
+            
         finally:
             close_connection(conn)
     
-    # Eliminar archivo de DataNodes ANTES de eliminar metadatos (fuera del bloqueo)
-    # Esto evita mantener el bloqueo de la BD durante las peticiones HTTP
-    from namenode.datanode_manager import delete_file_from_datanodes
-    print(f"[MANAGER] Eliminando archivo físico {file_hash} de DataNodes...")
-    delete_file_from_datanodes(file_hash, file_id, node_id_db=node_id)
-    
-    # Ahora eliminar metadatos (con bloqueo)
+    # Ahora eliminar metadatos PRIMERO (con bloqueo)
+    # Después verificaremos si quedan otras referencias antes de eliminar el archivo físico
+    should_delete_physical = False
     with db_lock:
         conn, cursor = get_connection(db_path=db_path, node_id=node_id)
         try:
@@ -455,8 +454,17 @@ def delete_file_metadata(file_id: int, node_id: str = None, user_id: str = None,
             
             file_user_id = file_user_row[0]
             
-            # Las relaciones se eliminan por CASCADE
+            # Contar cuántos archivos (file_id) diferentes tienen el mismo hash ANTES de eliminar
+            cursor.execute("SELECT COUNT(*) FROM files WHERE hash = ?", (hash_value,))
+            reference_count_before = cursor.fetchone()[0]
+            print(f"[MANAGER] Archivo {file_id} ({file_name}) tiene {reference_count_before} referencia(s) al hash {file_hash[:16]}...")
+            
+            # Eliminar metadatos
             cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
+            
+            # Contar cuántas referencias quedan DESPUÉS de eliminar este metadato
+            cursor.execute("SELECT COUNT(*) FROM files WHERE hash = ?", (hash_value,))
+            reference_count_after = cursor.fetchone()[0]
             
             # Limpiar etiquetas huérfanas del usuario (etiquetas que no tienen ningún archivo asociado)
             if file_user_id:
@@ -471,13 +479,32 @@ def delete_file_metadata(file_id: int, node_id: str = None, user_id: str = None,
             
             conn.commit()
             print(f"[INFO] Metadatos eliminados: {file_name}")
-            return True
+            
+            # Guardar si necesitamos eliminar el archivo físico (fuera del bloqueo)
+            should_delete_physical = (reference_count_after == 0)
+            
+            if should_delete_physical:
+                # Esta era la última referencia, necesitamos eliminar el archivo físico
+                print(f"[MANAGER] Última referencia eliminada. Eliminando archivo físico {file_hash} de DataNodes...")
+            else:
+                # Hay otras referencias, solo se eliminaron metadatos, NO el archivo físico
+                print(f"[MANAGER] Hay {reference_count_after} otra(s) referencia(s) al mismo archivo. Solo se eliminaron metadatos, manteniendo archivo físico.")
+            
+                
         except Exception as e:
             conn.rollback()
             print(f"[ERROR] Error al eliminar metadatos: {e}")
             return False
         finally:
             close_connection(conn)
+    
+    # Si no quedan más referencias, eliminar el archivo físico (fuera del bloqueo)
+    # Esto evita mantener el bloqueo durante las peticiones HTTP
+    if should_delete_physical:
+        from namenode.datanode_manager import delete_file_from_datanodes
+        delete_file_from_datanodes(file_hash, file_id, node_id_db=node_id)
+    
+    return True
 
 
 def delete_files_by_tags(query_tags: List[str], node_id: str = None, user_id: str = None, term: int = 0) -> bool:

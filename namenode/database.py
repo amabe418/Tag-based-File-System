@@ -206,6 +206,28 @@ def init_metadata_db(db_path: str = None, node_id: str = None):
         except Exception as e3:
             print(f"[DATABASE] Error verificando columnas después de fallo de migración: {e3}")
     
+    # Migración: agregar campo replica_count si no existe
+    try:
+        cursor.execute("PRAGMA table_info(files)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        if 'replica_count' not in columns:
+            cursor.execute("ALTER TABLE files ADD COLUMN replica_count INTEGER DEFAULT 0")
+            # Inicializar contador basado en réplicas existentes
+            cursor.execute("""
+                UPDATE files 
+                SET replica_count = (
+                    SELECT COUNT(*) 
+                    FROM file_replicas 
+                    WHERE file_replicas.file_id = files.id
+                )
+            """)
+            conn.commit()
+            print("[DATABASE] Columna replica_count agregada a tabla files e inicializada")
+    except sqlite3.OperationalError as e:
+        print(f"[DATABASE] Error en migración de replica_count: {e}")
+        pass
+    
     # Asegurar que user_id no sea NULL
     try:
         cursor.execute("UPDATE files SET user_id = 'system' WHERE user_id IS NULL")

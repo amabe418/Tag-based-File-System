@@ -107,6 +107,16 @@ def rate_limit_middleware(
             # - /client/download/{file_id} (descarga completa con Range requests)
             return await call_next(request)
         
+        # Excluir endpoints de chunks (lectura de chunks para replicación)
+        # Estos endpoints son usados por el namenode para replicar archivos
+        if path.startswith("/chunks/"):
+            return await call_next(request)
+        
+        # Excluir endpoints de store/session (almacenamiento de chunks para replicación)
+        # Estos endpoints son usados por el namenode para replicar archivos
+        if path.startswith("/store/session/"):
+            return await call_next(request)
+        
         client_id = get_client_identifier(request)
         allowed, remaining = rate_limiter.is_allowed(
             client_id,
@@ -163,6 +173,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             # Excluir:
             # - /client/download/{file_id}/chunk/{chunk_index} (descarga de chunks individuales)
             # - /client/download/{file_id} (descarga completa con Range requests)
+            return await call_next(request)
+        
+        # Excluir endpoints de chunks (lectura de chunks para replicación)
+        # Estos endpoints son usados por el namenode para replicar archivos
+        if path.startswith("/chunks/"):
+            return await call_next(request)
+        
+        # Excluir endpoints de store/session (almacenamiento de chunks para replicación)
+        # Estos endpoints son usados por el namenode para replicar archivos
+        if path.startswith("/store/session/"):
             return await call_next(request)
         
         client_id = get_client_identifier(request)

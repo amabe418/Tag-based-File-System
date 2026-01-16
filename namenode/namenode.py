@@ -127,6 +127,7 @@ from namenode.datanode_manager import (
     get_files_affected_by_datanode, rereplicate_file, mark_datanode_draining,
     unmark_datanode_draining, drain_datanode, discover_file_replicas
 )
+from namenode.datanode_transfer import send_chunks_from_datanode
 
 app = FastAPI(title="TBFS MetaNameNode (Distributed)")
 
@@ -1463,11 +1464,17 @@ def verify_and_rereplicate_files(node_id: str = None):
     for file_id in file_ids:
         replicas = get_file_replicas(file_id, node_id_db=node_id)
         
+        # Sincronizar contador con la realidad
+        active_replicas = [r for r in replicas if r.get("status") == "active"]
+        active_count = len(active_replicas)
+        from namenode.datanode_manager import update_replica_count
+        update_replica_count(file_id, active_count, node_id_db=node_id)
+        
         # Verificar que haya al menos 2 réplicas (o 1 si solo hay 1 DataNode)
         min_replicas = min(2, len(active_datanodes))
         
-        if len(replicas) < min_replicas:
-            print(f"[NAMENODE] FASE 4: Archivo {file_id} tiene solo {len(replicas)} réplicas, necesita {min_replicas}")
+        if active_count < min_replicas:
+            print(f"[NAMENODE] FASE 4: Archivo {file_id} tiene solo {active_count} réplicas, necesita {min_replicas}")
             
             # Obtener información del archivo
             file_info = get_file_by_id(file_id, node_id=node_id)
@@ -2320,34 +2327,14 @@ async def lifespan(app: FastAPI):
                     inactive = detect_inactive_datanodes(timeout_seconds=30, node_id_db=NODE_ID)
                     if inactive:
                         print(f"[NAMENODE] DataNodes inactivos detectados: {inactive}")
-                        
-                        # Re-replicar archivos afectados por cada DataNode inactivo
-                        for failed_datanode_id in inactive:
-                            print(f"[NAMENODE] Iniciando re-replicación para archivos en {failed_datanode_id}...")
-                            
-                            # Obtener archivos afectados
-                            affected_files = get_files_affected_by_datanode(failed_datanode_id, node_id_db=NODE_ID)
-                            print(f"[NAMENODE] {len(affected_files)} archivos afectados por {failed_datanode_id}")
-                            
-                            # Re-replicar cada archivo
-                            from namenode.manager import get_file_by_id
-                            rereplicated_count = 0
-                            failed_count = 0
-                            
-                            for file_id in affected_files:
-                                file_data = get_file_by_id(file_id, node_id=NODE_ID)
-                                if not file_data:
-                                    continue
-                                
-                                hash_value = file_data.get("hash", "")
-                                file_hash = hash_value[7:] if hash_value.startswith("sha256:") else hash_value
-                                
-                                if rereplicate_file(file_id, file_hash, failed_datanode_id, node_id_db=NODE_ID):
-                                    rereplicated_count += 1
-                                else:
-                                    failed_count += 1
-                            
-                            print(f"[NAMENODE] Re-replicación completada para {failed_datanode_id}: {rereplicated_count} exitosas, {failed_count} fallidas")
+                        # Las réplicas ya fueron eliminadas en detect_inactive_datanodes()
+                        # Solo necesitamos re-replicar archivos que quedaron undereplicated
+                        from namenode.datanode_manager import trigger_rereplication_for_undereplicated
+                        trigger_rereplication_for_undereplicated(node_id_db=NODE_ID)
+                    
+                    # Limpiar archivos con más de 3 réplicas activas (por si acaso)
+                    from namenode.datanode_manager import cleanup_overreplicated_files
+                    cleanup_overreplicated_files(node_id_db=NODE_ID)
                             
                 except Exception as e:
                     print(f"[NAMENODE] Error en monitoreo de DataNodes: {e}")
@@ -3417,8 +3404,85 @@ def finalize_chunked_upload(
     # Verificar que el archivo existe en el DataNode (opcional, puede confiar en el cliente)
     # Por ahora confiamos en que el cliente finalizó correctamente en el DataNode
     
-    # Guardar asignación de réplicas
-    save_file_replicas(file_id, datanode_ids, node_id_db=NODE_ID)
+    # ========== REPLICACIÓN A DATANODES SECUNDARIOS ==========
+    # El archivo ya está en el datanode primario, ahora replicarlo a los otros datanodes
+    primary_datanode_id = datanode_ids[0]
+    primary_datanode_url = datanode_url  # Ya está en formato http://...
+    
+    successful_replicas = [primary_datanode_id]  # El primario ya tiene el archivo
+    failed_replicas = []
+    
+    # Obtener token de servicio para autenticación con DataNodes
+    with cluster_lock:
+        node_id = cluster_state["node_id"]
+    try:
+        service_token = generate_service_token(node_id, "service")
+        print(f"[NAMENODE] [CHUNKED_UPLOAD] Token generado para node_id={node_id}")
+    except Exception as token_error:
+        print(f"[NAMENODE] [CHUNKED_UPLOAD] Error generando token para node_id={node_id}: {token_error}, usando token pre-compartido")
+        service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+    
+    # Replicar a datanodes secundarios (excluyendo el primario)
+    if len(datanode_ids) > 1:
+        print(f"[NAMENODE] [CHUNKED_UPLOAD] Iniciando replicación a {len(datanode_ids) - 1} datanodes adicionales...")
+        
+        for i in range(1, len(datanode_ids)):
+            target_datanode_id = datanode_ids[i]
+            
+            try:
+                # Obtener información del datanode destino
+                target_datanode = get_datanode(target_datanode_id, node_id_db=NODE_ID)
+                if not target_datanode:
+                    print(f"[NAMENODE] [CHUNKED_UPLOAD] ⚠️  DataNode {target_datanode_id} no encontrado, saltando...")
+                    failed_replicas.append(target_datanode_id)
+                    continue
+                
+                target_datanode_url = target_datanode["url"]
+                if not target_datanode_url.startswith("http"):
+                    target_datanode_url = f"http://{target_datanode_url}:{target_datanode['port']}"
+                
+                print(f"[NAMENODE] [CHUNKED_UPLOAD] Replicando a {target_datanode_id} ({target_datanode_url})...")
+                
+                # Usar función que transfiere chunks directamente desde el primario al destino
+                # Esto es eficiente porque no ensambla el archivo completo en memoria
+                success, message = send_chunks_from_datanode(
+                    source_datanode_url=primary_datanode_url,
+                    target_datanode_url=target_datanode_url,
+                    file_id=file_hash,
+                    service_token=service_token
+                )
+                
+                if success:
+                    successful_replicas.append(target_datanode_id)
+                    print(f"[NAMENODE] [CHUNKED_UPLOAD] ✓ Réplica exitosa en {target_datanode_id}")
+                else:
+                    failed_replicas.append(target_datanode_id)
+                    print(f"[NAMENODE] [CHUNKED_UPLOAD] ✗ Error replicando a {target_datanode_id}: {message}")
+                    
+            except Exception as e:
+                failed_replicas.append(target_datanode_id)
+                print(f"[NAMENODE] [CHUNKED_UPLOAD] ✗ Excepción replicando a {target_datanode_id}: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Verificar mínimo de réplicas requeridas
+        # Idealmente 2, pero aceptar 1 si solo hay 1 DataNode disponible
+        min_required_replicas = min(2, len(datanode_ids)) if datanode_ids else 1
+        
+        if len(successful_replicas) < min_required_replicas:
+            error_msg = f"No se pudo replicar el archivo a suficientes DataNodes después de finalizar el upload ({len(successful_replicas)}/{len(datanode_ids)} exitosas, mínimo requerido: {min_required_replicas})"
+            print(f"[NAMENODE] [CHUNKED_UPLOAD] ❌ {error_msg}")
+            
+            # No lanzar excepción, solo reportar el problema
+            # El archivo al menos está en el primario y está disponible
+            print(f"[NAMENODE] [CHUNKED_UPLOAD] ⚠️  Advertencia: {error_msg}. El archivo está disponible en {len(successful_replicas)} datanode(s)")
+        else:
+            print(f"[NAMENODE] [CHUNKED_UPLOAD] ✅ Replicación completada: {len(successful_replicas)}/{len(datanode_ids)} réplicas exitosas")
+    else:
+        print(f"[NAMENODE] [CHUNKED_UPLOAD] Solo hay 1 datanode asignado, no se requiere replicación adicional")
+    
+    # Guardar asignación de réplicas (solo las exitosas)
+    save_file_replicas(file_id, successful_replicas, node_id_db=NODE_ID)
     
     # Replicar operación a otros MetaNameNodes
     with cluster_lock:
@@ -3449,14 +3513,16 @@ def finalize_chunked_upload(
         if upload_id in active_uploads:
             del active_uploads[upload_id]
     
-    print(f"[NAMENODE] [CHUNKED_UPLOAD] Upload finalizado: upload_id={upload_id}, file_id={file_id}, réplicas={datanode_ids}")
+    print(f"[NAMENODE] [CHUNKED_UPLOAD] Upload finalizado: upload_id={upload_id}, file_id={file_id}, réplicas={successful_replicas} (exitosas: {len(successful_replicas)}/{len(datanode_ids)})")
     
     return {
         "success": True,
         "file_id": file_id,
         "message": f"Archivo '{filename}' subido correctamente",
-        "replicas": datanode_ids,
-        "replicas_stored": len(datanode_ids)
+        "replicas": successful_replicas,
+        "replicas_stored": len(successful_replicas),
+        "replicas_assigned": len(datanode_ids),
+        "replicas_failed": len(failed_replicas) if len(datanode_ids) > 1 else 0
     }
 
 

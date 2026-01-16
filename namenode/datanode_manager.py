@@ -25,13 +25,17 @@ def register_datanode(node_id: str, url: str, port: int, ip: Optional[str],
     insert_params = (node_id, url, port, ip, total_space, free_space, current_time)
     
     # Solo mantener el lock durante la operación de BD
+    old_status = None
     with db_lock:
         conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
         
         try:
-            # Verificar si ya existe
-            cursor.execute("SELECT node_id FROM datanodes WHERE node_id = ?", (node_id,))
-            exists = cursor.fetchone()
+            # Verificar si ya existe y obtener status anterior
+            cursor.execute("SELECT status FROM datanodes WHERE node_id = ?", (node_id,))
+            row = cursor.fetchone()
+            exists = row is not None
+            if exists:
+                old_status = row[0]
             
             if exists:
                 # Actualizar DataNode existente (preservar estado de draining si existe)
@@ -70,6 +74,44 @@ def register_datanode(node_id: str, url: str, port: int, ip: Optional[str],
         "status": "active",
         "draining": False
     })
+    
+    # Si es un nuevo datanode, trigger re-replicación de archivos undereplicated
+    # IMPORTANTE: Hacer esto de forma asíncrona y con delay para no bloquear el registro
+    if not exists:
+        print(f"[DATANODE_MANAGER] Nuevo DataNode detectado: {node_id}, programando re-replicación de archivos undereplicated...")
+        # Ejecutar en background con delay para no bloquear el registro
+        import threading
+        def trigger_rereplication_async():
+            try:
+                # Esperar 5 segundos antes de empezar para no bloquear el registro
+                time.sleep(5)
+                print(f"[DATANODE_MANAGER] Iniciando re-replicación asíncrona después del delay...")
+                trigger_rereplication_for_undereplicated(node_id_db=node_id_db)
+            except Exception as e:
+                print(f"[DATANODE_MANAGER] Error en re-replicación asíncrona: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        thread = threading.Thread(target=trigger_rereplication_async, daemon=True)
+        thread.start()
+    
+    # Si un datanode pasó de inactive a active, eliminar réplicas redundantes
+    if exists and old_status == 'inactive':
+        print(f"[DATANODE_MANAGER] DataNode {node_id} pasó de inactive a active, verificando réplicas redundantes...")
+        # Ejecutar en background para no bloquear el registro
+        import threading
+        def remove_redundant_replicas_async():
+            try:
+                # Esperar 5 segundos antes de empezar para no bloquear el registro
+                time.sleep(5)
+                remove_redundant_replicas_from_datanode(node_id, node_id_db=node_id_db)
+            except Exception as e:
+                print(f"[DATANODE_MANAGER] Error eliminando réplicas redundantes: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        thread = threading.Thread(target=remove_redundant_replicas_async, daemon=True)
+        thread.start()
     
     return True
 
@@ -317,6 +359,44 @@ def assign_replicas(file_hash: str, file_size: int, node_id_db: str = None,
     return assigned
 
 
+def update_replica_count(file_id: int, count: int, node_id_db: str = None) -> bool:
+    """
+    Actualiza el contador de réplicas en la tabla files.
+    
+    Args:
+        file_id: ID del archivo
+        count: Número de réplicas
+        node_id_db: ID del nodo para la base de datos
+    
+    Returns:
+        True si se actualizó correctamente, False en caso de error
+    """
+    if node_id_db is None:
+        import os
+        node_id_db = os.getenv("NODE_ID", "namenode-1")
+    
+    db_path = get_db_path(node_id_db)
+    
+    with db_lock:
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        
+        try:
+            cursor.execute("""
+                UPDATE files 
+                SET replica_count = ? 
+                WHERE id = ?
+            """, (count, file_id))
+            
+            conn.commit()
+            return True
+        except Exception as e:
+            conn.rollback()
+            print(f"[DATANODE_MANAGER] Error al actualizar replica_count para file_id={file_id}: {e}")
+            return False
+        finally:
+            close_connection(conn)
+
+
 def save_file_replicas(file_id: int, datanode_ids: List[str], node_id_db: str = None) -> bool:
     """
     Guarda la asignación de réplicas para un archivo.
@@ -352,8 +432,16 @@ def save_file_replicas(file_id: int, datanode_ids: List[str], node_id_db: str = 
                         VALUES (?, ?, ?)
                     """, (file_id, datanode_id, replica_types[i]))
             
+            # Actualizar contador de réplicas directamente (ya estamos dentro de db_lock)
+            cursor.execute("""
+                UPDATE files 
+                SET replica_count = ? 
+                WHERE id = ?
+            """, (len(datanode_ids), file_id))
+            
             conn.commit()
-            print(f"[DATANODE_MANAGER] Réplicas guardadas para file_id={file_id}: {datanode_ids}")
+            print(f"[DATANODE_MANAGER] Réplicas guardadas para file_id={file_id}: {datanode_ids} (count: {len(datanode_ids)})")
+            
             return True
             
         except Exception as e:
@@ -657,6 +745,10 @@ def delete_file_from_datanodes(file_hash: str, file_id: int, node_id_db: str = N
             failed_count += 1
     
     print(f"[DATANODE_MANAGER] Eliminación completada: {success_count} exitosas, {failed_count} fallidas")
+    
+    # Actualizar contador de réplicas (debería ser 0 después de eliminar)
+    update_replica_count(file_id, 0, node_id_db=node_id_db)
+    
     return success_count > 0
 
 
@@ -683,6 +775,100 @@ def get_files_affected_by_datanode(datanode_id: str, node_id_db: str = None) -> 
             """, (datanode_id,))
             
             return [row[0] for row in cursor.fetchall()]
+        finally:
+            close_connection(conn)
+
+
+def remove_redundant_replicas_from_datanode(datanode_id: str, node_id_db: str = None) -> int:
+    """
+    Elimina réplicas redundantes de un datanode que pasó de inactive a active.
+    Si un archivo ya tiene 3 réplicas activas (sin contar la del datanode que se levantó),
+    elimina la réplica del datanode que se levantó.
+    
+    Args:
+        datanode_id: ID del DataNode que pasó de inactive a active
+        node_id_db: ID del nodo para la base de datos
+    
+    Returns:
+        Número de réplicas eliminadas
+    """
+    if node_id_db is None:
+        import os
+        node_id_db = os.getenv("NODE_ID", "namenode-1")
+    
+    db_path = get_db_path(node_id_db)
+    
+    # Obtener archivos en este datanode
+    affected_files = get_files_affected_by_datanode(datanode_id, node_id_db=node_id_db)
+    
+    if not affected_files:
+        print(f"[DATANODE_MANAGER] DataNode {datanode_id} no tiene archivos, nada que verificar")
+        return 0
+    
+    print(f"[DATANODE_MANAGER] Verificando {len(affected_files)} archivos en DataNode {datanode_id} para réplicas redundantes...")
+    
+    removed_count = 0
+    
+    with db_lock:
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        
+        try:
+            for file_id in affected_files:
+                # Contar réplicas activas (excluyendo la del datanode que se levantó)
+                cursor.execute("""
+                    SELECT COUNT(*) 
+                    FROM file_replicas fr
+                    JOIN datanodes dn ON fr.datanode_id = dn.node_id
+                    WHERE fr.file_id = ? AND dn.status = 'active' AND fr.datanode_id != ?
+                """, (file_id, datanode_id))
+                
+                active_count_without_this = cursor.fetchone()[0]
+                
+                # Si ya tiene 3 réplicas activas (sin contar la del datanode que se levantó),
+                # eliminar la réplica del datanode que se levantó
+                if active_count_without_this >= 3:
+                    cursor.execute("""
+                        DELETE FROM file_replicas 
+                        WHERE file_id = ? AND datanode_id = ?
+                    """, (file_id, datanode_id))
+                    
+                    # Actualizar contador (debería ser 3 ahora)
+                    cursor.execute("""
+                        UPDATE files 
+                        SET replica_count = ? 
+                        WHERE id = ?
+                    """, (3, file_id))
+                    
+                    removed_count += 1
+                    print(f"[DATANODE_MANAGER] Réplica redundante eliminada: file_id={file_id} del datanode {datanode_id} (ya tenía {active_count_without_this} réplicas activas)")
+                else:
+                    # Actualizar contador incluyendo la réplica del datanode que se levantó
+                    cursor.execute("""
+                        SELECT COUNT(*) 
+                        FROM file_replicas fr
+                        JOIN datanodes dn ON fr.datanode_id = dn.node_id
+                        WHERE fr.file_id = ? AND dn.status = 'active'
+                    """, (file_id,))
+                    total_active_count = cursor.fetchone()[0]
+                    
+                    cursor.execute("""
+                        UPDATE files 
+                        SET replica_count = ? 
+                        WHERE id = ?
+                    """, (total_active_count, file_id))
+                    
+                    print(f"[DATANODE_MANAGER] Réplica mantenida: file_id={file_id} en datanode {datanode_id} (solo tenía {active_count_without_this} réplicas activas, ahora tiene {total_active_count})")
+            
+            conn.commit()
+            print(f"[DATANODE_MANAGER] Eliminación de réplicas redundantes completada: {removed_count} réplicas eliminadas de {datanode_id}")
+            return removed_count
+            
+        except Exception as e:
+            conn.rollback()
+            print(f"[DATANODE_MANAGER] Error eliminando réplicas redundantes: {e}")
+            import traceback
+            traceback.print_exc()
+            return 0
         finally:
             close_connection(conn)
 
@@ -877,8 +1063,23 @@ def rereplicate_file(file_id: int, file_hash: str, failed_datanode_id: str,
                         VALUES (?, ?, ?)
                     """, (file_id, new_datanode_id, "tertiary"))
                 
+                # Actualizar contador de réplicas directamente (ya estamos dentro de db_lock)
+                # Contar réplicas activas: las que quedaron después de eliminar la fallida + la nueva
+                cursor.execute("""
+                    SELECT COUNT(*) FROM file_replicas 
+                    WHERE file_id = ? AND datanode_id != ?
+                """, (file_id, failed_datanode_id))
+                active_count = cursor.fetchone()[0] + 1  # +1 por la nueva réplica agregada
+                
+                cursor.execute("""
+                    UPDATE files 
+                    SET replica_count = ? 
+                    WHERE id = ?
+                """, (active_count, file_id))
+                
                 conn.commit()
-                print(f"[DATANODE_MANAGER] Réplicas actualizadas: {failed_datanode_id} -> {new_datanode_id}")
+                print(f"[DATANODE_MANAGER] Réplicas actualizadas: {failed_datanode_id} -> {new_datanode_id} (total: {active_count})")
+                
                 return True
             except Exception as e:
                 conn.rollback()
@@ -890,6 +1091,274 @@ def rereplicate_file(file_id: int, file_hash: str, failed_datanode_id: str,
     except Exception as e:
         print(f"[DATANODE_MANAGER] Error en re-replicación de file_id={file_id}: {e}")
         return False
+
+
+def rereplicate_to_reach_3(file_id: int, node_id_db: str = None) -> bool:
+    """
+    Re-replica un archivo hasta tener 3 réplicas (o el máximo disponible).
+    
+    Args:
+        file_id: ID del archivo en la base de datos
+        node_id_db: ID del nodo para la base de datos
+    
+    Returns:
+        True si se re-replicó exitosamente, False en caso de error
+    """
+    from namenode.manager import get_file_by_id
+    
+    # Obtener información del archivo
+    file_info = get_file_by_id(file_id, node_id=node_id_db)
+    if not file_info:
+        print(f"[DATANODE_MANAGER] Archivo {file_id} no encontrado")
+        return False
+    
+    # Obtener réplicas actuales
+    replicas = get_file_replicas(file_id, node_id_db=node_id_db)
+    current_count = len([r for r in replicas if r.get("status") == "active"])
+    
+    if current_count >= 3:
+        print(f"[DATANODE_MANAGER] Archivo {file_id} ya tiene {current_count} réplicas, no necesita re-replicación")
+        return True
+    
+    # Calcular cuántas réplicas faltan
+    needed = 3 - current_count
+    print(f"[DATANODE_MANAGER] Archivo {file_id} tiene {current_count} réplicas, necesita {needed} más")
+    
+    # Obtener hash del archivo
+    hash_value = file_info.get("hash", "")
+    file_hash = hash_value[7:] if hash_value.startswith("sha256:") else hash_value
+    file_size = file_info.get("size", 0)
+    
+    # Obtener DataNodes que ya tienen el archivo
+    existing_datanodes = [r["datanode_id"] for r in replicas]
+    
+    # Obtener una réplica activa como fuente
+    active_replicas = [r for r in replicas if r.get("status") == "active"]
+    if not active_replicas:
+        print(f"[DATANODE_MANAGER] No hay réplicas activas disponibles para re-replicar file_id={file_id}")
+        return False
+    
+    source_replica = active_replicas[0]
+    source_url = source_replica["url"]
+    if not source_url.startswith("http"):
+        source_url = f"http://{source_url}:{source_replica['port']}"
+    
+    # Re-replicar hasta tener 3 réplicas
+    success_count = 0
+    for i in range(needed):
+        # Asignar nuevo DataNode (excluyendo los existentes)
+        new_datanode_ids = assign_replicas(
+            file_hash,
+            file_size,
+            node_id_db=node_id_db,
+            exclude_datanodes=existing_datanodes
+        )
+        
+        if not new_datanode_ids:
+            print(f"[DATANODE_MANAGER] No hay más DataNodes disponibles para re-replicar file_id={file_id}")
+            break
+        
+        # Seleccionar un DataNode que no tenga ya el archivo
+        available_datanodes = [dn_id for dn_id in new_datanode_ids 
+                               if dn_id not in existing_datanodes]
+        
+        if not available_datanodes:
+            print(f"[DATANODE_MANAGER] No hay DataNodes disponibles para re-replicación")
+            break
+        
+        new_datanode_id = available_datanodes[0]
+        new_datanode_info = get_datanode(new_datanode_id, node_id_db=node_id_db)
+        
+        if not new_datanode_info:
+            print(f"[DATANODE_MANAGER] DataNode {new_datanode_id} no encontrado")
+            continue
+        
+        new_datanode_url = new_datanode_info["url"]
+        if not new_datanode_url.startswith("http"):
+            new_datanode_url = f"http://{new_datanode_url}:{new_datanode_info['port']}"
+        
+        # Obtener token de servicio
+        import os
+        try:
+            from security.service_auth import generate_service_token
+            service_token = generate_service_token(os.getenv("NODE_ID", "namenode-1"), "service")
+        except Exception:
+            service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+        
+        try:
+            # Transferir archivo desde la réplica fuente al nuevo datanode
+            from namenode.datanode_transfer import send_file_to_datanode_chunked
+            
+            # Verificar si el archivo tiene chunks
+            try:
+                response = requests.get(
+                    f"{source_url}/chunks/{file_hash}/info",
+                    headers={"Authorization": f"Bearer {service_token}"},
+                    timeout=30
+                )
+                response.raise_for_status()
+                chunks_info = response.json()
+                has_chunks = chunks_info["chunk_count"] > 0
+            except:
+                has_chunks = False
+            
+            if has_chunks:
+                # Transferir chunks directamente
+                success, message = send_file_to_datanode_chunked(
+                    datanode_url=new_datanode_url,
+                    file_id=file_hash,
+                    service_token=service_token,
+                    source_datanode_url=source_url
+                )
+            else:
+                # Leer archivo completo y transferir
+                response = requests.get(
+                    f"{source_url}/retrieve/{file_hash}",
+                    headers={"Authorization": f"Bearer {service_token}"},
+                    timeout=30
+                )
+                response.raise_for_status()
+                file_content = response.content
+                
+                if file_size > (5 * 1024 * 1024):  # > 5MB, usar chunked
+                    success, message = send_file_to_datanode_chunked(
+                        datanode_url=new_datanode_url,
+                        file_id=file_hash,
+                        file_content=file_content,
+                        service_token=service_token
+                    )
+                else:
+                    # Método tradicional
+                    files = {"file": ("replica", file_content)}
+                    data = {"file_id": file_hash}
+                    response = requests.post(
+                        f"{new_datanode_url}/store",
+                        files=files,
+                        data=data,
+                        headers={"Authorization": f"Bearer {service_token}"},
+                        timeout=120
+                    )
+                    response.raise_for_status()
+                    success = True
+                    message = "Archivo transferido"
+            
+            if success:
+                # Agregar nueva réplica a la base de datos
+                replica_type = ["secondary", "tertiary"][min(i, 1)]  # secondary o tertiary
+                db_path = get_db_path(node_id_db)
+                with db_lock:
+                    conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+                    try:
+                        cursor.execute("""
+                            INSERT INTO file_replicas (file_id, datanode_id, replica_type)
+                            VALUES (?, ?, ?)
+                        """, (file_id, new_datanode_id, replica_type))
+                        
+                        # Actualizar contador directamente (sin llamar a update_replica_count para evitar lock anidado)
+                        existing_datanodes.append(new_datanode_id)
+                        new_count = len(existing_datanodes)
+                        cursor.execute("""
+                            UPDATE files 
+                            SET replica_count = ? 
+                            WHERE id = ?
+                        """, (new_count, file_id))
+                        
+                        conn.commit()
+                        
+                        success_count += 1
+                        print(f"[DATANODE_MANAGER] Réplica agregada para file_id={file_id} en {new_datanode_id} (total: {new_count})")
+                    except Exception as e:
+                        conn.rollback()
+                        print(f"[DATANODE_MANAGER] Error guardando réplica en BD: {e}")
+                    finally:
+                        close_connection(conn)
+            else:
+                print(f"[DATANODE_MANAGER] Error transfiriendo archivo a {new_datanode_id}: {message}")
+                
+        except Exception as e:
+            print(f"[DATANODE_MANAGER] Error re-replicando a {new_datanode_id}: {e}")
+            continue
+    
+    if success_count > 0:
+        print(f"[DATANODE_MANAGER] Re-replicación completada para file_id={file_id}: {success_count} réplicas agregadas")
+        return True
+    else:
+        print(f"[DATANODE_MANAGER] No se pudo agregar ninguna réplica para file_id={file_id}")
+        return False
+
+
+def trigger_rereplication_for_undereplicated(node_id_db: str = None, max_files: int = 10) -> int:
+    """
+    Encuentra todos los archivos con menos de 3 réplicas activas y los re-replica.
+    Cuenta réplicas activas reales en lugar de usar replica_count para evitar problemas de sincronización.
+    Procesa en lotes para no bloquear el sistema.
+    
+    Args:
+        node_id_db: ID del nodo para la base de datos
+        max_files: Número máximo de archivos a procesar en esta ejecución (default: 10)
+    
+    Returns:
+        Número de archivos procesados
+    """
+    if node_id_db is None:
+        import os
+        node_id_db = os.getenv("NODE_ID", "namenode-1")
+    
+    db_path = get_db_path(node_id_db)
+    
+    # Obtener TODOS los archivos y contar réplicas activas reales (no usar replica_count)
+    with db_lock:
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        
+        try:
+            # Obtener todos los archivos con sus réplicas activas
+            cursor.execute("""
+                SELECT f.id, COUNT(CASE WHEN dn.status = 'active' THEN 1 END) as active_replicas
+                FROM files f
+                LEFT JOIN file_replicas fr ON f.id = fr.file_id
+                LEFT JOIN datanodes dn ON fr.datanode_id = dn.node_id
+                GROUP BY f.id
+                HAVING active_replicas < 3
+                LIMIT ?
+            """, (max_files,))
+            undereplicated_files = [row[0] for row in cursor.fetchall()]
+        finally:
+            close_connection(conn)
+    
+    if not undereplicated_files:
+        print(f"[DATANODE_MANAGER] No hay archivos undereplicated")
+        return 0
+    
+    print(f"[DATANODE_MANAGER] Encontrados {len(undereplicated_files)} archivos undereplicated (procesando máximo {max_files}), iniciando re-replicación...")
+    
+    # Verificar que hay datanodes disponibles
+    active_datanodes = get_active_datanodes(node_id_db=node_id_db, exclude_draining=True)
+    if len(active_datanodes) < 2:
+        print(f"[DATANODE_MANAGER] No hay suficientes DataNodes activos para re-replicación (mínimo 2)")
+        return 0
+    
+    # Re-replicar cada archivo con delay entre archivos para no saturar
+    success_count = 0
+    failed_count = 0
+    
+    for idx, file_id in enumerate(undereplicated_files):
+        try:
+            # Delay entre archivos para no saturar (excepto el primero)
+            if idx > 0:
+                time.sleep(2)  # 2 segundos entre archivos
+            
+            if rereplicate_to_reach_3(file_id, node_id_db=node_id_db):
+                success_count += 1
+            else:
+                failed_count += 1
+        except Exception as e:
+            print(f"[DATANODE_MANAGER] Error procesando file_id={file_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            failed_count += 1
+    
+    print(f"[DATANODE_MANAGER] Re-replicación completada: {success_count} exitosas, {failed_count} fallidas")
+    return success_count
 
 
 def mark_datanode_inactive(node_id: str, node_id_db: str = None) -> bool:
@@ -1088,9 +1557,49 @@ def detect_inactive_datanodes(timeout_seconds: int = 30, node_id_db: str = None)
                     print(f"[DATANODE_MANAGER] DataNode {node_id} detectado como inactivo (último heartbeat: {current_time - last_heartbeat:.1f}s)")
             
             if inactive_ids:
+                # Eliminar réplicas de datanodes inactivos y actualizar contadores
+                # Hacer esto dentro del mismo bloque de lock para evitar locks anidados
+                for failed_datanode_id in inactive_ids:
+                    # Obtener archivos afectados
+                    cursor.execute("""
+                        SELECT DISTINCT file_id 
+                        FROM file_replicas 
+                        WHERE datanode_id = ?
+                    """, (failed_datanode_id,))
+                    affected_files = [row[0] for row in cursor.fetchall()]
+                    
+                    # Eliminar réplicas del datanode inactivo
+                    cursor.execute("""
+                        DELETE FROM file_replicas 
+                        WHERE datanode_id = ?
+                    """, (failed_datanode_id,))
+                    deleted_replicas = cursor.rowcount
+                    print(f"[DATANODE_MANAGER] Eliminadas {deleted_replicas} réplicas del datanode inactivo {failed_datanode_id}")
+                    
+                    # Actualizar contadores de archivos afectados
+                    for file_id in affected_files:
+                        # Contar réplicas activas después de eliminar
+                        cursor.execute("""
+                            SELECT COUNT(*) 
+                            FROM file_replicas fr
+                            JOIN datanodes dn ON fr.datanode_id = dn.node_id
+                            WHERE fr.file_id = ? AND dn.status = 'active'
+                        """, (file_id,))
+                        active_count = cursor.fetchone()[0]
+                        
+                        # Actualizar contador directamente
+                        cursor.execute("""
+                            UPDATE files 
+                            SET replica_count = ? 
+                            WHERE id = ?
+                        """, (active_count, file_id))
+                        
+                        print(f"[DATANODE_MANAGER] Contador actualizado para file_id={file_id}: {active_count} réplicas activas (réplicas del datanode {failed_datanode_id} eliminadas)")
+                
+                # Hacer commit de todas las actualizaciones (status de datanodes + eliminación de réplicas + contadores)
                 conn.commit()
                 
-                # Actualizar cache
+                # Actualizar cache (fuera del lock de BD)
                 cache = get_datanode_cache(node_id_db)
                 for node_id in inactive_ids:
                     cache.update(node_id, {"status": "inactive"})
@@ -1101,5 +1610,99 @@ def detect_inactive_datanodes(timeout_seconds: int = 30, node_id_db: str = None)
             conn.rollback()
             print(f"[DATANODE_MANAGER] Error al detectar DataNodes inactivos: {e}")
             return []
+        finally:
+            close_connection(conn)
+
+
+def cleanup_overreplicated_files(node_id_db: str = None) -> int:
+    """
+    Limpia archivos que tienen más de 3 réplicas activas, eliminando las réplicas extra.
+    Mantiene las 3 réplicas más antiguas (priorizando primary, secondary, tertiary).
+    
+    Args:
+        node_id_db: ID del nodo para la base de datos
+    
+    Returns:
+        Número de réplicas eliminadas
+    """
+    if node_id_db is None:
+        import os
+        node_id_db = os.getenv("NODE_ID", "namenode-1")
+    
+    db_path = get_db_path(node_id_db)
+    
+    with db_lock:
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        
+        try:
+            # Encontrar archivos con más de 3 réplicas activas
+            cursor.execute("""
+                SELECT f.id, COUNT(*) as active_replicas
+                FROM files f
+                JOIN file_replicas fr ON f.id = fr.file_id
+                JOIN datanodes dn ON fr.datanode_id = dn.node_id
+                WHERE dn.status = 'active'
+                GROUP BY f.id
+                HAVING active_replicas > 3
+            """)
+            
+            overreplicated_files = cursor.fetchall()
+            
+            if not overreplicated_files:
+                return 0
+            
+            print(f"[DATANODE_MANAGER] Encontrados {len(overreplicated_files)} archivos con más de 3 réplicas activas, limpiando...")
+            
+            total_removed = 0
+            
+            for file_id, active_count in overreplicated_files:
+                # Obtener todas las réplicas activas ordenadas por tipo (primary, secondary, tertiary)
+                cursor.execute("""
+                    SELECT fr.datanode_id, fr.replica_type
+                    FROM file_replicas fr
+                    JOIN datanodes dn ON fr.datanode_id = dn.node_id
+                    WHERE fr.file_id = ? AND dn.status = 'active'
+                    ORDER BY 
+                        CASE fr.replica_type
+                            WHEN 'primary' THEN 1
+                            WHEN 'secondary' THEN 2
+                            WHEN 'tertiary' THEN 3
+                            ELSE 4
+                        END
+                """, (file_id,))
+                
+                replicas = cursor.fetchall()
+                
+                # Si hay más de 3, eliminar las extra (mantener las primeras 3)
+                if len(replicas) > 3:
+                    replicas_to_remove = replicas[3:]  # Todas después de la tercera
+                    
+                    for datanode_id, replica_type in replicas_to_remove:
+                        cursor.execute("""
+                            DELETE FROM file_replicas 
+                            WHERE file_id = ? AND datanode_id = ?
+                        """, (file_id, datanode_id))
+                        total_removed += 1
+                        print(f"[DATANODE_MANAGER] Réplica extra eliminada: file_id={file_id}, datanode={datanode_id} (tipo: {replica_type})")
+                    
+                    # Actualizar contador a 3
+                    cursor.execute("""
+                        UPDATE files 
+                        SET replica_count = 3 
+                        WHERE id = ?
+                    """, (file_id,))
+            
+            if total_removed > 0:
+                conn.commit()
+                print(f"[DATANODE_MANAGER] Limpieza completada: {total_removed} réplicas extra eliminadas")
+            
+            return total_removed
+            
+        except Exception as e:
+            conn.rollback()
+            print(f"[DATANODE_MANAGER] Error en limpieza de réplicas extra: {e}")
+            import traceback
+            traceback.print_exc()
+            return 0
         finally:
             close_connection(conn)

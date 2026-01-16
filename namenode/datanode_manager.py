@@ -1143,6 +1143,10 @@ def rereplicate_to_reach_3(file_id: int, node_id_db: str = None) -> bool:
     if not source_url.startswith("http"):
         source_url = f"http://{source_url}:{source_replica['port']}"
     
+    # Verificar si hay una réplica "primary" activa
+    has_primary = any(r.get("replica_type") == "primary" and r.get("status") == "active" 
+                      for r in replicas)
+    
     # Re-replicar hasta tener 3 réplicas
     success_count = 0
     for i in range(needed):
@@ -1244,7 +1248,31 @@ def rereplicate_to_reach_3(file_id: int, node_id_db: str = None) -> bool:
             
             if success:
                 # Agregar nueva réplica a la base de datos
-                replica_type = ["secondary", "tertiary"][min(i, 1)]  # secondary o tertiary
+                # Si no hay réplica primary activa, la primera nueva será primary
+                # Si ya hay primary, asignar secondary o tertiary según corresponda
+                if not has_primary and i == 0:
+                    replica_type = "primary"
+                    has_primary = True  # Marcar que ya tenemos primary
+                else:
+                    # Determinar el tipo basado en las réplicas existentes
+                    # Contar cuántas secondary y tertiary ya existen
+                    existing_types = [r.get("replica_type") for r in replicas if r.get("status") == "active"]
+                    secondary_count = existing_types.count("secondary")
+                    tertiary_count = existing_types.count("tertiary")
+                    
+                    # Si ya hay primary, asignar secondary o tertiary según lo que falte
+                    if has_primary:
+                        if secondary_count == 0:
+                            replica_type = "secondary"
+                        elif tertiary_count == 0:
+                            replica_type = "tertiary"
+                        else:
+                            # Si ya hay secondary y tertiary, usar el índice para decidir
+                            replica_type = ["secondary", "tertiary"][min(i, 1)]
+                    else:
+                        # Si aún no hay primary (pero i > 0), asignar secondary o tertiary
+                        replica_type = ["secondary", "tertiary"][min(i, 1)]
+                
                 db_path = get_db_path(node_id_db)
                 with db_lock:
                     conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
@@ -1285,6 +1313,94 @@ def rereplicate_to_reach_3(file_id: int, node_id_db: str = None) -> bool:
     else:
         print(f"[DATANODE_MANAGER] No se pudo agregar ninguna réplica para file_id={file_id}")
         return False
+
+
+def fix_missing_primary_replicas(node_id_db: str = None) -> int:
+    """
+    Corrige archivos que no tienen una réplica "primary" activa.
+    Asigna la primera réplica activa disponible como "primary".
+    
+    Args:
+        node_id_db: ID del nodo para la base de datos
+    
+    Returns:
+        Número de archivos corregidos
+    """
+    if node_id_db is None:
+        import os
+        node_id_db = os.getenv("NODE_ID", "namenode-1")
+    
+    db_path = get_db_path(node_id_db)
+    
+    with db_lock:
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        
+        try:
+            # Encontrar archivos que no tienen réplica "primary" activa
+            cursor.execute("""
+                SELECT DISTINCT f.id
+                FROM files f
+                JOIN file_replicas fr ON f.id = fr.file_id
+                JOIN datanodes dn ON fr.datanode_id = dn.node_id
+                WHERE dn.status = 'active'
+                AND f.id NOT IN (
+                    SELECT DISTINCT fr2.file_id
+                    FROM file_replicas fr2
+                    JOIN datanodes dn2 ON fr2.datanode_id = dn2.node_id
+                    WHERE fr2.replica_type = 'primary' AND dn2.status = 'active'
+                )
+            """)
+            
+            files_without_primary = [row[0] for row in cursor.fetchall()]
+            
+            if not files_without_primary:
+                print(f"[DATANODE_MANAGER] Todos los archivos tienen réplica primary activa")
+                return 0
+            
+            print(f"[DATANODE_MANAGER] Encontrados {len(files_without_primary)} archivos sin réplica primary, corrigiendo...")
+            
+            fixed_count = 0
+            for file_id in files_without_primary:
+                # Obtener la primera réplica activa para este archivo
+                cursor.execute("""
+                    SELECT fr.datanode_id, fr.replica_type
+                    FROM file_replicas fr
+                    JOIN datanodes dn ON fr.datanode_id = dn.node_id
+                    WHERE fr.file_id = ? AND dn.status = 'active'
+                    ORDER BY 
+                        CASE fr.replica_type
+                            WHEN 'secondary' THEN 1
+                            WHEN 'tertiary' THEN 2
+                            ELSE 3
+                        END
+                    LIMIT 1
+                """, (file_id,))
+                
+                result = cursor.fetchone()
+                if result:
+                    datanode_id, current_type = result
+                    # Actualizar la réplica para que sea "primary"
+                    cursor.execute("""
+                        UPDATE file_replicas
+                        SET replica_type = 'primary'
+                        WHERE file_id = ? AND datanode_id = ?
+                    """, (file_id, datanode_id))
+                    
+                    fixed_count += 1
+                    print(f"[DATANODE_MANAGER] Archivo {file_id}: {datanode_id} actualizado de '{current_type}' a 'primary'")
+            
+            conn.commit()
+            print(f"[DATANODE_MANAGER] Corrección completada: {fixed_count} archivos corregidos")
+            return fixed_count
+            
+        except Exception as e:
+            conn.rollback()
+            print(f"[DATANODE_MANAGER] Error corrigiendo réplicas: {e}")
+            import traceback
+            traceback.print_exc()
+            return 0
+        finally:
+            close_connection(conn)
 
 
 def trigger_rereplication_for_undereplicated(node_id_db: str = None, max_files: int = 10) -> int:

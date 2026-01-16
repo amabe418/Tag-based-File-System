@@ -129,6 +129,28 @@ case $TYPE in
         if [ "$NUM" -ne 1 ]; then
             echo "⚠️  Advertencia: Solo hay un frontend, usando número 1"
         fi
+        
+        # Detectar carpeta Downloads del usuario
+        if [ -n "$HOME" ]; then
+            DOWNLOADS_DIR="$HOME/Downloads"
+        else
+            DOWNLOADS_DIR="$HOME/Downloads"
+        fi
+        
+        # Crear carpeta Downloads si no existe
+        if [ ! -d "$DOWNLOADS_DIR" ]; then
+            echo "📁 Creando carpeta Downloads: $DOWNLOADS_DIR"
+            mkdir -p "$DOWNLOADS_DIR"
+        fi
+        
+        # Verificar permisos de escritura
+        if [ ! -w "$DOWNLOADS_DIR" ]; then
+            echo "⚠️  Advertencia: No hay permisos de escritura en $DOWNLOADS_DIR"
+            echo "   Los archivos descargados se guardarán en el contenedor"
+        else
+            echo "📁 Montando carpeta Downloads del host: $DOWNLOADS_DIR -> /app/downloads"
+        fi
+        
         # El frontend se conecta a namenodes usando DNS de Docker
         # Flask en puerto 5000 (sin límite de tamaño), Streamlit en 8501
         docker run -d \
@@ -137,10 +159,11 @@ case $TYPE in
             --network-alias frontend \
             --hostname "$CONTAINER_NAME" \
             -p 8501:8501 \
+            -v "$DOWNLOADS_DIR:/app/downloads" \
             "${FRONTEND_CODE_VOLUMES[@]}" \
             -e NAMENODE_SERVICE=namenode \
             -e NAMENODE_PORT=8010 \
-            -e DOWNLOAD_DIR=downloads \
+            -e DOWNLOAD_DIR=/app/downloads \
             -e FLASK_PORT=8501 \
             "${EXTRA_ARGS[@]}" \
             tbfs-frontend:latest

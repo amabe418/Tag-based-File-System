@@ -277,6 +277,168 @@ function clearSelection() {
     document.getElementById('upload-step-2').style.display = 'none';
 }
 
+// Variable global para almacenar intervalos de polling de progreso
+const uploadProgressIntervals = {};
+// Variable global para rastrear uploads activos (upload_id -> {filename, completed})
+const activeUploads = {};
+
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
+}
+
+async function checkUploadProgress(uploadId, filename) {
+    try {
+        const response = await fetch(`/api/upload-progress/${uploadId}`, {
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        
+        if (!response.ok) {
+            console.error(`[TBFS] Error consultando progreso: ${response.status}`);
+            return null;
+        }
+        
+        const data = await response.json();
+        return data;
+    } catch (error) {
+        console.error('[TBFS] Error consultando progreso:', error);
+        return null;
+    }
+}
+
+function checkAllUploadsCompleted() {
+    // Verificar si todos los uploads activos han terminado
+    const allCompleted = Object.values(activeUploads).every(upload => upload.completed || upload.error);
+    const hasActiveUploads = Object.keys(activeUploads).length > 0;
+    const noPollingIntervals = Object.keys(uploadProgressIntervals).length === 0;
+    
+    if (allCompleted && hasActiveUploads && noPollingIntervals) {
+        // Todos los uploads terminaron, limpiar selección y resetear card
+        const progressBar = document.getElementById('upload-progress');
+        const progressFill = document.getElementById('upload-progress-bar');
+        const status = document.getElementById('upload-status');
+        
+        setTimeout(() => {
+            clearSelection();
+            // Limpiar tracking de uploads
+            Object.keys(activeUploads).forEach(id => delete activeUploads[id]);
+            // Asegurar que la barra de progreso esté oculta
+            progressBar.style.display = 'none';
+            progressFill.style.width = '0%';
+            status.textContent = '';
+        }, 2000);
+    }
+}
+
+function startProgressPolling(uploadId, filename) {
+    const progressBar = document.getElementById('upload-progress');
+    const progressFill = document.getElementById('upload-progress-bar');
+    const status = document.getElementById('upload-status');
+    
+    // Registrar este upload como activo
+    activeUploads[uploadId] = { filename, completed: false, error: false };
+    
+    progressBar.style.display = 'block';
+    status.textContent = `Iniciando subida de ${filename}...`;
+    
+    const pollInterval = setInterval(async () => {
+        const progressData = await checkUploadProgress(uploadId, filename);
+        
+        if (!progressData || !progressData.success) {
+            console.error('[TBFS] No se pudo obtener progreso');
+            return;
+        }
+        
+        const progress = progressData.progress || 0;
+        const chunksUploaded = progressData.chunks_uploaded || 0;
+        const totalChunks = progressData.total_chunks || 0;
+        const bytesUploaded = progressData.bytes_uploaded || 0;
+        const fileSize = progressData.file_size || 0;
+        const statusText = progressData.status;
+        
+        // Actualizar barra de progreso (usar el máximo progreso de todos los uploads activos)
+        let maxProgress = progress;
+        Object.keys(activeUploads).forEach(id => {
+            if (uploadProgressIntervals[id]) {
+                // Si hay otros uploads activos, calcular progreso promedio
+                // Por ahora usamos el progreso actual
+            }
+        });
+        progressFill.style.width = `${maxProgress}%`;
+        
+        // Actualizar texto de estado según el estado actual
+        let statusMessage = '';
+        switch (statusText) {
+            case 'initializing':
+                statusMessage = `Iniciando subida de ${filename}...`;
+                break;
+            case 'uploading_chunks':
+                statusMessage = `Subiendo ${filename}: ${chunksUploaded}/${totalChunks} chunks (${formatBytes(bytesUploaded)}/${formatBytes(fileSize)}) - ${progress.toFixed(1)}%`;
+                break;
+            case 'finalizing':
+                statusMessage = `Finalizando en DataNode: ${filename}...`;
+                break;
+            case 'finalizing_namenode':
+                statusMessage = `Completando metadatos: ${filename}...`;
+                break;
+            case 'completed':
+                statusMessage = `✅ ${filename} subido correctamente`;
+                clearInterval(pollInterval);
+                delete uploadProgressIntervals[uploadId];
+                // Marcar como completado
+                if (activeUploads[uploadId]) {
+                    activeUploads[uploadId].completed = true;
+                }
+                loadFiles();
+                showMessage('main', `Archivo '${filename}' subido correctamente`, 'success');
+                // Verificar si todos los uploads terminaron
+                checkAllUploadsCompleted();
+                // Si hay otros uploads activos, no ocultar la barra aún
+                const otherActiveUploads = Object.keys(uploadProgressIntervals).length > 0;
+                if (!otherActiveUploads) {
+                    setTimeout(() => {
+                        progressBar.style.display = 'none';
+                        progressFill.style.width = '0%';
+                        status.textContent = '';
+                    }, 2000);
+                }
+                break;
+            case 'error':
+                const errorMsg = progressData.error || 'Error desconocido';
+                statusMessage = `❌ Error: ${errorMsg}`;
+                clearInterval(pollInterval);
+                delete uploadProgressIntervals[uploadId];
+                // Marcar como error
+                if (activeUploads[uploadId]) {
+                    activeUploads[uploadId].error = true;
+                }
+                showMessage('main', `Error subiendo ${filename}: ${errorMsg}`, 'error');
+                // Verificar si todos los uploads terminaron
+                checkAllUploadsCompleted();
+                // Si hay otros uploads activos, no ocultar la barra aún
+                const otherActiveUploadsOnError = Object.keys(uploadProgressIntervals).length > 0;
+                if (!otherActiveUploadsOnError) {
+                    setTimeout(() => {
+                        progressBar.style.display = 'none';
+                        progressFill.style.width = '0%';
+                        status.textContent = '';
+                    }, 5000);
+                }
+                break;
+            default:
+                statusMessage = `Subiendo ${filename}... (${progress.toFixed(1)}%)`;
+        }
+        
+        status.textContent = statusMessage;
+        
+    }, 500); // Consultar cada 500ms para actualización fluida
+    
+    uploadProgressIntervals[uploadId] = pollInterval;
+}
+
 async function startUpload() {
     if (selectedFiles.length === 0) {
         showMessage('main', 'No hay archivos seleccionados', 'error');
@@ -294,7 +456,7 @@ async function startUpload() {
     const total = selectedFiles.length;
 
     for (const file of selectedFiles) {
-        status.textContent = `Subiendo ${file.name}...`;
+        status.textContent = `Preparando ${file.name}...`;
         
         const formData = new FormData();
         formData.append('file', file);
@@ -307,11 +469,50 @@ async function startUpload() {
                 body: formData
             });
 
-            const data = await response.json();
+            // Verificar que la respuesta sea válida antes de parsear JSON
+            if (!response.ok) {
+                let errorMsg = `Error HTTP ${response.status}`;
+                try {
+                    const errorData = await response.json();
+                    errorMsg = errorData.error || errorMsg;
+                } catch (e) {
+                    const text = await response.text();
+                    errorMsg = text || errorMsg;
+                }
+                showMessage('main', `Error subiendo ${file.name}: ${errorMsg}`, 'error');
+                continue;
+            }
+
+            let data;
+            try {
+                data = await response.json();
+            } catch (e) {
+                console.error('Error parseando respuesta JSON:', e);
+                showMessage('main', `Error subiendo ${file.name}: Respuesta inválida del servidor`, 'error');
+                continue;
+            }
 
             if (data.success) {
-                uploaded++;
-                progressFill.style.width = `${(uploaded / total) * 100}%`;
+                // Si es un upload chunked, recibimos upload_id y debemos consultar progreso
+                if (data.upload_id) {
+                    // Archivo grande - usar polling de progreso
+                    startProgressPolling(data.upload_id, file.name);
+                    uploaded++; // Contamos como iniciado
+                } else {
+                    // Archivo pequeño - subida directa completada
+                    uploaded++;
+                    progressFill.style.width = `${(uploaded / total) * 100}%`;
+                    if (uploaded === total) {
+                        status.textContent = `✅ ${uploaded} archivo(s) subido(s) correctamente`;
+                        setTimeout(() => {
+                            progressBar.style.display = 'none';
+                            progressFill.style.width = '0%';
+                            status.textContent = '';
+                            clearSelection();
+                            loadFiles();
+                        }, 2000);
+                    }
+                }
             } else {
                 const errorMsg = typeof data.error === 'object' ? JSON.stringify(data.error) : (data.error || 'Error desconocido');
                 showMessage('main', `Error subiendo ${file.name}: ${errorMsg}`, 'error');
@@ -322,18 +523,16 @@ async function startUpload() {
         }
     }
 
-    if (uploaded === total) {
+    // Si todos los archivos son pequeños y se completaron, mostrar mensaje y limpiar
+    if (uploaded === total && Object.keys(uploadProgressIntervals).length === 0) {
         showMessage('main', `${uploaded} archivo(s) subido(s) correctamente`, 'success');
-    } else if (uploaded > 0) {
-        showMessage('main', `${uploaded} de ${total} archivo(s) subido(s)`, 'success');
+        setTimeout(() => {
+            clearSelection();
+            loadFiles();
+        }, 2000);
     }
-
-    status.textContent = '';
-    progressBar.style.display = 'none';
-    progressFill.style.width = '0%';
-    
-    clearSelection();
-    loadFiles();
+    // Si hay uploads chunked en progreso, no limpiar aún
+    // Se limpiará cuando todos terminen en checkAllUploadsCompleted()
 }
 
 // ============ DOWNLOAD ============

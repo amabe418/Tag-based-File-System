@@ -90,6 +90,16 @@ def rate_limit_middleware(
         if request.url.path in ["/", "/health", "/docs", "/openapi.json", "/redoc"]:
             return await call_next(request)
         
+        # Excluir endpoints de chunked upload (no aplicar rate limiting)
+        # Estos endpoints son parte de una operación de upload legítima
+        path = request.url.path
+        if path.startswith("/client/upload/"):
+            # Excluir:
+            # - /client/upload/init
+            # - /client/upload/session/{session_id}/chunk/{chunk_index}
+            # - /client/upload/session/{session_id}/finalize
+            return await call_next(request)
+        
         client_id = get_client_identifier(request)
         allowed, remaining = rate_limiter.is_allowed(
             client_id,
@@ -129,6 +139,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         # Excluir endpoints de health check y documentación
         if request.url.path in ["/", "/health", "/docs", "/openapi.json", "/redoc"]:
+            return await call_next(request)
+        
+        # Excluir endpoints de chunked upload (no aplicar rate limiting)
+        # Estos endpoints son parte de una operación de upload legítima
+        path = request.url.path
+        if path.startswith("/client/upload/"):
+            # Excluir:
+            # - /client/upload/init
+            # - /client/upload/session/{session_id}/chunk/{chunk_index}
+            # - /client/upload/session/{session_id}/finalize
             return await call_next(request)
         
         client_id = get_client_identifier(request)

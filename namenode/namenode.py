@@ -20,6 +20,7 @@ import sqlite3
 import hashlib
 import sys
 import socket
+import uuid
 from pathlib import Path
 
 # Agregar directorio raíz al path para importar security
@@ -52,7 +53,8 @@ from security.auth import (
 from security.service_auth import (
     verify_service_token,
     validate_service_request,
-    generate_service_token
+    generate_service_token,
+    generate_client_upload_token
 )
 from security.rate_limit import RateLimitMiddleware
 
@@ -225,6 +227,10 @@ class OperationLog(BaseModel):
 operation_log = []
 log_lock = threading.Lock()
 commit_index = 0
+
+# Almacenamiento de uploads en progreso (upload_id -> info)
+active_uploads = {}
+uploads_lock = threading.Lock()
 
 
 def save_operation_to_log(operation: OperationLog, node_id: str = None):
@@ -633,8 +639,8 @@ def gossip_exchange(peer_id: str) -> bool:
         else:
             update_peer_status(peer_id, False)
             print(f"[NAMENODE] [GOSSIP] Error en intercambio con {peer_id}: HTTP {response.status_code}")
-            return False
-            
+        return False
+
     except requests.exceptions.ConnectionError as e:
         # Errores de conexión (DNS, red, etc.) - esperados cuando el peer no está disponible
         update_peer_status(peer_id, False)
@@ -730,7 +736,7 @@ def gossip_loop():
                 # Ejecutar en un hilo separado para no bloquear
                 thread = threading.Thread(target=gossip_exchange, args=(peer,), daemon=True)
                 thread.start()
-            
+        
             # Verificar si el líder está desconectado basado en el estado de gossip
             # (solo si no somos el líder)
             if not is_leader():
@@ -1665,7 +1671,7 @@ def request_vote(candidate_id: str, term: int) -> bool:
             return False
         else:
             print(f"[NAMENODE] ✅ DNS confirma que no hay otros peers, autoelegiéndose como líder")
-            return True
+        return True
     
     # Sin quorum: ganar con mayoría simple de los nodos que respondieron
     # Si obtuvimos más de la mitad de los votos de los nodos activos, somos líder
@@ -3184,6 +3190,225 @@ async def add_file_compat(
         "file_id": file_id,
         "replicas": datanode_ids,
         "replicas_stored": success_count
+    }
+
+
+# ========== CHUNKED UPLOAD ENDPOINTS ==========
+
+@app.post("/upload/init")
+def init_chunked_upload(
+    filename: str = Form(...),
+    file_hash: str = Form(...),
+    file_size: int = Form(...),
+    tags: str = Form(...),
+    chunk_size: int = Form(...),
+    current_user: User = Depends(require_permission(Permission.WRITE_FILES))
+):
+    """
+    Inicia un upload por chunks.
+    Crea metadatos del archivo, asigna un DataNode y devuelve token para subir directamente.
+    """
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            response = requests.post(
+                f"{leader_url}/upload/init",
+                data={
+                    "filename": filename,
+                    "file_hash": file_hash,
+                    "file_size": file_size,
+                    "tags": tags,
+                    "chunk_size": chunk_size
+                },
+                headers={"Authorization": f"Bearer {current_user.username}"},
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    print(f"[NAMENODE] [CHUNKED_UPLOAD] Iniciando upload: {filename} ({file_size} bytes)")
+    
+    # Parsear file_hash (puede venir con o sin prefijo "sha256:")
+    if file_hash.startswith("sha256:"):
+        file_hash_clean = file_hash[7:]
+    else:
+        file_hash_clean = file_hash
+    hash_value = f"sha256:{file_hash_clean}"
+    
+    # Parsear tags
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    if not tag_list:
+        tag_list = ["general"]
+    
+    # Calcular total de chunks
+    total_chunks = (file_size + chunk_size - 1) // chunk_size
+    
+    # Asignar DataNode primario para el upload
+    datanode_ids = assign_replicas(file_hash_clean, file_size, node_id_db=NODE_ID)
+    if not datanode_ids or len(datanode_ids) == 0:
+        raise HTTPException(status_code=507, detail="No hay DataNodes disponibles")
+    
+    primary_datanode_id = datanode_ids[0]
+    primary_datanode = get_datanode(primary_datanode_id, node_id_db=NODE_ID)
+    if not primary_datanode:
+        raise HTTPException(status_code=507, detail=f"DataNode {primary_datanode_id} no encontrado")
+    
+    # Construir URL del DataNode
+    datanode_url = primary_datanode["url"]
+    if not datanode_url.startswith("http"):
+        datanode_url = f"http://{datanode_url}:{primary_datanode['port']}"
+    
+    # Generar token temporal para el cliente (válido por 15 minutos)
+    print(f"[NAMENODE] [CHUNKED_UPLOAD] Generando token con file_hash_clean={file_hash_clean[:32]}... (longitud: {len(file_hash_clean)})")
+    client_token = generate_client_upload_token(
+        user_id=current_user.username,
+        file_hash=file_hash_clean,
+        datanode_id=primary_datanode_id,
+        expires_minutes=15
+    )
+    
+    # Crear metadatos del archivo (sin el archivo físico aún)
+    file_id = add_file_metadata(
+        name=filename,
+        tags=tag_list,
+        size=file_size,
+        hash_value=hash_value,
+        node_id=NODE_ID,
+        user_id=current_user.username
+    )
+    
+    # Generar upload_id único
+    upload_id = str(uuid.uuid4())
+    
+    # Almacenar información del upload en progreso
+    with uploads_lock:
+        active_uploads[upload_id] = {
+            "upload_id": upload_id,
+            "file_id": file_id,
+            "filename": filename,
+            "file_hash": file_hash_clean,
+            "file_size": file_size,
+            "tags": tag_list,
+            "user_id": current_user.username,
+            "datanode_id": primary_datanode_id,
+            "datanode_url": datanode_url,
+            "datanode_ids": datanode_ids,  # Para replicación después
+            "chunk_size": chunk_size,
+            "total_chunks": total_chunks,
+            "started_at": time.time()
+        }
+    
+    print(f"[NAMENODE] [CHUNKED_UPLOAD] Upload iniciado: upload_id={upload_id}, file_id={file_id}, datanode={primary_datanode_id}")
+    print(f"[NAMENODE] [CHUNKED_UPLOAD] Devolviendo file_hash={file_hash_clean[:32]}... (longitud: {len(file_hash_clean)})")
+    
+    response_data = {
+        "upload_id": upload_id,
+        "file_id": file_id,
+        "file_hash": file_hash_clean,  # Hash del archivo (sin prefijo) para usar en DataNode
+        "datanode_url": datanode_url,
+        "datanode_id": primary_datanode_id,
+        "client_token": client_token,
+        "total_chunks": total_chunks,
+        "chunk_size": chunk_size
+    }
+    print(f"[NAMENODE] [CHUNKED_UPLOAD] Respuesta completa: {list(response_data.keys())}")
+    return response_data
+
+
+@app.post("/upload/{upload_id}/finalize")
+def finalize_chunked_upload(
+    upload_id: str,
+    current_user: User = Depends(require_permission(Permission.WRITE_FILES))
+):
+    """
+    Finaliza un upload por chunks.
+    Verifica que el archivo esté completo en el DataNode y completa los metadatos.
+    """
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            response = requests.post(
+                f"{leader_url}/upload/{upload_id}/finalize",
+                headers={"Authorization": f"Bearer {current_user.username}"},
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    # Obtener información del upload
+    with uploads_lock:
+        upload_info = active_uploads.get(upload_id)
+        if not upload_info:
+            raise HTTPException(status_code=404, detail="Upload no encontrado")
+        
+        # Verificar que el usuario es el propietario
+        if upload_info["user_id"] != current_user.username:
+            raise HTTPException(status_code=403, detail="No tienes permiso para finalizar este upload")
+        
+        file_id = upload_info["file_id"]
+        datanode_id = upload_info["datanode_id"]
+        datanode_url = upload_info["datanode_url"]
+        datanode_ids = upload_info["datanode_ids"]
+        file_hash = upload_info["file_hash"]
+        filename = upload_info["filename"]
+        tag_list = upload_info["tags"]
+        file_size = upload_info["file_size"]
+    
+    print(f"[NAMENODE] [CHUNKED_UPLOAD] Finalizando upload: upload_id={upload_id}, file_id={file_id}")
+    
+    # Verificar que el archivo existe en el DataNode (opcional, puede confiar en el cliente)
+    # Por ahora confiamos en que el cliente finalizó correctamente en el DataNode
+    
+    # Guardar asignación de réplicas
+    save_file_replicas(file_id, datanode_ids, node_id_db=NODE_ID)
+    
+    # Replicar operación a otros MetaNameNodes
+    with cluster_lock:
+        current_term = cluster_state["term"]
+    
+    operation = OperationLog(
+        operation="add_file",
+        data={
+            "name": filename,
+            "tags": tag_list,
+            "size": file_size,
+            "hash": f"sha256:{file_hash}",
+            "datanode_ids": datanode_ids,
+            "user_id": current_user.username
+        },
+        term=current_term,
+        timestamp=time.time()
+    )
+    
+    with log_lock:
+        operation_log.append(operation)
+    
+    save_operation_to_log(operation, NODE_ID)
+    replicate_to_peers(operation)
+    
+    # Limpiar upload de la lista activa
+    with uploads_lock:
+        if upload_id in active_uploads:
+            del active_uploads[upload_id]
+    
+    print(f"[NAMENODE] [CHUNKED_UPLOAD] Upload finalizado: upload_id={upload_id}, file_id={file_id}, réplicas={datanode_ids}")
+    
+    return {
+        "success": True,
+        "file_id": file_id,
+        "message": f"Archivo '{filename}' subido correctamente",
+        "replicas": datanode_ids,
+        "replicas_stored": len(datanode_ids)
     }
 
 

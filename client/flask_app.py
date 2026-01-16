@@ -6,9 +6,11 @@ import os
 import hashlib
 import requests
 from flask import Flask, render_template, request, jsonify, send_file, Response, stream_with_context
+import json
 from werkzeug.utils import secure_filename
 from namenode_client import namenode_client
 import io
+import threading
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "tbfs-secret-key-change-me")
@@ -16,6 +18,10 @@ app.secret_key = os.getenv("FLASK_SECRET_KEY", "tbfs-secret-key-change-me")
 # Configuración
 NAMENODE_PORT = int(os.getenv("NAMENODE_PORT", "8010"))
 CHUNK_SIZE = 5 * 1024 * 1024  # 5MB
+
+# Almacenamiento de progreso de uploads (upload_id -> progreso)
+upload_progress = {}
+progress_lock = threading.Lock()
 
 
 def get_leader_url():
@@ -193,12 +199,36 @@ def api_upload():
                 headers=get_auth_headers(token),
                 timeout=120
             )
+            
+            # Procesar respuesta del NameNode
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    return jsonify({
+                        "success": True,
+                        "file_id": data.get("file_id"),
+                        "message": data.get("message", f"Archivo '{filename}' subido correctamente")
+                    })
+                except ValueError as e:
+                    # Si la respuesta no es JSON válido
+                    print(f"[FLASK] Error: respuesta del NameNode no es JSON válido: {response.text[:200]}")
+                    return jsonify({"success": False, "error": "Respuesta inválida del servidor"}), 500
+            else:
+                # Manejar errores del NameNode
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get("detail", error_data.get("error", f"Error HTTP {response.status_code}"))
+                except:
+                    error_msg = f"Error HTTP {response.status_code}: {response.text[:200]}"
+                print(f"[FLASK] Error del servidor: {error_msg}")
+                return jsonify({"success": False, "error": str(error_msg)}), response.status_code
         else:
-            # Subida por chunks
-            file_hash = f"sha256:{hashlib.sha256(file_content).hexdigest()}"
+            # Subida por chunks - transferencia directa a DataNode
+            file_hash_hex = hashlib.sha256(file_content).hexdigest()
+            file_hash = f"sha256:{file_hash_hex}"
             total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
             
-            # 1. Iniciar sesión de upload
+            # 1. Iniciar upload en NameNode (crea metadatos, asigna DataNode, genera token)
             init_response = requests.post(
                 f"{leader_url}/upload/init",
                 data={
@@ -213,58 +243,195 @@ def api_upload():
             )
             
             if init_response.status_code != 200:
-                return jsonify({"success": False, "error": "Error iniciando upload"}), 500
+                error_msg = init_response.json().get("detail", "Error iniciando upload") if init_response.status_code < 500 else "Error del servidor"
+                return jsonify({"success": False, "error": error_msg}), init_response.status_code
             
             upload_data = init_response.json()
             upload_id = upload_data["upload_id"]
+            datanode_url = upload_data["datanode_url"]
+            client_token = upload_data["client_token"]
+            file_id = upload_data["file_id"]
+            file_hash = upload_data["file_hash"]
             
-            # 2. Subir chunks
-            for i in range(total_chunks):
-                start = i * CHUNK_SIZE
-                end = min(start + CHUNK_SIZE, file_size)
-                chunk_data = file_content[start:end]
-                chunk_hash = hashlib.sha256(chunk_data).hexdigest()
-                
-                chunk_response = requests.post(
-                    f"{leader_url}/upload/{upload_id}/chunk/{i}",
-                    files={"chunk": (f"chunk_{i}", chunk_data)},
-                    data={"chunk_hash": chunk_hash},
-                    headers=get_auth_headers(token),
-                    timeout=120
-                )
-                
-                if chunk_response.status_code != 200:
-                    return jsonify({"success": False, "error": f"Error en chunk {i}"}), 500
+            print(f"[FLASK] Upload iniciado: upload_id={upload_id}, datanode={datanode_url}, file_id={file_id}, file_hash={file_hash[:32]}...")
             
-            # 3. Finalizar
-            response = requests.post(
-                f"{leader_url}/upload/{upload_id}/finalize",
-                headers=get_auth_headers(token),
-                timeout=300
-            )
-        
-        if response.status_code == 200:
-            data = response.json()
+            # Inicializar progreso ANTES de empezar a subir chunks
+            with progress_lock:
+                upload_progress[upload_id] = {
+                    "filename": filename,
+                    "total_chunks": total_chunks,
+                    "chunks_uploaded": 0,
+                    "progress": 0.0,
+                    "bytes_uploaded": 0,
+                    "file_size": file_size,
+                    "status": "initializing"
+                }
+            
+            # Función para ejecutar la subida en un hilo separado
+            def upload_chunks_thread():
+                try:
+                    # 2. Iniciar sesión en DataNode
+                    datanode_payload = {
+                        "file_id": file_hash,
+                        "total_chunks": total_chunks,
+                        "chunk_size": CHUNK_SIZE,
+                        "file_size": file_size
+                    }
+                    datanode_init_response = requests.post(
+                        f"{datanode_url}/client/upload/init",
+                        data=datanode_payload,
+                        headers={"Authorization": f"Bearer {client_token}"},
+                        timeout=30
+                    )
+                    
+                    if datanode_init_response.status_code != 200:
+                        error_msg = datanode_init_response.json().get("detail", "Error iniciando sesión en DataNode")
+                        with progress_lock:
+                            if upload_id in upload_progress:
+                                upload_progress[upload_id]["status"] = "error"
+                                upload_progress[upload_id]["error"] = error_msg
+                        return
+                    
+                    datanode_session = datanode_init_response.json()
+                    session_id = datanode_session["session_id"]
+                    
+                    # Actualizar estado: empezando a subir chunks
+                    with progress_lock:
+                        if upload_id in upload_progress:
+                            upload_progress[upload_id]["status"] = "uploading_chunks"
+                    
+                    # 3. Subir chunks directamente al DataNode
+                    for i in range(total_chunks):
+                        start = i * CHUNK_SIZE
+                        end = min(start + CHUNK_SIZE, file_size)
+                        chunk_data = file_content[start:end]
+                        chunk_hash = hashlib.sha256(chunk_data).hexdigest()
+                        
+                        chunk_response = requests.post(
+                            f"{datanode_url}/client/upload/session/{session_id}/chunk/{i}",
+                            files={"chunk": (f"chunk_{i}", chunk_data)},
+                            data={"chunk_hash": chunk_hash},
+                            headers={"Authorization": f"Bearer {client_token}"},
+                            timeout=120
+                        )
+                        
+                        if chunk_response.status_code != 200:
+                            error_msg = chunk_response.json().get("detail", f"Error en chunk {i}")
+                            with progress_lock:
+                                if upload_id in upload_progress:
+                                    upload_progress[upload_id]["status"] = "error"
+                                    upload_progress[upload_id]["error"] = error_msg
+                            return
+                        
+                        chunks_uploaded = i + 1
+                        progress = (chunks_uploaded / total_chunks) * 100
+                        bytes_uploaded = min(chunks_uploaded * CHUNK_SIZE, file_size)
+                        
+                        # Actualizar progreso en memoria
+                        with progress_lock:
+                            if upload_id in upload_progress:
+                                upload_progress[upload_id]["chunks_uploaded"] = chunks_uploaded
+                                upload_progress[upload_id]["progress"] = progress
+                                upload_progress[upload_id]["bytes_uploaded"] = bytes_uploaded
+                        
+                        print(f"[FLASK] Progreso: {chunks_uploaded}/{total_chunks} chunks ({progress:.1f}%)")
+                    
+                    # Actualizar estado: chunks completados, ahora finalizando
+                    with progress_lock:
+                        if upload_id in upload_progress:
+                            upload_progress[upload_id]["status"] = "finalizing"
+                    
+                    # 4. Finalizar en DataNode
+                    datanode_finalize_response = requests.post(
+                        f"{datanode_url}/client/upload/session/{session_id}/finalize",
+                        headers={"Authorization": f"Bearer {client_token}"},
+                        timeout=300
+                    )
+                    
+                    if datanode_finalize_response.status_code != 200:
+                        error_msg = datanode_finalize_response.json().get("detail", "Error finalizando en DataNode")
+                        with progress_lock:
+                            if upload_id in upload_progress:
+                                upload_progress[upload_id]["status"] = "error"
+                                upload_progress[upload_id]["error"] = error_msg
+                        return
+                    
+                    # Actualizar estado: finalizando en NameNode
+                    with progress_lock:
+                        if upload_id in upload_progress:
+                            upload_progress[upload_id]["status"] = "finalizing_namenode"
+                    
+                    # 5. Finalizar en NameNode
+                    finalize_response = requests.post(
+                        f"{leader_url}/upload/{upload_id}/finalize",
+                        headers=get_auth_headers(token),
+                        timeout=30
+                    )
+                    
+                    # Limpiar progreso después de completar
+                    with progress_lock:
+                        if upload_id in upload_progress:
+                            if finalize_response.status_code == 200:
+                                upload_progress[upload_id]["status"] = "completed"
+                                upload_progress[upload_id]["result"] = finalize_response.json()
+                            else:
+                                upload_progress[upload_id]["status"] = "error"
+                                try:
+                                    upload_progress[upload_id]["error"] = finalize_response.json().get("detail", "Error finalizando")
+                                except:
+                                    upload_progress[upload_id]["error"] = f"Error HTTP {finalize_response.status_code}"
+                    
+                except Exception as e:
+                    print(f"[FLASK] Error en hilo de upload: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    with progress_lock:
+                        if upload_id in upload_progress:
+                            upload_progress[upload_id]["status"] = "error"
+                            upload_progress[upload_id]["error"] = str(e)
+            
+            # Iniciar subida en hilo separado
+            upload_thread = threading.Thread(target=upload_chunks_thread, daemon=True)
+            upload_thread.start()
+            
+            # Retornar inmediatamente con upload_id para que el frontend pueda consultar progreso
             return jsonify({
                 "success": True,
-                "file_id": data.get("file_id"),
-                "message": f"Archivo '{filename}' subido correctamente"
+                "upload_id": upload_id,
+                "message": f"Upload iniciado para '{filename}'",
+                "total_chunks": total_chunks,
+                "file_size": file_size
             })
-        else:
-            # Intentar obtener el mensaje de error
-            try:
-                error_data = response.json()
-                error_msg = error_data.get("detail", error_data.get("error", f"Error HTTP {response.status_code}"))
-            except:
-                error_msg = f"Error HTTP {response.status_code}: {response.text[:200]}"
-            print(f"[FLASK] Error del servidor: {error_msg}")
-            return jsonify({"success": False, "error": str(error_msg)}), response.status_code
             
     except Exception as e:
         print(f"[FLASK] Error subiendo archivo: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/upload-progress/<upload_id>", methods=["GET"])
+def api_upload_progress(upload_id):
+    """Consulta el progreso de un upload en curso."""
+    with progress_lock:
+        progress_data = upload_progress.get(upload_id)
+    
+    if not progress_data:
+        return jsonify({"success": False, "error": "Upload no encontrado"}), 404
+    
+    return jsonify({
+        "success": True,
+        "upload_id": upload_id,
+        "filename": progress_data.get("filename"),
+        "total_chunks": progress_data.get("total_chunks"),
+        "chunks_uploaded": progress_data.get("chunks_uploaded", 0),
+        "progress": progress_data.get("progress", 0.0),
+        "bytes_uploaded": progress_data.get("bytes_uploaded", 0),
+        "file_size": progress_data.get("file_size"),
+        "status": progress_data.get("status"),
+        "error": progress_data.get("error") if progress_data.get("status") == "error" else None,
+        "result": progress_data.get("result") if progress_data.get("status") == "completed" else None
+    })
 
 
 @app.route("/api/download/<filename>", methods=["GET"])

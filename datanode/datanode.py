@@ -517,8 +517,9 @@ def init_client_chunked_upload(
     
     # Verificar que el file_hash coincide
     expected_file_hash = payload.get("file_hash")
+    print(f"[DATANODE] [CLIENT_UPLOAD_INIT] Verificando file_hash: expected={expected_file_hash}, received={file_id}, match={expected_file_hash == file_id if expected_file_hash else 'N/A'}")
     if expected_file_hash and expected_file_hash != file_id:
-        raise HTTPException(status_code=403, detail="file_id no coincide con el token")
+        raise HTTPException(status_code=403, detail=f"file_id no coincide con el token (esperado: {expected_file_hash}, recibido: {file_id})")
     
     # Verificar que el datanode_id coincide
     expected_datanode_id = payload.get("datanode_id")

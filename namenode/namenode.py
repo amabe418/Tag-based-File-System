@@ -3323,16 +3323,7 @@ def init_chunked_upload(
         expires_minutes=15
     )
     
-    # Crear metadatos del archivo (sin el archivo físico aún)
-    file_id = add_file_metadata(
-        name=filename,
-        tags=tag_list,
-        size=file_size,
-        hash_value=hash_value,
-        node_id=NODE_ID,
-        user_id=current_user.username
-    )
-    
+    # NO crear metadatos aquí - se crearán SOLO después de verificar que el archivo existe en el DataNode
     # Verificar si ya existe un upload en progreso para el mismo hash y usuario
     existing_upload_id = None
     existing_session_id = None
@@ -3380,13 +3371,14 @@ def init_chunked_upload(
         upload_id = str(uuid.uuid4())
         print(f"[NAMENODE] [CHUNKED_UPLOAD] Creando nuevo upload: upload_id={upload_id}")
     
-    # Almacenar información del upload en progreso
+    # Almacenar información del upload en progreso (SIN file_id aún - se creará al finalizar)
     with uploads_lock:
         active_uploads[upload_id] = {
             "upload_id": upload_id,
-            "file_id": file_id,
+            "file_id": None,  # Se creará SOLO después de verificar que el archivo existe en DataNode
             "filename": filename,
             "file_hash": file_hash_clean,
+            "hash_value": hash_value,  # Guardar hash con prefijo para crear metadatos
             "file_size": file_size,
             "tags": tag_list,
             "user_id": current_user.username,
@@ -3399,12 +3391,12 @@ def init_chunked_upload(
             "session_id": existing_session_id  # Guardar session_id si se reanudó
         }
     
-    print(f"[NAMENODE] [CHUNKED_UPLOAD] Upload iniciado: upload_id={upload_id}, file_id={file_id}, datanode={primary_datanode_id}")
+    print(f"[NAMENODE] [CHUNKED_UPLOAD] Upload iniciado: upload_id={upload_id}, datanode={primary_datanode_id} (metadatos NO creados aún)")
     print(f"[NAMENODE] [CHUNKED_UPLOAD] Devolviendo file_hash={file_hash_clean[:32]}... (longitud: {len(file_hash_clean)})")
     
     response_data = {
         "upload_id": upload_id,
-        "file_id": file_id,
+        "file_id": None,  # No hay file_id aún - se creará al finalizar
         "file_hash": file_hash_clean,  # Hash del archivo (sin prefijo) para usar en DataNode
         "datanode_url": datanode_url,
         "datanode_id": primary_datanode_id,
@@ -3454,19 +3446,103 @@ def finalize_chunked_upload(
         if upload_info["user_id"] != current_user.username:
             raise HTTPException(status_code=403, detail="No tienes permiso para finalizar este upload")
         
-        file_id = upload_info["file_id"]
+        file_id = upload_info.get("file_id")  # Puede ser None si aún no se han creado metadatos
         datanode_id = upload_info["datanode_id"]
         datanode_url = upload_info["datanode_url"]
         datanode_ids = upload_info["datanode_ids"]
         file_hash = upload_info["file_hash"]
+        hash_value = upload_info.get("hash_value", f"sha256:{file_hash}")  # Hash con prefijo para metadatos
         filename = upload_info["filename"]
         tag_list = upload_info["tags"]
         file_size = upload_info["file_size"]
     
-    print(f"[NAMENODE] [CHUNKED_UPLOAD] Finalizando upload: upload_id={upload_id}, file_id={file_id}")
+    print(f"[NAMENODE] [CHUNKED_UPLOAD] Finalizando upload: upload_id={upload_id}")
     
-    # Verificar que el archivo existe en el DataNode (opcional, puede confiar en el cliente)
-    # Por ahora confiamos en que el cliente finalizó correctamente en el DataNode
+    # ========== VERIFICAR QUE EL ARCHIVO EXISTE EN EL DATANODE ==========
+    # Verificar ESTRICTAMENTE que el archivo está completo en el DataNode antes de crear metadatos
+    print(f"[NAMENODE] [CHUNKED_UPLOAD] Verificando que el archivo existe en DataNode {datanode_id}...")
+    
+    try:
+        # Obtener token de servicio para verificar en DataNode
+        with cluster_lock:
+            node_id = cluster_state["node_id"]
+        try:
+            service_token = generate_service_token(node_id, "service")
+        except Exception as token_error:
+            print(f"[NAMENODE] [CHUNKED_UPLOAD] Error generando token: {token_error}, usando token pre-compartido")
+            service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+        
+        # Verificar que el archivo existe haciendo una petición HEAD o GET pequeño
+        # Usamos /retrieve con Range para solo obtener los primeros bytes (más eficiente)
+        verify_response = requests.get(
+            f"{datanode_url}/retrieve/{file_hash}",
+            headers={"Authorization": f"Bearer {service_token}", "Range": "bytes=0-0"},
+            timeout=10
+        )
+        
+        if verify_response.status_code == 404:
+            raise HTTPException(
+                status_code=400,
+                detail=f"El archivo no existe en el DataNode {datanode_id}. La subida no se completó correctamente."
+            )
+        elif verify_response.status_code not in [200, 206]:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Error verificando archivo en DataNode {datanode_id}: HTTP {verify_response.status_code}"
+            )
+        
+        print(f"[NAMENODE] [CHUNKED_UPLOAD] ✅ Archivo verificado en DataNode {datanode_id}")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[NAMENODE] [CHUNKED_UPLOAD] ❌ Error verificando archivo en DataNode: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Error verificando que el archivo existe en el DataNode: {str(e)}"
+        )
+    
+    # ========== CREAR METADATOS SOLO AHORA ==========
+    # Ahora que hemos verificado que el archivo existe, crear los metadatos
+    # Si file_id ya existe (reanudación), verificamos que pertenece a este usuario
+    # Si no existe, lo creamos
+    if file_id:
+        # Verificar que el file_id existe y pertenece al usuario
+        from namenode.manager import get_file_by_id
+        existing_file = get_file_by_id(file_id, node_id=NODE_ID, user_id=current_user.username)
+        if not existing_file:
+            # file_id existe pero no pertenece a este usuario o no existe - crear nuevo
+            print(f"[NAMENODE] [CHUNKED_UPLOAD] file_id {file_id} no válido o no pertenece al usuario, creando nuevo...")
+            file_id = None
+    
+    if not file_id:
+        # Crear metadatos SOLO ahora que verificamos que el archivo existe en DataNode
+        print(f"[NAMENODE] [CHUNKED_UPLOAD] Creando metadatos del archivo (archivo verificado en DataNode)...")
+        
+        with cluster_lock:
+            current_term = cluster_state["term"]
+        
+        file_id = add_file_metadata(
+            name=filename,
+            tags=tag_list,
+            size=file_size,
+            hash_value=hash_value,
+            node_id=NODE_ID,
+            user_id=current_user.username,
+            term=current_term
+        )
+        
+        if not file_id:
+            raise HTTPException(status_code=500, detail="No se pudieron crear los metadatos del archivo")
+        
+        print(f"[NAMENODE] [CHUNKED_UPLOAD] ✅ Metadatos creados: file_id={file_id}")
+        
+        # Actualizar upload_info con el file_id creado
+        with uploads_lock:
+            if upload_id in active_uploads:
+                active_uploads[upload_id]["file_id"] = file_id
+    else:
+        print(f"[NAMENODE] [CHUNKED_UPLOAD] ✅ Usando metadatos existentes: file_id={file_id}")
     
     # ========== REPLICACIÓN A DATANODES SECUNDARIOS ==========
     # El archivo ya está en el datanode primario, ahora replicarlo a los otros datanodes
@@ -3546,6 +3622,7 @@ def finalize_chunked_upload(
         print(f"[NAMENODE] [CHUNKED_UPLOAD] Solo hay 1 datanode asignado, no se requiere replicación adicional")
     
     # Guardar asignación de réplicas (solo las exitosas)
+    # IMPORTANTE: file_id ya fue creado arriba, así que podemos guardar las réplicas
     save_file_replicas(file_id, successful_replicas, node_id_db=NODE_ID)
     
     # Replicar operación a otros MetaNameNodes

@@ -258,10 +258,10 @@ def api_upload():
             upload_id = upload_data["upload_id"]
             datanode_url = upload_data["datanode_url"]
             client_token = upload_data["client_token"]
-            file_id = upload_data["file_id"]
+            file_id = upload_data.get("file_id")  # Puede ser None hasta que finalice
             file_hash = upload_data["file_hash"]
             
-            print(f"[FLASK] Upload iniciado: upload_id={upload_id}, datanode={datanode_url}, file_id={file_id}, file_hash={file_hash[:32]}...")
+            print(f"[FLASK] Upload iniciado: upload_id={upload_id}, datanode={datanode_url}, file_id={file_id if file_id else 'None (se creará al finalizar)'}, file_hash={file_hash[:32]}...")
             
             # Inicializar progreso ANTES de empezar a subir chunks
             with progress_lock:
@@ -424,12 +424,14 @@ def api_upload():
             upload_thread.start()
             
             # Retornar inmediatamente con upload_id para que el frontend pueda consultar progreso
+            # Nota: file_id será None hasta que finalice el upload
             return jsonify({
                 "success": True,
                 "upload_id": upload_id,
                 "message": f"Upload iniciado para '{filename}'",
                 "total_chunks": total_chunks,
-                "file_size": file_size
+                "file_size": file_size,
+                "file_id": None  # Se creará al finalizar cuando el archivo esté en el DataNode
             })
             
     except Exception as e:

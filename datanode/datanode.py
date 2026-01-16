@@ -526,7 +526,25 @@ def init_client_chunked_upload(
     if expected_datanode_id and expected_datanode_id != DATANODE_ID:
         raise HTTPException(status_code=403, detail="Token no válido para este DataNode")
     
-    # Crear sesión
+    # Verificar si ya existe una sesión para este file_id (reanudación)
+    existing_session = chunked_storage_manager.find_session_by_file_id(file_id)
+    
+    if existing_session:
+        # Sesión existente encontrada, reanudar desde donde se quedó
+        print(f"[DATANODE] Sesión existente encontrada para file_id={file_id}, reanudando upload...")
+        print(f"[DATANODE] Progreso: {len(existing_session.received_chunks)}/{existing_session.total_chunks} chunks recibidos")
+        
+        return {
+            "session_id": existing_session.session_id,
+            "file_id": file_id,
+            "total_chunks": existing_session.total_chunks,
+            "resumed": True,
+            "received_chunks": sorted(list(existing_session.received_chunks)),
+            "missing_chunks": sorted(list(set(range(existing_session.total_chunks)) - existing_session.received_chunks)),
+            "progress_percentage": existing_session.progress_percentage
+        }
+    
+    # Crear nueva sesión
     session_id = str(uuid.uuid4())
     
     try:
@@ -543,7 +561,8 @@ def init_client_chunked_upload(
         return {
             "session_id": session_id,
             "file_id": file_id,
-            "total_chunks": total_chunks
+            "total_chunks": total_chunks,
+            "resumed": False
         }
     except Exception as e:
         print(f"[DATANODE] Error creando sesión de upload de cliente: {e}")
@@ -599,6 +618,88 @@ async def client_store_chunk(
         "chunk_index": chunk_index,
         "progress_percentage": session.progress_percentage
     }
+
+
+@app.get("/client/upload/progress/{file_id}")
+def get_client_upload_progress(
+    file_id: str,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """
+    Consulta el progreso de un upload por file_id (hash del archivo).
+    Útil para reanudar uploads interrumpidos.
+    """
+    # Verificar autenticación de cliente
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de cliente")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_client_token(token, expected_type="client_upload")
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de cliente inválido o expirado")
+    
+    # Verificar que el file_hash coincide
+    expected_file_hash = payload.get("file_hash")
+    if expected_file_hash and expected_file_hash != file_id:
+        raise HTTPException(status_code=403, detail="file_id no coincide con el token")
+    
+    # Buscar sesión existente
+    progress = chunked_storage_manager.get_session_progress(file_id)
+    
+    if not progress:
+        raise HTTPException(status_code=404, detail="No hay sesión activa para este archivo")
+    
+    return progress
+
+
+@app.get("/client/download/{file_id}/chunk/{chunk_index}")
+def client_download_chunk(
+    file_id: str,
+    chunk_index: int,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """
+    Descarga un chunk individual de un archivo.
+    Requiere token temporal emitido por el NameNode.
+    """
+    # Verificar autenticación de cliente
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de cliente")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_client_token(token, expected_type="client_download")
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de cliente inválido o expirado")
+    
+    # Verificar que el file_hash coincide
+    expected_file_hash = payload.get("file_hash")
+    if expected_file_hash and expected_file_hash != file_id:
+        raise HTTPException(status_code=403, detail="file_id no coincide con el token")
+    
+    # Verificar que el datanode_id coincide
+    expected_datanode_id = payload.get("datanode_id")
+    if expected_datanode_id and expected_datanode_id != DATANODE_ID:
+        raise HTTPException(status_code=403, detail="Token no válido para este DataNode")
+    
+    print(f"[DATANODE] GET /client/download/{file_id}/chunk/{chunk_index} (user={payload.get('user_id')})")
+    
+    # Obtener chunk específico
+    from datanode.storage import get_chunk
+    
+    chunk_data = get_chunk(file_id, chunk_index)
+    if chunk_data is None:
+        raise HTTPException(status_code=404, detail=f"Chunk {chunk_index} no encontrado para archivo '{file_id}'")
+    
+    from fastapi.responses import Response
+    return Response(
+        content=chunk_data,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="chunk_{chunk_index:06d}"',
+            "Content-Length": str(len(chunk_data)),
+            "Accept-Ranges": "bytes"
+        }
+    )
 
 
 @app.post("/client/upload/session/{session_id}/finalize")

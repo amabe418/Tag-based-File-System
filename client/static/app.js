@@ -282,6 +282,11 @@ const uploadProgressIntervals = {};
 // Variable global para rastrear uploads activos (upload_id -> {filename, completed})
 const activeUploads = {};
 
+// Variable global para almacenar intervalos de polling de progreso de descarga
+const downloadProgressIntervals = {};
+// Variable global para rastrear descargas activas (download_id -> {filename, completed})
+const activeDownloads = {};
+
 function formatBytes(bytes) {
     if (bytes === 0) return '0 B';
     const k = 1024;
@@ -537,27 +542,131 @@ async function startUpload() {
 
 // ============ DOWNLOAD ============
 
-function downloadFile(filename) {
-    fetch(`/api/download/${encodeURIComponent(filename)}`, {
-        headers: { 'Authorization': `Bearer ${authToken}` }
-    })
-    .then(response => {
-        if (!response.ok) throw new Error('Error en descarga');
-        return response.blob();
-    })
-    .then(blob => {
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        window.URL.revokeObjectURL(url);
-        a.remove();
-    })
-    .catch(error => {
-        showMessage('main', `Error descargando ${filename}`, 'error');
-    });
+async function checkDownloadProgress(downloadId, filename) {
+    try {
+        const response = await fetch(`/api/download-progress/${downloadId}`, {
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        
+        if (!response.ok) {
+            console.error(`[TBFS] Error consultando progreso de descarga: ${response.status}`);
+            return null;
+        }
+        
+        const data = await response.json();
+        return data;
+    } catch (error) {
+        console.error('[TBFS] Error consultando progreso de descarga:', error);
+        return null;
+    }
+}
+
+function startDownloadProgressPolling(downloadId, filename) {
+    const progressBar = document.getElementById('upload-progress');
+    const progressFill = document.getElementById('upload-progress-bar');
+    const status = document.getElementById('upload-status');
+    
+    progressBar.style.display = 'block';
+    status.textContent = `Iniciando descarga de ${filename}...`;
+    
+    const pollInterval = setInterval(async () => {
+        const progressData = await checkDownloadProgress(downloadId, filename);
+        
+        if (!progressData || !progressData.success) {
+            console.error('[TBFS] No se pudo obtener progreso de descarga');
+            return;
+        }
+        
+        const progress = progressData.progress || 0;
+        const chunksDownloaded = progressData.chunks_downloaded || 0;
+        const totalChunks = progressData.total_chunks || 0;
+        const bytesDownloaded = progressData.bytes_downloaded || 0;
+        const fileSize = progressData.file_size || 0;
+        const statusText = progressData.status;
+        
+        // Actualizar barra de progreso
+        progressFill.style.width = `${progress}%`;
+        
+        // Actualizar texto de estado según el estado actual
+        let statusMessage = '';
+        switch (statusText) {
+            case 'initializing':
+                statusMessage = `Iniciando descarga de ${filename}...`;
+                break;
+            case 'downloading_chunks':
+                statusMessage = `Descargando ${filename}: ${chunksDownloaded}/${totalChunks} chunks (${formatBytes(bytesDownloaded)}/${formatBytes(fileSize)}) - ${progress.toFixed(1)}%`;
+                break;
+            case 'assembling':
+                statusMessage = `Ensamblando archivo: ${filename}...`;
+                break;
+            case 'completed':
+                const finalFilename = progressData.final_filename || filename;
+                statusMessage = `✅ ${finalFilename} descargado correctamente en Downloads`;
+                clearInterval(pollInterval);
+                delete downloadProgressIntervals[downloadId];
+                setTimeout(() => {
+                    progressBar.style.display = 'none';
+                    progressFill.style.width = '0%';
+                    status.textContent = '';
+                }, 3000);
+                showMessage('main', `Archivo '${finalFilename}' descargado correctamente en tu carpeta Downloads`, 'success');
+                break;
+            case 'error':
+                const errorMsg = progressData.error || 'Error desconocido';
+                statusMessage = `❌ Error: ${errorMsg}`;
+                clearInterval(pollInterval);
+                delete downloadProgressIntervals[downloadId];
+                setTimeout(() => {
+                    progressBar.style.display = 'none';
+                    progressFill.style.width = '0%';
+                    status.textContent = '';
+                }, 5000);
+                showMessage('main', `Error descargando ${filename}: ${errorMsg}`, 'error');
+                break;
+            default:
+                statusMessage = `Descargando ${filename}... (${progress.toFixed(1)}%)`;
+        }
+        
+        status.textContent = statusMessage;
+        
+    }, 500); // Consultar cada 500ms para actualización fluida
+    
+    downloadProgressIntervals[downloadId] = pollInterval;
+}
+
+async function downloadFile(filename) {
+    try {
+        const response = await fetch(`/api/download/${encodeURIComponent(filename)}`, {
+            method: 'GET',
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({ error: 'Error en descarga' }));
+            showMessage('main', `Error descargando ${filename}: ${errorData.error || 'Error desconocido'}`, 'error');
+            return;
+        }
+
+        const data = await response.json();
+
+        if (data.success) {
+            // Si es una descarga por chunks, recibimos download_id y debemos consultar progreso
+            if (data.download_id) {
+                // Archivo grande - usar polling de progreso
+                startDownloadProgressPolling(data.download_id, filename);
+                showMessage('main', `Descarga iniciada para '${filename}'`, 'info');
+            } else {
+                // Archivo pequeño - descarga directa (compatibilidad hacia atrás)
+                showMessage('main', `Descarga completada: ${filename}`, 'success');
+            }
+        } else {
+            const errorMsg = data.error || 'Error desconocido';
+            showMessage('main', `Error descargando ${filename}: ${errorMsg}`, 'error');
+        }
+    } catch (error) {
+        console.error('Error en descarga:', error);
+        showMessage('main', `Error descargando ${filename}: ${error.message || 'Error de conexión'}`, 'error');
+    }
 }
 
 // ============ DELETE ============

@@ -23,6 +23,14 @@ CHUNK_SIZE = 5 * 1024 * 1024  # 5MB
 upload_progress = {}
 progress_lock = threading.Lock()
 
+# Almacenamiento de progreso de descargas (download_id -> progreso)
+download_progress = {}
+download_lock = threading.Lock()
+
+# Directorio de descargas (mapeado desde el host)
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/app/downloads")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
 
 def get_leader_url():
     """Obtiene la URL del líder del cluster."""
@@ -294,14 +302,32 @@ def api_upload():
                     
                     datanode_session = datanode_init_response.json()
                     session_id = datanode_session["session_id"]
+                    resumed = datanode_session.get("resumed", False)
+                    received_chunks = set(datanode_session.get("received_chunks", []))
+                    missing_chunks = datanode_session.get("missing_chunks", [])
+                    
+                    # Determinar qué chunks subir
+                    if resumed and received_chunks:
+                        # Reanudar: solo subir chunks faltantes
+                        chunks_to_upload = missing_chunks if missing_chunks else [i for i in range(total_chunks) if i not in received_chunks]
+                        print(f"[FLASK] Reanudando upload: {len(received_chunks)} chunks ya recibidos, subiendo {len(chunks_to_upload)} chunks faltantes")
+                    else:
+                        # Nuevo upload: subir todos los chunks
+                        chunks_to_upload = list(range(total_chunks))
+                        print(f"[FLASK] Nuevo upload: subiendo todos los {total_chunks} chunks")
                     
                     # Actualizar estado: empezando a subir chunks
                     with progress_lock:
                         if upload_id in upload_progress:
                             upload_progress[upload_id]["status"] = "uploading_chunks"
+                            if resumed:
+                                upload_progress[upload_id]["chunks_uploaded"] = len(received_chunks)
+                                upload_progress[upload_id]["progress"] = (len(received_chunks) / total_chunks) * 100
+                                upload_progress[upload_id]["bytes_uploaded"] = len(received_chunks) * CHUNK_SIZE
                     
-                    # 3. Subir chunks directamente al DataNode
-                    for i in range(total_chunks):
+                    # 3. Subir chunks directamente al DataNode (solo los faltantes si se reanudó)
+                    chunks_uploaded_count = 0
+                    for i in chunks_to_upload:
                         start = i * CHUNK_SIZE
                         end = min(start + CHUNK_SIZE, file_size)
                         chunk_data = file_content[start:end]
@@ -323,7 +349,10 @@ def api_upload():
                                     upload_progress[upload_id]["error"] = error_msg
                             return
                         
-                        chunks_uploaded = i + 1
+                        chunks_uploaded_count += 1
+                        # Calcular progreso total (chunks recibidos previamente + chunks subidos ahora)
+                        total_chunks_received = len(received_chunks) + chunks_uploaded_count
+                        chunks_uploaded = total_chunks_received
                         progress = (chunks_uploaded / total_chunks) * 100
                         bytes_uploaded = min(chunks_uploaded * CHUNK_SIZE, file_size)
                         
@@ -436,7 +465,7 @@ def api_upload_progress(upload_id):
 
 @app.route("/api/download/<filename>", methods=["GET"])
 def api_download(filename):
-    """Descarga un archivo - streaming directo."""
+    """Inicia descarga por chunks de un archivo."""
     token = request.headers.get("Authorization", "").replace("Bearer ", "")
     
     leader_url, error = get_leader_url()
@@ -444,34 +473,239 @@ def api_download(filename):
         return jsonify({"success": False, "error": f"No hay líder disponible: {error}"}), 503
     
     try:
-        # Hacer petición al namenode con streaming
-        response = requests.get(
-            f"{leader_url}/download/{filename}",
+        # 1. Iniciar descarga en NameNode (obtiene info del archivo y token)
+        init_response = requests.post(
+            f"{leader_url}/download/init",
+            data={"filename": filename},
             headers=get_auth_headers(token),
-            stream=True,
-            timeout=300
+            timeout=30
         )
         
-        if response.status_code == 200:
-            # Stream directo al cliente
-            def generate():
-                for chunk in response.iter_content(chunk_size=8192):
-                    yield chunk
-            
-            return Response(
-                stream_with_context(generate()),
-                headers={
-                    "Content-Disposition": f"attachment; filename={filename}",
-                    "Content-Type": response.headers.get("Content-Type", "application/octet-stream"),
-                    "Content-Length": response.headers.get("Content-Length", "")
-                }
-            )
-        else:
-            return jsonify({"success": False, "error": "Archivo no encontrado"}), response.status_code
+        if init_response.status_code != 200:
+            error_msg = init_response.json().get("detail", "Error iniciando descarga") if init_response.status_code < 500 else "Error del servidor"
+            return jsonify({"success": False, "error": error_msg}), init_response.status_code
+        
+        download_data = init_response.json()
+        download_id = download_data["download_id"]
+        file_id = download_data["file_id"]
+        file_hash = download_data["file_hash"]
+        file_size = download_data["file_size"]
+        datanode_url = download_data["datanode_url"]
+        client_token = download_data["client_token"]
+        total_chunks = download_data["total_chunks"]
+        chunk_size = download_data["chunk_size"]
+        
+        print(f"[FLASK] Descarga iniciada: download_id={download_id}, file_id={file_id}, chunks={total_chunks}")
+        
+        # Inicializar progreso
+        with download_lock:
+            download_progress[download_id] = {
+                "filename": filename,
+                "file_id": file_id,
+                "file_hash": file_hash,
+                "file_size": file_size,
+                "total_chunks": total_chunks,
+                "chunks_downloaded": 0,
+                "progress": 0.0,
+                "bytes_downloaded": 0,
+                "status": "initializing"
+            }
+        
+        # Función para ejecutar la descarga en un hilo separado
+        def download_chunks_thread():
+            try:
+                # Verificar si hay chunks ya descargados (reanudación)
+                chunks_dir = os.path.join(DOWNLOAD_DIR, f"{file_hash}_chunks")
+                received_chunks = set()
+                if os.path.exists(chunks_dir):
+                    # Buscar chunks existentes
+                    for chunk_file in os.listdir(chunks_dir):
+                        if chunk_file.startswith("chunk_") and chunk_file.endswith(".tmp"):
+                            try:
+                                chunk_idx = int(chunk_file.replace("chunk_", "").replace(".tmp", ""))
+                                received_chunks.add(chunk_idx)
+                            except ValueError:
+                                pass
+                    
+                    if received_chunks:
+                        print(f"[FLASK] Reanudando descarga: {len(received_chunks)} chunks ya descargados")
+                
+                # Determinar qué chunks descargar
+                if received_chunks:
+                    chunks_to_download = [i for i in range(total_chunks) if i not in received_chunks]
+                else:
+                    chunks_to_download = list(range(total_chunks))
+                    os.makedirs(chunks_dir, exist_ok=True)
+                
+                # Actualizar estado: empezando a descargar chunks
+                with download_lock:
+                    if download_id in download_progress:
+                        download_progress[download_id]["status"] = "downloading_chunks"
+                        if received_chunks:
+                            download_progress[download_id]["chunks_downloaded"] = len(received_chunks)
+                            download_progress[download_id]["progress"] = (len(received_chunks) / total_chunks) * 100
+                            download_progress[download_id]["bytes_downloaded"] = len(received_chunks) * chunk_size
+                
+                # 2. Descargar chunks directamente del DataNode
+                chunks_downloaded_count = 0
+                for i in chunks_to_download:
+                    chunk_path = os.path.join(chunks_dir, f"chunk_{i:06d}.tmp")
+                    
+                    # Descargar chunk
+                    chunk_response = requests.get(
+                        f"{datanode_url}/client/download/{file_hash}/chunk/{i}",
+                        headers={"Authorization": f"Bearer {client_token}"},
+                        timeout=120
+                    )
+                    
+                    if chunk_response.status_code != 200:
+                        try:
+                            error_msg = chunk_response.json().get("detail", f"Error descargando chunk {i}")
+                        except:
+                            error_msg = f"Error HTTP {chunk_response.status_code} descargando chunk {i}"
+                        with download_lock:
+                            if download_id in download_progress:
+                                download_progress[download_id]["status"] = "error"
+                                download_progress[download_id]["error"] = error_msg
+                        return
+                    
+                    # Guardar chunk en disco
+                    with open(chunk_path, 'wb') as f:
+                        f.write(chunk_response.content)
+                    
+                    chunks_downloaded_count += 1
+                    total_chunks_received = len(received_chunks) + chunks_downloaded_count
+                    progress = (total_chunks_received / total_chunks) * 100
+                    bytes_downloaded = min(total_chunks_received * chunk_size, file_size)
+                    
+                    # Actualizar progreso
+                    with download_lock:
+                        if download_id in download_progress:
+                            download_progress[download_id]["chunks_downloaded"] = total_chunks_received
+                            download_progress[download_id]["progress"] = progress
+                            download_progress[download_id]["bytes_downloaded"] = bytes_downloaded
+                    
+                    print(f"[FLASK] Progreso descarga: {total_chunks_received}/{total_chunks} chunks ({progress:.1f}%)")
+                
+                # Actualizar estado: chunks completados, ahora ensamblando
+                with download_lock:
+                    if download_id in download_progress:
+                        download_progress[download_id]["status"] = "assembling"
+                
+                # 3. Ensamblar archivo desde chunks
+                # Usar secure_filename para asegurar que el nombre sea seguro
+                safe_filename = secure_filename(filename)
+                final_file_path = os.path.join(DOWNLOAD_DIR, safe_filename)
+                
+                # Si el archivo ya existe, agregar un sufijo numérico
+                if os.path.exists(final_file_path):
+                    base_name, ext = os.path.splitext(safe_filename)
+                    counter = 1
+                    while os.path.exists(final_file_path):
+                        final_file_path = os.path.join(DOWNLOAD_DIR, f"{base_name}_{counter}{ext}")
+                        counter += 1
+                    safe_filename = os.path.basename(final_file_path)
+                    print(f"[FLASK] Archivo ya existe, guardando como: {safe_filename}")
+                
+                print(f"[FLASK] Ensamblando archivo desde {total_chunks} chunks...")
+                
+                with open(final_file_path, 'wb') as final_file:
+                    for i in range(total_chunks):
+                        chunk_path = os.path.join(chunks_dir, f"chunk_{i:06d}.tmp")
+                        if not os.path.exists(chunk_path):
+                            error_msg = f"Chunk {i} no encontrado después de descarga"
+                            with download_lock:
+                                if download_id in download_progress:
+                                    download_progress[download_id]["status"] = "error"
+                                    download_progress[download_id]["error"] = error_msg
+                            return
+                        
+                        with open(chunk_path, 'rb') as chunk_file:
+                            final_file.write(chunk_file.read())
+                
+                # Verificar hash del archivo ensamblado
+                with open(final_file_path, 'rb') as f:
+                    file_content = f.read()
+                    calculated_hash = hashlib.sha256(file_content).hexdigest()
+                
+                if calculated_hash != file_hash:
+                    error_msg = f"Hash del archivo no coincide (esperado: {file_hash[:16]}..., calculado: {calculated_hash[:16]}...)"
+                    with download_lock:
+                        if download_id in download_progress:
+                            download_progress[download_id]["status"] = "error"
+                            download_progress[download_id]["error"] = error_msg
+                    os.remove(final_file_path)
+                    return
+                
+                # Limpiar chunks temporales
+                try:
+                    import shutil
+                    shutil.rmtree(chunks_dir)
+                    print(f"[FLASK] Chunks temporales eliminados: {chunks_dir}")
+                except Exception as e:
+                    print(f"[FLASK] Advertencia: No se pudieron eliminar chunks temporales: {e}")
+                
+                # Actualizar estado: completado
+                with download_lock:
+                    if download_id in download_progress:
+                        download_progress[download_id]["status"] = "completed"
+                        download_progress[download_id]["file_path"] = final_file_path
+                        download_progress[download_id]["final_filename"] = safe_filename
+                
+                print(f"[FLASK] Archivo descargado y ensamblado: {final_file_path} ({len(file_content)} bytes)")
+                
+            except Exception as e:
+                print(f"[FLASK] Error en hilo de descarga: {e}")
+                import traceback
+                traceback.print_exc()
+                with download_lock:
+                    if download_id in download_progress:
+                        download_progress[download_id]["status"] = "error"
+                        download_progress[download_id]["error"] = str(e)
+        
+        # Iniciar descarga en hilo separado
+        download_thread = threading.Thread(target=download_chunks_thread, daemon=True)
+        download_thread.start()
+        
+        # Retornar inmediatamente con download_id para que el frontend pueda consultar progreso
+        return jsonify({
+            "success": True,
+            "download_id": download_id,
+            "message": f"Descarga iniciada para '{filename}'",
+            "total_chunks": total_chunks,
+            "file_size": file_size
+        })
             
     except Exception as e:
-        print(f"[FLASK] Error descargando archivo: {e}")
+        print(f"[FLASK] Error iniciando descarga: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/download-progress/<download_id>", methods=["GET"])
+def api_download_progress(download_id):
+    """Consulta el progreso de una descarga en curso."""
+    with download_lock:
+        progress_data = download_progress.get(download_id)
+    
+    if not progress_data:
+        return jsonify({"success": False, "error": "Descarga no encontrada"}), 404
+    
+    return jsonify({
+        "success": True,
+        "download_id": download_id,
+        "filename": progress_data.get("filename"),
+        "total_chunks": progress_data.get("total_chunks"),
+        "chunks_downloaded": progress_data.get("chunks_downloaded", 0),
+        "progress": progress_data.get("progress", 0.0),
+        "bytes_downloaded": progress_data.get("bytes_downloaded", 0),
+        "file_size": progress_data.get("file_size"),
+        "status": progress_data.get("status"),
+        "error": progress_data.get("error") if progress_data.get("status") == "error" else None,
+        "file_path": progress_data.get("file_path") if progress_data.get("status") == "completed" else None,
+        "final_filename": progress_data.get("final_filename") if progress_data.get("status") == "completed" else None
+    })
 
 
 @app.route("/api/delete/<int:file_id>", methods=["DELETE"])

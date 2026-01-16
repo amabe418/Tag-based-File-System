@@ -144,6 +144,30 @@ class ChunkedStorageManager:
         with self.lock:
             return self.sessions.get(session_id)
     
+    def find_session_by_file_id(self, file_id: str) -> Optional[FileReceiveSession]:
+        """Busca una sesión activa por file_id (hash del archivo)"""
+        with self.lock:
+            for session in self.sessions.values():
+                if session.file_id == file_id and not session.is_complete:
+                    return session
+        return None
+    
+    def get_session_progress(self, file_id: str) -> Optional[dict]:
+        """Obtiene el progreso de una sesión por file_id"""
+        session = self.find_session_by_file_id(file_id)
+        if not session:
+            return None
+        
+        return {
+            "session_id": session.session_id,
+            "file_id": session.file_id,
+            "total_chunks": session.total_chunks,
+            "received_chunks": sorted(list(session.received_chunks)),
+            "missing_chunks": sorted(list(set(range(session.total_chunks)) - session.received_chunks)),
+            "progress_percentage": session.progress_percentage,
+            "is_complete": session.is_complete
+        }
+    
     def save_chunk(
         self,
         session_id: str,

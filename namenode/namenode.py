@@ -3282,8 +3282,52 @@ def init_chunked_upload(
         user_id=current_user.username
     )
     
-    # Generar upload_id único
-    upload_id = str(uuid.uuid4())
+    # Verificar si ya existe un upload en progreso para el mismo hash y usuario
+    existing_upload_id = None
+    existing_session_id = None
+    received_chunks = []
+    missing_chunks = []
+    
+    with uploads_lock:
+        # Buscar upload existente para el mismo hash y usuario
+        for uid, upload_info in active_uploads.items():
+            if (upload_info.get("file_hash") == file_hash_clean and 
+                upload_info.get("user_id") == current_user.username):
+                existing_upload_id = uid
+                print(f"[NAMENODE] [CHUNKED_UPLOAD] Upload previo encontrado: upload_id={existing_upload_id}")
+                break
+    
+    # Si hay un upload previo, consultar progreso en el DataNode
+    # Nota: Generamos el token primero para poder consultar el progreso
+    if existing_upload_id:
+        try:
+            # Consultar progreso en DataNode usando el token del cliente
+            progress_response = requests.get(
+                f"{datanode_url}/client/upload/progress/{file_hash_clean}",
+                headers={"Authorization": f"Bearer {client_token}"},
+                timeout=10
+            )
+            
+            if progress_response.status_code == 200:
+                progress_data = progress_response.json()
+                existing_session_id = progress_data.get("session_id")
+                received_chunks = progress_data.get("received_chunks", [])
+                missing_chunks = progress_data.get("missing_chunks", [])
+                print(f"[NAMENODE] [CHUNKED_UPLOAD] Progreso encontrado: {len(received_chunks)}/{total_chunks} chunks recibidos")
+            else:
+                print(f"[NAMENODE] [CHUNKED_UPLOAD] No se pudo consultar progreso, creando nueva sesión")
+                existing_upload_id = None
+        except Exception as e:
+            print(f"[NAMENODE] [CHUNKED_UPLOAD] Error consultando progreso: {e}, creando nueva sesión")
+            existing_upload_id = None
+    
+    # Generar upload_id (reutilizar si hay upload previo, o crear nuevo)
+    if existing_upload_id:
+        upload_id = existing_upload_id
+        print(f"[NAMENODE] [CHUNKED_UPLOAD] Reanudando upload existente: upload_id={upload_id}")
+    else:
+        upload_id = str(uuid.uuid4())
+        print(f"[NAMENODE] [CHUNKED_UPLOAD] Creando nuevo upload: upload_id={upload_id}")
     
     # Almacenar información del upload en progreso
     with uploads_lock:
@@ -3300,7 +3344,8 @@ def init_chunked_upload(
             "datanode_ids": datanode_ids,  # Para replicación después
             "chunk_size": chunk_size,
             "total_chunks": total_chunks,
-            "started_at": time.time()
+            "started_at": time.time(),
+            "session_id": existing_session_id  # Guardar session_id si se reanudó
         }
     
     print(f"[NAMENODE] [CHUNKED_UPLOAD] Upload iniciado: upload_id={upload_id}, file_id={file_id}, datanode={primary_datanode_id}")
@@ -3314,7 +3359,10 @@ def init_chunked_upload(
         "datanode_id": primary_datanode_id,
         "client_token": client_token,
         "total_chunks": total_chunks,
-        "chunk_size": chunk_size
+        "chunk_size": chunk_size,
+        "resumed": existing_upload_id is not None,
+        "received_chunks": received_chunks,
+        "missing_chunks": missing_chunks
     }
     print(f"[NAMENODE] [CHUNKED_UPLOAD] Respuesta completa: {list(response_data.keys())}")
     return response_data
@@ -3849,6 +3897,105 @@ def download_file_compat(
         status_code=503,
         detail=f"No se pudo leer el archivo desde ningún DataNode disponible. Último error: {last_error}"
     )
+
+
+@app.post("/download/init")
+def init_chunked_download(
+    filename: str = Form(...),
+    current_user: User = Depends(require_permission(Permission.READ_FILES))
+):
+    """
+    Inicia una descarga por chunks.
+    Obtiene información del archivo y genera token para descargar directamente desde DataNode.
+    """
+    leader_url = get_leader_url()
+    if leader_url:
+        try:
+            response = requests.post(
+                f"{leader_url}/download/init",
+                data={"filename": filename},
+                headers={"Authorization": f"Bearer {current_user.username}"},
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Error conectando con líder: {e}")
+    
+    if not is_leader():
+        raise HTTPException(status_code=503, detail="No hay líder disponible")
+    
+    print(f"[NAMENODE] [CHUNKED_DOWNLOAD] Iniciando descarga: {filename}")
+    
+    # Buscar archivo por nombre en metadatos (solo del usuario actual)
+    files = query_files(query_tags=None, node_id=NODE_ID, user_id=current_user.username)
+    file_data = None
+    file_id = None
+    file_hash = None
+    file_size = None
+    
+    for fid, name, _ in files:
+        if name == filename:
+            file_data = get_file_by_id(fid, node_id=NODE_ID, user_id=current_user.username)
+            if file_data:
+                file_id = fid
+                file_hash_value = file_data.get("hash", "")
+                file_size = file_data.get("size", 0)
+                # Extraer hash sin prefijo "sha256:"
+                file_hash = file_hash_value[7:] if file_hash_value.startswith("sha256:") else file_hash_value
+                break
+    
+    if not file_data or not file_hash:
+        raise HTTPException(status_code=404, detail=f"Archivo '{filename}' no encontrado")
+    
+    # Obtener réplicas del archivo
+    replicas = get_file_replicas(file_id, node_id_db=NODE_ID)
+    if not replicas:
+        raise HTTPException(status_code=503, detail="No hay réplicas disponibles para este archivo")
+    
+    # Seleccionar mejor DataNode para lectura
+    primary_datanode = get_best_datanode_for_read(file_id, node_id_db=NODE_ID)
+    if not primary_datanode:
+        # Si no hay mejor opción, usar la primera réplica
+        primary_datanode = replicas[0]
+    
+    primary_datanode_id = primary_datanode["datanode_id"]
+    datanode_info = get_datanode(primary_datanode_id, node_id_db=NODE_ID)
+    if not datanode_info:
+        raise HTTPException(status_code=503, detail=f"DataNode {primary_datanode_id} no encontrado")
+    
+    # Construir URL del DataNode
+    datanode_url = datanode_info["url"]
+    if not datanode_url.startswith("http"):
+        datanode_url = f"http://{datanode_url}:{datanode_info['port']}"
+    
+    # Calcular tamaño de chunk (usar el mismo que para uploads: 5MB)
+    CHUNK_SIZE = 5 * 1024 * 1024
+    total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE if file_size > 0 else 1
+    
+    # Generar token temporal para el cliente (válido por 15 minutos)
+    from security.service_auth import generate_client_download_token
+    client_token = generate_client_download_token(
+        user_id=current_user.username,
+        file_hash=file_hash,
+        datanode_id=primary_datanode_id,
+        expires_minutes=15
+    )
+    
+    print(f"[NAMENODE] [CHUNKED_DOWNLOAD] Descarga iniciada: file_id={file_id}, datanode={primary_datanode_id}, chunks={total_chunks}")
+    
+    return {
+        "download_id": str(uuid.uuid4()),
+        "file_id": file_id,
+        "filename": filename,
+        "file_hash": file_hash,
+        "file_size": file_size,
+        "datanode_url": datanode_url,
+        "datanode_id": primary_datanode_id,
+        "client_token": client_token,
+        "total_chunks": total_chunks,
+        "chunk_size": CHUNK_SIZE
+    }
 
 
 # ========== ENDPOINTS INTERNOS PARA REPLICACIÓN ==========

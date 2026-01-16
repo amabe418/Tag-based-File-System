@@ -90,14 +90,21 @@ def rate_limit_middleware(
         if request.url.path in ["/", "/health", "/docs", "/openapi.json", "/redoc"]:
             return await call_next(request)
         
-        # Excluir endpoints de chunked upload (no aplicar rate limiting)
-        # Estos endpoints son parte de una operación de upload legítima
+        # Excluir endpoints de chunked upload y download (no aplicar rate limiting)
+        # Estos endpoints son parte de operaciones de upload/download legítimas
         path = request.url.path
         if path.startswith("/client/upload/"):
             # Excluir:
             # - /client/upload/init
             # - /client/upload/session/{session_id}/chunk/{chunk_index}
             # - /client/upload/session/{session_id}/finalize
+            # - /client/upload/progress/{file_id}
+            return await call_next(request)
+        
+        if path.startswith("/client/download/"):
+            # Excluir:
+            # - /client/download/{file_id}/chunk/{chunk_index} (descarga de chunks individuales)
+            # - /client/download/{file_id} (descarga completa con Range requests)
             return await call_next(request)
         
         client_id = get_client_identifier(request)
@@ -141,14 +148,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if request.url.path in ["/", "/health", "/docs", "/openapi.json", "/redoc"]:
             return await call_next(request)
         
-        # Excluir endpoints de chunked upload (no aplicar rate limiting)
-        # Estos endpoints son parte de una operación de upload legítima
+        # Excluir endpoints de chunked upload y download (no aplicar rate limiting)
+        # Estos endpoints son parte de operaciones de upload/download legítimas
         path = request.url.path
         if path.startswith("/client/upload/"):
             # Excluir:
             # - /client/upload/init
             # - /client/upload/session/{session_id}/chunk/{chunk_index}
             # - /client/upload/session/{session_id}/finalize
+            # - /client/upload/progress/{file_id}
+            return await call_next(request)
+        
+        if path.startswith("/client/download/"):
+            # Excluir:
+            # - /client/download/{file_id}/chunk/{chunk_index} (descarga de chunks individuales)
+            # - /client/download/{file_id} (descarga completa con Range requests)
             return await call_next(request)
         
         client_id = get_client_identifier(request)

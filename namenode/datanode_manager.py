@@ -26,6 +26,7 @@ def register_datanode(node_id: str, url: str, port: int, ip: Optional[str],
     
     # Solo mantener el lock durante la operación de BD
     old_status = None
+    new_status = 'active'  # Status por defecto (para nuevos DataNodes)
     with db_lock:
         conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
         
@@ -38,13 +39,37 @@ def register_datanode(node_id: str, url: str, port: int, ip: Optional[str],
                 old_status = row[0]
             
             if exists:
+                # Si el DataNode existía como inactive, verificar conectividad antes de marcar como active
+                new_status = 'active'  # Status por defecto para actualización
+                
+                if old_status == 'inactive':
+                    # Verificar conectividad antes de marcar como active
+                    try:
+                        # Construir URL completa
+                        if not url.startswith("http"):
+                            test_url = f"http://{url}:{port}"
+                        else:
+                            test_url = f"{url}:{port}" if ":" not in url.split("://")[1] else url
+                        
+                        # Intentar conectar al DataNode con timeout corto
+                        response = requests.get(f"{test_url}/", timeout=3)
+                        if response.status_code != 200:
+                            print(f"[DATANODE_MANAGER] ⚠️  DataNode {node_id} no responde correctamente (HTTP {response.status_code}), manteniendo como inactive")
+                            new_status = 'inactive'
+                        else:
+                            print(f"[DATANODE_MANAGER] ✅ DataNode {node_id} verificado y respondiendo correctamente, marcando como active")
+                    except Exception as e:
+                        print(f"[DATANODE_MANAGER] ⚠️  DataNode {node_id} no es accesible durante registro ({str(e)}), manteniendo como inactive")
+                        new_status = 'inactive'
+                
                 # Actualizar DataNode existente (preservar estado de draining si existe)
+                update_params_with_status = (url, port, ip, total_space, free_space, current_time, new_status, node_id)
                 cursor.execute("""
                     UPDATE datanodes 
                     SET url = ?, port = ?, ip = ?, total_space = ?, free_space = ?, 
-                        last_heartbeat = ?, status = 'active'
+                        last_heartbeat = ?, status = ?
                     WHERE node_id = ?
-                """, update_params)
+                """, update_params_with_status)
             else:
                 # Insertar nuevo DataNode
                 cursor.execute("""
@@ -61,7 +86,9 @@ def register_datanode(node_id: str, url: str, port: int, ip: Optional[str],
             close_connection(conn)
     
     # Actualizar cache fuera del lock de BD
-    print(f"[DATANODE_MANAGER] DataNode registrado/actualizado: {node_id} -> {url}:{port}")
+    # Obtener el status real que se usó (puede ser 'inactive' si no pasó la verificación)
+    actual_status = new_status if (exists and old_status == 'inactive') else ('active' if not exists else new_status)
+    print(f"[DATANODE_MANAGER] DataNode registrado/actualizado: {node_id} -> {url}:{port} (status: {actual_status})")
     cache = get_datanode_cache(node_id_db)
     cache.update(node_id, {
         "node_id": node_id,
@@ -71,7 +98,7 @@ def register_datanode(node_id: str, url: str, port: int, ip: Optional[str],
         "total_space": total_space,
         "free_space": free_space,
         "last_heartbeat": current_time,
-        "status": "active",
+        "status": actual_status,
         "draining": False
     })
     
@@ -120,26 +147,70 @@ def update_datanode_heartbeat(node_id: str, free_space: int, total_space: int,
                               node_id_db: str = None) -> bool:
     """
     Actualiza el heartbeat de un DataNode.
+    Verifica la conectividad real antes de marcar como active para evitar oscilaciones.
     
     Returns:
         True si se actualizó correctamente, False en caso de error
     """
     db_path = get_db_path(node_id_db)
     
+    # Obtener información del DataNode para verificar conectividad
+    datanode_info = get_datanode(node_id, node_id_db=node_id_db)
+    if not datanode_info:
+        print(f"[DATANODE_MANAGER] DataNode {node_id} no encontrado para heartbeat")
+        return False
+    
+    # Verificar conectividad real antes de marcar como active
+    # Esto previene oscilaciones cuando un DataNode está inactivo pero envía heartbeats en cola
+    should_mark_active = True
+    if datanode_info.get("status") == "inactive":
+        # Si el DataNode estaba marcado como inactive, verificar que realmente responde
+        print(f"[DATANODE_MANAGER] DataNode {node_id} estaba inactive, verificando conectividad antes de marcar como active...")
+        datanode_url = datanode_info.get("url")
+        datanode_port = datanode_info.get("port")
+        
+        if datanode_url and datanode_port:
+            try:
+                # Construir URL completa
+                if not datanode_url.startswith("http"):
+                    test_url = f"http://{datanode_url}:{datanode_port}"
+                else:
+                    test_url = f"{datanode_url}:{datanode_port}" if ":" not in datanode_url.split("://")[1] else datanode_url
+                
+                # Intentar conectar al DataNode con timeout corto
+                response = requests.get(f"{test_url}/", timeout=3)
+                if response.status_code != 200:
+                    print(f"[DATANODE_MANAGER] ⚠️  DataNode {node_id} no responde correctamente (HTTP {response.status_code}), manteniendo como inactive")
+                    should_mark_active = False
+                else:
+                    print(f"[DATANODE_MANAGER] ✅ DataNode {node_id} verificado y respondiendo correctamente")
+            except Exception as e:
+                print(f"[DATANODE_MANAGER] ⚠️  DataNode {node_id} no es accesible ({str(e)}), manteniendo como inactive")
+                should_mark_active = False
+    
     # Preparar datos fuera del lock
     current_time = time.time()
-    update_params = (free_space, total_space, current_time, node_id)
     
     # Solo mantener el lock durante la operación de BD
     with db_lock:
         conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
         
         try:
-            cursor.execute("""
-                UPDATE datanodes 
-                SET free_space = ?, total_space = ?, last_heartbeat = ?, status = 'active'
-                WHERE node_id = ?
-            """, update_params)
+            if should_mark_active:
+                update_params = (free_space, total_space, current_time, "active", node_id)
+                cursor.execute("""
+                    UPDATE datanodes 
+                    SET free_space = ?, total_space = ?, last_heartbeat = ?, status = ?
+                    WHERE node_id = ?
+                """, update_params)
+            else:
+                # Actualizar heartbeat pero mantener status como inactive
+                update_params = (free_space, total_space, current_time, "inactive", node_id)
+                cursor.execute("""
+                    UPDATE datanodes 
+                    SET free_space = ?, total_space = ?, last_heartbeat = ?, status = ?
+                    WHERE node_id = ?
+                """, update_params)
             
             if cursor.rowcount == 0:
                 print(f"[DATANODE_MANAGER] DataNode {node_id} no encontrado para heartbeat")
@@ -159,7 +230,7 @@ def update_datanode_heartbeat(node_id: str, free_space: int, total_space: int,
         "free_space": free_space,
         "total_space": total_space,
         "last_heartbeat": current_time,
-        "status": "active"
+        "status": "active" if should_mark_active else "inactive"
     })
     
     return True

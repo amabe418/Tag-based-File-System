@@ -681,6 +681,30 @@ def get_operation_key(operation: OperationLog) -> str:
         return f"{operation.operation}:{str(operation.data)}"
 
 
+def get_operation_sort_key(operation: OperationLog, node_id: str = None) -> tuple:
+    """
+    Genera una clave de ordenamiento determinística para operaciones.
+    Usa (term, timestamp, node_id_hash) para garantizar orden consistente entre todos los nodos.
+    
+    Args:
+        operation: Operación a ordenar
+        node_id: ID del nodo que generó la operación (opcional, se obtiene de operation.data si está disponible)
+    
+    Returns:
+        Tupla (term, timestamp, node_id_hash) para ordenamiento
+    """
+    if node_id is None:
+        # Intentar obtener node_id de los datos de la operación o usar un valor por defecto
+        node_id = operation.data.get("node_id", operation.data.get("user_id", "unknown"))
+    
+    # Crear hash del node_id para ordenamiento determinístico
+    import hashlib
+    node_id_hash = int(hashlib.md5(node_id.encode()).hexdigest()[:8], 16)
+    
+    # Ordenar por: term (primero), timestamp (segundo), node_id_hash (tercero para determinismo)
+    return (operation.term, operation.timestamp, node_id_hash)
+
+
 def compare_operation_logs(local_log: List[OperationLog], peer_log: List[OperationLog]) -> Dict:
     """
     Fase 4: Compara dos logs de operaciones para encontrar diferencias.
@@ -2153,7 +2177,7 @@ def detect_and_log_table_changes(node_id: str = None):
     from namenode.database import get_db_path, get_connection, close_connection, db_lock
     
     try:
-        db_path = get_db_path(node_id_db=node_id)
+        db_path = get_db_path(node_id=node_id)
         
         with db_lock:
             conn, cursor = get_connection(db_path=db_path, node_id=node_id)
@@ -2398,7 +2422,17 @@ def leader_sync_loop():
                 # Identificar operaciones faltantes en el seguidor
                 follower_keys = set()
                 for op in follower_operations:
-                    key = f"{op.get('operation')}_{op.get('timestamp')}_{op.get('term')}"
+                    # follower_operations puede ser una lista de diccionarios (JSON) o de objetos OperationLog
+                    if isinstance(op, dict):
+                        op_operation = op.get('operation', '')
+                        op_timestamp = op.get('timestamp', 0)
+                        op_term = op.get('term', 0)
+                    else:
+                        # Es un objeto OperationLog
+                        op_operation = op.operation
+                        op_timestamp = op.timestamp
+                        op_term = op.term
+                    key = f"{op_operation}_{op_timestamp}_{op_term}"
                     follower_keys.add(key)
                 
                 missing_operations = []
@@ -4777,7 +4811,7 @@ def internal_replicate(
             # Sincronizar tabla file_replicas desde el líder
             from namenode.database import get_db_path, get_connection, close_connection, db_lock
             
-            db_path = get_db_path(node_id_db=NODE_ID)
+            db_path = get_db_path(node_id=NODE_ID)
             file_replicas_data = operation_data.get("file_replicas", [])
             
             with db_lock:
@@ -4813,7 +4847,7 @@ def internal_replicate(
             # Sincronizar tabla datanodes desde el líder
             from namenode.database import get_db_path, get_connection, close_connection, db_lock
             
-            db_path = get_db_path(node_id_db=NODE_ID)
+            db_path = get_db_path(node_id=NODE_ID)
             datanodes_data = operation_data.get("datanodes", [])
             
             with db_lock:

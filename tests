@@ -19,4 +19,8 @@ Levantar un namenode de la generación vieja
 Errores encontrados:
 Al incorporarse nuevamente al clúster el namenode viejo continúa con la información vieja en su base datos, por lo que no tiene la localización física de los datos.
 
+#### YA ESTO PICNHA
 => Cualquier nodo VIEJO que se incorpore nuevamente al clúster debe ser actualizar también SUS TABLAS datanodes y file_replicas. 
+
+Test 3 (Reconciliar la red luego de una partición):
+Ajustar la forma en que se reconcilian dos nodos líderes una vez unida la red nuevamente

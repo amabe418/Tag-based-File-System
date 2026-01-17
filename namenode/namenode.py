@@ -670,6 +670,12 @@ def get_operation_key(operation: OperationLog) -> str:
     elif operation.operation == "change_password":
         # Clave: username
         return operation.data.get("username", "")
+    elif operation.operation == "sync_file_replicas":
+        # Para sincronización de réplicas, usar timestamp para identificar la versión
+        return f"sync_replicas:{operation.timestamp}"
+    elif operation.operation == "sync_datanodes":
+        # Para sincronización de datanodes, usar timestamp para identificar la versión
+        return f"sync_datanodes:{operation.timestamp}"
     else:
         # Clave genérica: operación + datos serializados
         return f"{operation.operation}:{str(operation.data)}"
@@ -927,17 +933,90 @@ def apply_operation_safely(operation: OperationLog, node_id: str = None):
         traceback.print_exc()
 
 
+def detect_multiple_leaders(peers: List[str]) -> List[Dict]:
+    """
+    Detecta si hay múltiples líderes activos en el clúster.
+    
+    Returns:
+        Lista de diccionarios con información de líderes detectados:
+        [{"node_id": str, "term": int, "timestamp": float}, ...]
+    """
+    leaders = []
+    
+    for peer in peers:
+        try:
+            peer_url = get_peer_url(peer)
+            response = requests.get(f"{peer_url}/", timeout=3)
+            if response.status_code == 200:
+                peer_data = response.json()
+                if peer_data.get("is_leader", False):
+                    leaders.append({
+                        "node_id": peer,
+                        "term": peer_data.get("term", 0),
+                        "timestamp": time.time()
+                    })
+        except Exception as e:
+            # Peer no responde, no es líder
+            pass
+    
+    # También verificar si este nodo es líder
+    with cluster_lock:
+        if cluster_state.get("is_leader", False):
+            leaders.append({
+                "node_id": cluster_state["node_id"],
+                "term": cluster_state.get("term", 0),
+                "timestamp": time.time()
+            })
+    
+    return leaders
+
+
+def merge_and_order_operations(all_logs: Dict[str, List[OperationLog]]) -> List[OperationLog]:
+    """
+    Fusiona logs de múltiples nodos y los ordena de forma determinística.
+    Usa un ordenamiento causal robusto: (term, timestamp, node_id_hash).
+    
+    Args:
+        all_logs: Diccionario {node_id: [OperationLog, ...]}
+    
+    Returns:
+        Lista de operaciones ordenadas de forma determinística
+    """
+    # Recopilar todas las operaciones con su origen
+    all_operations = []
+    seen_operations = set()  # Para evitar duplicados
+    
+    for node_id, log in all_logs.items():
+        for op in log:
+            # Crear clave única para detectar duplicados
+            op_key = (op.operation, op.term, op.timestamp, get_operation_key(op))
+            
+            if op_key not in seen_operations:
+                seen_operations.add(op_key)
+                all_operations.append((op, node_id))
+    
+    # Ordenar usando la clave determinística
+    sorted_operations = sorted(
+        all_operations,
+        key=lambda x: get_operation_sort_key(x[0], x[1])
+    )
+    
+    # Extraer solo las operaciones (sin node_id)
+    return [op for op, _ in sorted_operations]
+
+
 def perform_full_reconciliation(reunited_peers: List[str]):
     """
-    Fase 4: Realiza reconciliación completa después de particionamiento.
+    Realiza reconciliación completa después de particionamiento con consenso entre líderes.
     
-    Proceso:
+    Proceso mejorado:
     1. Obtener logs de operaciones de todos los peers reunificados
-    2. Comparar logs para encontrar operaciones faltantes
-    3. Aplicar operaciones faltantes en orden (por term y timestamp)
-    4. Detectar y resolver conflictos (last-write-wins)
-    5. Verificar integridad de datos físicos
-    6. Re-replicar archivos faltantes
+    2. Detectar múltiples líderes activos
+    3. Fusionar y ordenar todas las operaciones de forma determinística
+    4. Aplicar operaciones en orden causal (term + timestamp + node_id)
+    5. Resolver conflictos con orden causal robusto
+    6. Verificar integridad de datos físicos
+    7. Re-replicar archivos faltantes
     
     Args:
         reunited_peers: Lista de peer IDs que han vuelto a estar disponibles
@@ -956,6 +1035,19 @@ def perform_full_reconciliation(reunited_peers: List[str]):
     print(f"[NAMENODE] 🔄   - Term local: {current_term}")
     print(f"[NAMENODE] 🔄   - Es líder: {cluster_state['is_leader']}")
     print(f"[NAMENODE] 🔄   - Líder conocido: {cluster_state.get('leader_id', 'None')}")
+    
+    # Paso 0: Detectar múltiples líderes activos
+    print(f"[NAMENODE] 🔄 [PASO 0] Detectando múltiples líderes activos...")
+    all_peers_to_check = list(set(reunited_peers + [current_node_id]))
+    detected_leaders = detect_multiple_leaders(all_peers_to_check)
+    
+    if len(detected_leaders) > 1:
+        print(f"[NAMENODE] 🔄 [PASO 0] ⚠️  MÚLTIPLES LÍDERES DETECTADOS: {len(detected_leaders)}")
+        for leader in detected_leaders:
+            print(f"[NAMENODE] 🔄 [PASO 0]   - Líder: {leader['node_id']}, Term: {leader['term']}")
+        print(f"[NAMENODE] 🔄 [PASO 0] Se requerirá consenso para ordenar operaciones")
+    else:
+        print(f"[NAMENODE] 🔄 [PASO 0] ✅ Un solo líder detectado o ninguno")
     
     # Paso 1: Obtener logs de todos los peers reunificados
     print(f"[NAMENODE] 🔄 [PASO 1] Obteniendo logs de operaciones de {len(reunited_peers)} peers...")
@@ -987,8 +1079,19 @@ def perform_full_reconciliation(reunited_peers: List[str]):
     print(f"[NAMENODE] 🔄 [PASO 2] ✅ Log local: {len(local_log)} operaciones totales")
     print(f"[NAMENODE] 🔄 [PASO 2]   Desglose: {op_counts_local}")
     
-    # Paso 3: Determinar líder válido (mayor term)
-    print(f"[NAMENODE] 🔄 [PASO 3] Determinando líder válido (mayor term)...")
+    # Paso 2.5: Incluir log local en la colección de logs
+    print(f"[NAMENODE] 🔄 [PASO 2.5] Incluyendo log local en fusión...")
+    all_logs = peer_logs.copy()
+    all_logs[current_node_id] = local_log
+    print(f"[NAMENODE] 🔄 [PASO 2.5] Total de logs a fusionar: {len(all_logs)}")
+    
+    # Paso 3: Fusionar y ordenar todas las operaciones de forma determinística
+    print(f"[NAMENODE] 🔄 [PASO 3] Fusionando y ordenando operaciones de forma determinística...")
+    merged_operations = merge_and_order_operations(all_logs)
+    print(f"[NAMENODE] 🔄 [PASO 3] ✅ Total de operaciones únicas después de fusión: {len(merged_operations)}")
+    
+    # Paso 4: Determinar líder válido (mayor term) y actualizar term si es necesario
+    print(f"[NAMENODE] 🔄 [PASO 4] Determinando líder válido (mayor term)...")
     max_term = current_term
     leader_peer = None
     
@@ -1004,157 +1107,130 @@ def perform_full_reconciliation(reunited_peers: List[str]):
                     peer_current_term = peer_data.get("term", 0)
                     peer_max_term = max(peer_max_term, peer_current_term)
             except Exception as e:
-                print(f"[NAMENODE] 🔄 [PASO 3] ⚠️  Error obteniendo term actual de {peer}: {e}")
+                print(f"[NAMENODE] 🔄 [PASO 4] ⚠️  Error obteniendo term actual de {peer}: {e}")
             
-            print(f"[NAMENODE] 🔄 [PASO 3] Peer {peer}: term máximo = {peer_max_term}")
+            print(f"[NAMENODE] 🔄 [PASO 4] Peer {peer}: term máximo = {peer_max_term}")
             if peer_max_term > max_term:
                 max_term = peer_max_term
                 leader_peer = peer
-                print(f"[NAMENODE] 🔄 [PASO 3] ✅ Nuevo líder candidato: {peer} (term {max_term})")
+                print(f"[NAMENODE] 🔄 [PASO 4] ✅ Nuevo líder candidato: {peer} (term {max_term})")
     
-    print(f"[NAMENODE] 🔄 [PASO 3] ✅ Term máximo encontrado: {max_term}")
-    print(f"[NAMENODE] 🔄 [PASO 3] ✅ Líder identificado: {leader_peer or current_node_id}")
+    # También verificar term del log local
+    if local_log:
+        local_max_term = max((op.term for op in local_log), default=current_term)
+        if local_max_term > max_term:
+            max_term = local_max_term
+            leader_peer = current_node_id
     
-    # Paso 4: Si hay un líder con term mayor, sincronizar desde él
-    if leader_peer and max_term > current_term:
-        print(f"[NAMENODE] 🔄 [PASO 4] Sincronizando desde líder {leader_peer} (term {max_term} > {current_term})")
-        leader_log = peer_logs[leader_peer]
-        
-        # Aplicar todas las operaciones del líder que no están en local
-        # Ordenar por term y timestamp
-        leader_log_sorted = sorted(leader_log, key=lambda op: (op.term, op.timestamp))
-        print(f"[NAMENODE] 🔄 [PASO 4] Log del líder tiene {len(leader_log_sorted)} operaciones ordenadas")
-        
-        applied_count = 0
-        skipped_count = 0
-        op_type_counts = {}
-        for operation in leader_log_sorted:
-            # Verificar si la operación ya está en local
-            already_applied = False
-            for local_op in local_log:
-                # Comparación más robusta
-                timestamp_match = abs(local_op.timestamp - operation.timestamp) < 5.0
-                term_match = local_op.term == operation.term
-                operation_match = local_op.operation == operation.operation
-                
-                if term_match and timestamp_match and operation_match:
-                    already_applied = True
-                    skipped_count += 1
-                    break
-            
-            if not already_applied:
-                print(f"[NAMENODE] 🔄 [PASO 4] Aplicando operación: {operation.operation} (term {operation.term}, timestamp {operation.timestamp:.2f})")
-                apply_operation_safely(operation, NODE_ID)
-                # Guardar operación aplicada en el log persistente
-                save_operation_to_log(operation, NODE_ID)
-                # Agregar al log en memoria
-                with log_lock:
-                    operation_log.append(operation)
-                applied_count += 1
-                op_type_counts[operation.operation] = op_type_counts.get(operation.operation, 0) + 1
-        
-        print(f"[NAMENODE] 🔄 [PASO 4] ✅ Resumen sincronización desde líder:")
-        print(f"[NAMENODE] 🔄 [PASO 4]   - Operaciones aplicadas: {applied_count}")
-        print(f"[NAMENODE] 🔄 [PASO 4]   - Operaciones saltadas (ya existían): {skipped_count}")
-        print(f"[NAMENODE] 🔄 [PASO 4]   - Desglose aplicadas: {op_type_counts}")
-        
-        # Recargar log local después de aplicar operaciones del líder
-        local_log = load_operation_log(NODE_ID)
-        print(f"[NAMENODE] 🔄 [PASO 4] ✅ Log local actualizado: {len(local_log)} operaciones")
-        
-        # Actualizar term local
-        with cluster_lock:
-            if max_term > cluster_state["term"]:
-                old_term = cluster_state["term"]
-                cluster_state["term"] = max_term
+    print(f"[NAMENODE] 🔄 [PASO 4] ✅ Term máximo encontrado: {max_term}")
+    print(f"[NAMENODE] 🔄 [PASO 4] ✅ Líder identificado: {leader_peer or current_node_id}")
+    
+    # Actualizar term local si es necesario
+    with cluster_lock:
+        if max_term > cluster_state["term"]:
+            old_term = cluster_state["term"]
+            cluster_state["term"] = max_term
+            if leader_peer and leader_peer != current_node_id:
                 cluster_state["leader_id"] = leader_peer
                 cluster_state["is_leader"] = False
-                print(f"[NAMENODE] 🔄 [PASO 4] ✅ Term actualizado: {old_term} -> {max_term}")
-    else:
-        print(f"[NAMENODE] 🔄 [PASO 4] ⏭️  No hay líder con term mayor, saltando sincronización desde líder")
+            print(f"[NAMENODE] 🔄 [PASO 4] ✅ Term actualizado: {old_term} -> {max_term}")
     
-    # Paso 5: Comparar con otros peers y aplicar operaciones faltantes
-    print(f"[NAMENODE] 🔄 [PASO 5] Comparando con otros peers y aplicando operaciones faltantes...")
-    total_peers_processed = 0
-    total_operations_applied = 0
+    # Paso 5: Aplicar operaciones fusionadas en orden determinístico
+    print(f"[NAMENODE] 🔄 [PASO 5] Aplicando operaciones fusionadas en orden causal...")
+    
+    # Crear índice de operaciones locales para verificación rápida
+    local_op_index = {}
+    for op in local_log:
+        op_key = (op.operation, op.term, op.timestamp, get_operation_key(op))
+        local_op_index[op_key] = op
+    
+    applied_count = 0
+    skipped_count = 0
+    op_type_counts = {}
+    
+    for operation in merged_operations:
+        # Verificar si la operación ya está en local
+        op_key = (operation.operation, operation.term, operation.timestamp, get_operation_key(operation))
+        
+        if op_key in local_op_index:
+            # Verificar si es realmente la misma operación
+            local_op = local_op_index[op_key]
+            timestamp_match = abs(local_op.timestamp - operation.timestamp) < 0.1  # Tolerancia muy pequeña
+            term_match = local_op.term == operation.term
+            operation_match = local_op.operation == operation.operation
+            
+            if term_match and timestamp_match and operation_match:
+                skipped_count += 1
+                continue
+        
+        # Aplicar operación
+        print(f"[NAMENODE] 🔄 [PASO 5] Aplicando operación: {operation.operation} (term {operation.term}, timestamp {operation.timestamp:.2f})")
+        apply_operation_safely(operation, NODE_ID)
+        # Guardar operación aplicada en el log persistente
+        save_operation_to_log(operation, NODE_ID)
+        # Agregar al log en memoria
+        with log_lock:
+            operation_log.append(operation)
+        applied_count += 1
+        op_type_counts[operation.operation] = op_type_counts.get(operation.operation, 0) + 1
+        
+        # Actualizar índice local
+        local_op_index[op_key] = operation
+    
+    print(f"[NAMENODE] 🔄 [PASO 5] ✅ Resumen aplicación de operaciones:")
+    print(f"[NAMENODE] 🔄 [PASO 5]   - Operaciones aplicadas: {applied_count}")
+    print(f"[NAMENODE] 🔄 [PASO 5]   - Operaciones saltadas (ya existían): {skipped_count}")
+    print(f"[NAMENODE] 🔄 [PASO 5]   - Desglose aplicadas: {op_type_counts}")
+    
+    # Recargar log local después de aplicar operaciones
+    local_log = load_operation_log(NODE_ID)
+    print(f"[NAMENODE] 🔄 [PASO 5] ✅ Log local actualizado: {len(local_log)} operaciones")
+    
+    # Paso 6: Resolver conflictos restantes con orden causal robusto
+    print(f"[NAMENODE] 🔄 [PASO 6] Resolviendo conflictos con orden causal robusto...")
     total_conflicts_resolved = 0
     
+    # Comparar log local final con cada peer para detectar conflictos
     for peer, peer_log in peer_logs.items():
-        if peer == leader_peer:
-            print(f"[NAMENODE] 🔄 [PASO 5] ⏭️  Saltando {peer} (ya procesado como líder)")
-            continue  # Ya procesamos el líder
-        
-        total_peers_processed += 1
-        print(f"[NAMENODE] 🔄 [PASO 5] Comparando con peer {peer}...")
         comparison = compare_operation_logs(local_log, peer_log)
-        
-        missing_count = len(comparison["missing_in_local"])
         conflicts_count = len(comparison["conflicts"])
-        missing_in_peer_count = len(comparison["missing_in_peer"])
         
-        print(f"[NAMENODE] 🔄 [PASO 5] Resultados comparación con {peer}:")
-        print(f"[NAMENODE] 🔄 [PASO 5]   - Operaciones faltantes en local: {missing_count}")
-        print(f"[NAMENODE] 🔄 [PASO 5]   - Operaciones faltantes en peer: {missing_in_peer_count}")
-        print(f"[NAMENODE] 🔄 [PASO 5]   - Conflictos detectados: {conflicts_count}")
-        
-        # Aplicar operaciones faltantes (ordenadas por term y timestamp)
-        missing_ops = sorted(comparison["missing_in_local"], key=lambda op: (op.term, op.timestamp))
-        applied_from_peer = 0
-        op_type_counts_peer = {}
-        for operation in missing_ops:
-            print(f"[NAMENODE] 🔄 [PASO 5]   Aplicando operación faltante: {operation.operation} (term {operation.term}, timestamp {operation.timestamp:.2f})")
-            apply_operation_safely(operation, NODE_ID)
-            # Guardar operación aplicada en el log persistente
-            save_operation_to_log(operation, NODE_ID)
-            # Agregar al log en memoria
-            with log_lock:
-                operation_log.append(operation)
-            applied_from_peer += 1
-            total_operations_applied += 1
-            op_type_counts_peer[operation.operation] = op_type_counts_peer.get(operation.operation, 0) + 1
-        
-        if applied_from_peer > 0:
-            print(f"[NAMENODE] 🔄 [PASO 5]   ✅ Aplicadas {applied_from_peer} operaciones de {peer}")
-            print(f"[NAMENODE] 🔄 [PASO 5]   Desglose: {op_type_counts_peer}")
-        
-        # Resolver conflictos (last-write-wins)
-        conflicts_resolved = 0
-        for conflict in comparison["conflicts"]:
-            local_op = conflict.get("local")
-            peer_op = conflict.get("peer")
+        if conflicts_count > 0:
+            print(f"[NAMENODE] 🔄 [PASO 6] Detectados {conflicts_count} conflictos con {peer}")
             
-            if local_op and peer_op:
-                # Usar timestamp para decidir (last-write-wins)
-                if peer_op.timestamp > local_op.timestamp:
-                    print(f"[NAMENODE] 🔄 [PASO 5]   Resolviendo conflicto: {peer_op.operation} - aplicando versión de peer (timestamp: {peer_op.timestamp:.2f} > {local_op.timestamp:.2f})")
-                    apply_operation_safely(peer_op, NODE_ID)
-                    # Guardar operación aplicada en el log persistente
-                    save_operation_to_log(peer_op, NODE_ID)
-                    # Agregar al log en memoria
-                    with log_lock:
-                        operation_log.append(peer_op)
-                    conflicts_resolved += 1
-                    total_conflicts_resolved += 1
-                else:
-                    print(f"[NAMENODE] 🔄 [PASO 5]   Resolviendo conflicto: {peer_op.operation} - manteniendo versión local (timestamp: {local_op.timestamp:.2f} >= {peer_op.timestamp:.2f})")
-        
-        if conflicts_resolved > 0:
-            print(f"[NAMENODE] 🔄 [PASO 5]   ✅ Resueltos {conflicts_resolved} conflictos con {peer}")
-        
-        # Recargar log local después de aplicar operaciones de este peer
-        local_log = load_operation_log(NODE_ID)
-        print(f"[NAMENODE] 🔄 [PASO 5] ✅ Log local actualizado después de procesar {peer}: {len(local_log)} operaciones")
+            for conflict in comparison["conflicts"]:
+                local_op = conflict.get("local")
+                peer_op = conflict.get("peer")
+                
+                if local_op and peer_op:
+                    # Usar orden causal robusto: (term, timestamp, node_id_hash)
+                    local_key = get_operation_sort_key(local_op, current_node_id)
+                    peer_key = get_operation_sort_key(peer_op, peer)
+                    
+                    # Si la operación del peer tiene orden causal mayor, aplicarla
+                    if peer_key > local_key:
+                        print(f"[NAMENODE] 🔄 [PASO 6]   Resolviendo conflicto: {peer_op.operation}")
+                        print(f"[NAMENODE] 🔄 [PASO 6]     - Local: term={local_op.term}, ts={local_op.timestamp:.2f}")
+                        print(f"[NAMENODE] 🔄 [PASO 6]     - Peer:  term={peer_op.term}, ts={peer_op.timestamp:.2f}")
+                        print(f"[NAMENODE] 🔄 [PASO 6]     - Aplicando versión del peer (orden causal mayor)")
+                        apply_operation_safely(peer_op, NODE_ID)
+                        save_operation_to_log(peer_op, NODE_ID)
+                        with log_lock:
+                            operation_log.append(peer_op)
+                        total_conflicts_resolved += 1
+                    else:
+                        print(f"[NAMENODE] 🔄 [PASO 6]   Manteniendo versión local (orden causal mayor o igual)")
     
-    print(f"[NAMENODE] 🔄 [PASO 5] ✅ Resumen comparación con peers:")
-    print(f"[NAMENODE] 🔄 [PASO 5]   - Peers procesados: {total_peers_processed}")
-    print(f"[NAMENODE] 🔄 [PASO 5]   - Total operaciones aplicadas: {total_operations_applied}")
-    print(f"[NAMENODE] 🔄 [PASO 5]   - Total conflictos resueltos: {total_conflicts_resolved}")
+    if total_conflicts_resolved > 0:
+        print(f"[NAMENODE] 🔄 [PASO 6] ✅ Total conflictos resueltos: {total_conflicts_resolved}")
+    else:
+        print(f"[NAMENODE] 🔄 [PASO 6] ✅ No se detectaron conflictos adicionales")
     
-    # Paso 6: Verificar integridad de datos físicos y re-replicar si es necesario
-    print(f"[NAMENODE] 🔄 [PASO 6] Verificando integridad de réplicas...")
+    # Paso 7: Verificar integridad de datos físicos y re-replicar si es necesario
+    print(f"[NAMENODE] 🔄 [PASO 7] Verificando integridad de réplicas...")
     verify_and_rereplicate_files(NODE_ID)
     
-    # Paso 7: Reconciliar tablas operation_states y operation_state_log
+    # Paso 8: Reconciliar tablas operation_states y operation_state_log
     print(f"[NAMENODE] 🔄 [PASO 7] Reconciliando operation_states y operation_state_log...")
     try:
         from namenode.database import get_operations_db_path, get_connection, close_connection, operations_db_lock
@@ -1206,8 +1282,8 @@ def perform_full_reconciliation(reunited_peers: List[str]):
         import traceback
         traceback.print_exc()
     
-    # Paso 8: Sincronizar term final con todos los namenodes y verificar versiones
-    print(f"[NAMENODE] 🔄 [PASO 8] Sincronizando term final con todos los namenodes...")
+    # Paso 9: Sincronizar term final con todos los namenodes y verificar versiones
+    print(f"[NAMENODE] 🔄 [PASO 9] Sincronizando term final con todos los namenodes...")
     with cluster_lock:
         final_term = cluster_state["term"]
         all_peers = list(set(reunited_peers + [current_node_id]))
@@ -1242,13 +1318,13 @@ def perform_full_reconciliation(reunited_peers: List[str]):
                     if peer_term < final_term:
                         # El peer necesita actualización - agregar a la lista
                         peers_needing_update.append((peer, peer_term))
-                        print(f"[NAMENODE] 🔄 [PASO 8] ⚠️  Peer {peer} tiene term {peer_term} < {final_term}, necesita actualización")
+                        print(f"[NAMENODE] 🔄 [PASO 9] ⚠️  Peer {peer} tiene term {peer_term} < {final_term}, necesita actualización")
                         failed_count += 1
                     elif peer_term == final_term:
-                        print(f"[NAMENODE] 🔄 [PASO 8] ✅ Peer {peer} ya tiene el term correcto ({final_term})")
+                        print(f"[NAMENODE] 🔄 [PASO 9] ✅ Peer {peer} ya tiene el term correcto ({final_term})")
                         synced_count += 1
                     else:
-                        print(f"[NAMENODE] 🔄 [PASO 8] ⚠️  Peer {peer} tiene term mayor ({peer_term} > {final_term}), debería ejecutar su propia reconciliación")
+                        print(f"[NAMENODE] 🔄 [PASO 9] ⚠️  Peer {peer} tiene term mayor ({peer_term} > {final_term}), debería ejecutar su propia reconciliación")
                         failed_count += 1
                 else:
                     print(f"[NAMENODE] 🔄 [PASO 8] ⚠️  Error HTTP {response.status_code} consultando peer {peer}")
@@ -1262,7 +1338,7 @@ def perform_full_reconciliation(reunited_peers: List[str]):
     
     # Si somos el líder y hay peers que necesitan actualización, enviar heartbeat para forzar actualización
     if is_leader_after_reconciliation and peers_needing_update:
-        print(f"[NAMENODE] 🔄 [PASO 8] Como líder, enviando heartbeats a {len(peers_needing_update)} peers para sincronizar term...")
+        print(f"[NAMENODE] 🔄 [PASO 9] Como líder, enviando heartbeats a {len(peers_needing_update)} peers para sincronizar term...")
         for peer, peer_term in peers_needing_update:
             try:
                 peer_url = get_peer_url(peer)
@@ -1285,18 +1361,18 @@ def perform_full_reconciliation(reunited_peers: List[str]):
                         timeout=3
                     )
                     if response.status_code == 200:
-                        print(f"[NAMENODE] 🔄 [PASO 8] ✅ Heartbeat enviado a {peer}, term debería actualizarse")
+                        print(f"[NAMENODE] 🔄 [PASO 9] ✅ Heartbeat enviado a {peer}, term debería actualizarse")
                         synced_count += 1
                         failed_count -= 1
                     else:
-                        print(f"[NAMENODE] 🔄 [PASO 8] ⚠️  Error enviando heartbeat a {peer}: HTTP {response.status_code}")
+                        print(f"[NAMENODE] 🔄 [PASO 9] ⚠️  Error enviando heartbeat a {peer}: HTTP {response.status_code}")
                 except Exception as e:
-                    print(f"[NAMENODE] 🔄 [PASO 8] ⚠️  Error enviando heartbeat a {peer}: {e}")
+                    print(f"[NAMENODE] 🔄 [PASO 9] ⚠️  Error enviando heartbeat a {peer}: {e}")
             except Exception as e:
-                print(f"[NAMENODE] 🔄 [PASO 8] ❌ Error procesando peer {peer}: {e}")
+                print(f"[NAMENODE] 🔄 [PASO 9] ❌ Error procesando peer {peer}: {e}")
     
     # Verificar versiones en la tabla files
-    print(f"[NAMENODE] 🔄 [PASO 8] Verificando campos de versión en tabla files...")
+    print(f"[NAMENODE] 🔄 [PASO 9] Verificando campos de versión en tabla files...")
     try:
         from namenode.database import get_metadata_db_path, get_connection, close_connection, metadata_db_lock
         db_path = get_metadata_db_path(NODE_ID)
@@ -1314,11 +1390,11 @@ def perform_full_reconciliation(reunited_peers: List[str]):
                 """)
                 stats = cursor.fetchone()
                 
-                print(f"[NAMENODE] 🔄 [PASO 8] Estado de versiones en tabla files:")
-                print(f"[NAMENODE] 🔄 [PASO 8]   - Total archivos: {stats['total']}")
-                print(f"[NAMENODE] 🔄 [PASO 8]   - Archivos sin version: {stats['null_version']}")
-                print(f"[NAMENODE] 🔄 [PASO 8]   - Archivos sin last_modified_term: {stats['null_term']}")
-                print(f"[NAMENODE] 🔄 [PASO 8]   - Archivos sin last_modified_timestamp: {stats['null_timestamp']}")
+                print(f"[NAMENODE] 🔄 [PASO 9] Estado de versiones en tabla files:")
+                print(f"[NAMENODE] 🔄 [PASO 9]   - Total archivos: {stats['total']}")
+                print(f"[NAMENODE] 🔄 [PASO 9]   - Archivos sin version: {stats['null_version']}")
+                print(f"[NAMENODE] 🔄 [PASO 9]   - Archivos sin last_modified_term: {stats['null_term']}")
+                print(f"[NAMENODE] 🔄 [PASO 9]   - Archivos sin last_modified_timestamp: {stats['null_timestamp']}")
                 
                 # Corregir archivos sin versiones válidas
                 fixed_count = 0
@@ -1334,14 +1410,14 @@ def perform_full_reconciliation(reunited_peers: List[str]):
                     conn.commit()
                     
                     if fixed_count > 0:
-                        print(f"[NAMENODE] 🔄 [PASO 8] ✅ Corregidos {fixed_count} archivos con campos de versión inválidos")
+                        print(f"[NAMENODE] 🔄 [PASO 9] ✅ Corregidos {fixed_count} archivos con campos de versión inválidos")
         finally:
             close_connection(conn)
     except Exception as e:
-        print(f"[NAMENODE] 🔄 [PASO 8] ⚠️  Error verificando versiones: {e}")
+        print(f"[NAMENODE] 🔄 [PASO 9] ⚠️  Error verificando versiones: {e}")
     
-    print(f"[NAMENODE] 🔄 [PASO 8] ✅ Sincronización de term completada: {synced_count} exitosos, {failed_count} con problemas")
-    print(f"[NAMENODE] 🔄 [PASO 8] Term final: {final_term} (debe ser el mismo en todos los namenodes después de heartbeats)")
+    print(f"[NAMENODE] 🔄 [PASO 9] ✅ Sincronización de term completada: {synced_count} exitosos, {failed_count} con problemas")
+    print(f"[NAMENODE] 🔄 [PASO 9] Term final: {final_term} (debe ser el mismo en todos los namenodes después de heartbeats)")
     
     # Estadísticas finales
     final_log = load_operation_log(NODE_ID)

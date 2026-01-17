@@ -155,7 +155,9 @@ cluster_state = {
     "peer_status": {},  # {peer_id: {"last_seen": float, "status": "alive"/"suspected"/"dead"}}
     "version": 0,  # Versión del estado local (incrementa en cada cambio de peers)
     "reconciliation_in_progress": False,  # Flag para evitar reconciliaciones simultáneas
-    "active_followers": []  # Lista de seguidores activos según el líder
+    "active_followers": [],  # Lista de seguidores activos según el líder
+    "last_file_replicas_snapshot": None,  # Snapshot de file_replicas para detectar cambios
+    "last_datanodes_snapshot": None  # Snapshot de datanodes para detectar cambios
 }
 cluster_lock = threading.Lock()
 
@@ -1869,22 +1871,105 @@ def start_election():
         return False
 
 
+def update_active_followers_from_dns():
+    """
+    Actualiza la lista de seguidores activos consultando directamente todos los namenodes vía DNS.
+    Solo se ejecuta en el líder.
+    """
+    if not is_leader():
+        return
+    
+    with cluster_lock:
+        leader_id = cluster_state["node_id"]
+        peers = cluster_state["peers"].copy()
+    
+    # Refrescar lista de peers vía DNS primero
+    refresh_peers_from_dns()
+    
+    with cluster_lock:
+        # Obtener peers actualizados después del refresh
+        peers = [p for p in cluster_state["peers"] if p != leader_id]
+    
+    print(f"[NAMENODE] 🔍 [FOLLOWER_TRACKING] Verificando seguidores activos vía DNS...")
+    verified_active_followers = []
+    
+    # Consultar cada peer vía DNS para verificar si es un seguidor activo
+    for peer_ip in peers:
+        try:
+            peer_url = get_peer_url(peer_ip)
+            response = requests.get(f"{peer_url}/", timeout=3)
+            if response.status_code == 200:
+                data = response.json()
+                # Si este peer no es líder (es seguidor) y responde, está activo
+                if not data.get("is_leader"):
+                    # Verificar que reconoce al líder actual
+                    peer_leader_id = data.get("leader_id")
+                    if peer_leader_id == leader_id:
+                        verified_active_followers.append(peer_ip)
+                        update_peer_status(peer_ip, True)
+                        print(f"[NAMENODE] 🔍 [FOLLOWER_TRACKING] ✅ Seguidor activo verificado: {peer_ip}")
+                    else:
+                        print(f"[NAMENODE] 🔍 [FOLLOWER_TRACKING] ⚠️  Peer {peer_ip} no reconoce al líder actual (conoce: {peer_leader_id})")
+                        update_peer_status(peer_ip, False)
+                else:
+                    # Este peer es líder (no es seguidor)
+                    print(f"[NAMENODE] 🔍 [FOLLOWER_TRACKING] ⚠️  Peer {peer_ip} es líder, no es seguidor")
+                    update_peer_status(peer_ip, False)
+        except Exception as e:
+            # Peer no responde, marcarlo como inactivo
+            update_peer_status(peer_ip, False)
+            print(f"[NAMENODE] 🔍 [FOLLOWER_TRACKING] ❌ Peer {peer_ip} no responde: {e}")
+    
+    # Actualizar lista de seguidores activos
+    with cluster_lock:
+        old_active_followers = set(cluster_state.get("active_followers", []))
+        new_active_followers = set(verified_active_followers)
+        
+        if old_active_followers != new_active_followers:
+            added = new_active_followers - old_active_followers
+            removed = old_active_followers - new_active_followers
+            if added:
+                print(f"[NAMENODE] 🔍 [FOLLOWER_TRACKING] 🆕 Seguidores activos agregados: {sorted(added)}")
+            if removed:
+                print(f"[NAMENODE] 🔍 [FOLLOWER_TRACKING] 🗑️  Seguidores activos removidos: {sorted(removed)}")
+        
+        cluster_state["active_followers"] = verified_active_followers.copy()
+        print(f"[NAMENODE] 🔍 [FOLLOWER_TRACKING] 📋 Lista actualizada: {len(verified_active_followers)}/{len(peers)} seguidores activos: {sorted(verified_active_followers)}")
+
+
 def leader_heartbeat_loop():
-    """Loop que envía heartbeats a los seguidores"""
+    """
+    Loop que envía heartbeats a los seguidores y mantiene actualizada la lista de seguidores activos.
+    También verifica periódicamente los seguidores vía DNS para asegurar que la lista esté actualizada.
+    """
+    follower_check_counter = 0
+    FOLLOWER_CHECK_INTERVAL = 6  # Verificar seguidores vía DNS cada 6 ciclos (~30 segundos)
+    
     while True:
         time.sleep(LEADER_HEARTBEAT_INTERVAL)
         
         if not is_leader():
             continue
         
+        # Verificar seguidores activos vía DNS periódicamente (cada ~30 segundos)
+        follower_check_counter += 1
+        if follower_check_counter >= FOLLOWER_CHECK_INTERVAL:
+            follower_check_counter = 0
+            update_active_followers_from_dns()
+        
         # Enviar heartbeat para mantener el liderazgo
         with cluster_lock:
             term = cluster_state["term"]
             leader_id = cluster_state["node_id"]
-            # Obtener la lista de peers conocidos (descubiertos mediante DNS)
-            # NUNCA incluir el leader_id (este nodo) en la lista de peers que se envía
-            peers = [p for p in cluster_state["peers"] if p != leader_id]
-            # NO incluir al líder en all_known_peers (no somos nuestro propio peer)
+            # Usar la lista de seguidores activos actualizada (si está disponible)
+            # Si no está actualizada, usar todos los peers
+            active_followers_from_state = cluster_state.get("active_followers", [])
+            all_peers = [p for p in cluster_state["peers"] if p != leader_id]
+            
+            # Priorizar verificar seguidores que están marcados como activos
+            # Pero también intentar con todos los peers por si alguno se recuperó
+            peers_to_check = list(set(active_followers_from_state + all_peers))
+            peers = [p for p in peers_to_check if p != leader_id]
             all_known_peers = peers.copy()
         
         # Obtener token de servicio para autenticación
@@ -1893,15 +1978,14 @@ def leader_heartbeat_loop():
         except Exception:
             service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
         
-        # Detectar qué seguidores están activos
+        # Detectar qué seguidores están activos mediante heartbeats
         active_followers = []
         
-        # Actualizar estado del líder como vivo en peer_status (el líder también se monitorea a sí mismo)
+        # Actualizar estado del líder como vivo
         update_peer_status(leader_id, True)
         
         print(f"[NAMENODE] 💓 [HEARTBEAT] Enviando heartbeats desde líder {leader_id}")
-        print(f"[NAMENODE] 💓 [HEARTBEAT] 📋 Lista completa de peers que se enviará ({len(all_known_peers)}): {sorted(all_known_peers)}")
-        print(f"[NAMENODE] 💓 [HEARTBEAT] 📋 Detalle: peers={sorted(peers)}, leader_id={leader_id} (incluido en lista)")
+        print(f"[NAMENODE] 💓 [HEARTBEAT] 📋 Verificando {len(peers)} seguidores: {sorted(peers)}")
         
         for peer in peers:
             try:
@@ -1911,8 +1995,8 @@ def leader_heartbeat_loop():
                     json={
                         "term": term, 
                         "leader_id": leader_id,
-                        "peers": all_known_peers,  # Incluir al líder en la lista de peers
-                        "active_followers": []  # Se actualizará después
+                        "peers": all_known_peers,
+                        "active_followers": []  # Se actualizará después con la lista completa
                     },
                     headers={"Authorization": f"Bearer {service_token}"},
                     timeout=2
@@ -1927,6 +2011,7 @@ def leader_heartbeat_loop():
                 pass  # Silenciar errores de heartbeat
         
         # Enviar segunda pasada con la lista completa de seguidores activos
+        # Esto permite que los seguidores sepan quiénes son los otros seguidores activos
         for peer in peers:
             try:
                 peer_url = get_peer_url(peer)
@@ -1935,7 +2020,7 @@ def leader_heartbeat_loop():
                     json={
                         "term": term, 
                         "leader_id": leader_id,
-                        "peers": all_known_peers,  # Incluir al líder en la lista de peers
+                        "peers": all_known_peers,
                         "active_followers": active_followers
                     },
                     headers={"Authorization": f"Bearer {service_token}"},
@@ -1943,41 +2028,232 @@ def leader_heartbeat_loop():
                 )
                 if response.status_code == 200:
                     update_peer_status(peer, True)
+                    # Si no estaba en la lista, agregarlo (por si se recuperó)
+                    if peer not in active_followers:
+                        active_followers.append(peer)
             except Exception:
                 update_peer_status(peer, False)
         
+        # Actualizar lista de seguidores activos en el estado del cluster
         with cluster_lock:
             cluster_state["last_heartbeat_time"] = time.time()
+            # Combinar seguidores activos verificados vía heartbeat con los del estado anterior
+            # Mantener solo los que respondieron exitosamente
             cluster_state["active_followers"] = active_followers.copy()
         
-        # Log del estado de peers (excluyendo este nodo de la lista)
+        # Log del estado de seguidores
         with cluster_lock:
             current_node_id = cluster_state["node_id"]
             current_peers = [p for p in cluster_state["peers"] if p != current_node_id]
-            current_leader = cluster_state["leader_id"]
-            # Construir lista completa para logging (excluyendo este nodo)
-            complete_peers_list = current_peers.copy()
-            if current_leader and current_leader != current_node_id and current_leader not in complete_peers_list:
-                complete_peers_list.append(current_leader)
         
-        print(f"[NAMENODE] 💓 [HEARTBEAT] 📋 Estado final de peers conocidos ({len(complete_peers_list)}): {sorted(complete_peers_list)} (excluyendo este nodo {cluster_state['node_id']})")
+        print(f"[NAMENODE] 💓 [HEARTBEAT] 📋 Estado final:")
+        print(f"[NAMENODE] 💓 [HEARTBEAT] 📋   - Peers conocidos: {len(current_peers)}")
+        print(f"[NAMENODE] 💓 [HEARTBEAT] 📋   - Seguidores activos: {len(active_followers)}/{len(peers)}")
         if active_followers:
-            print(f"[NAMENODE] ✅ Seguidores activos ({len(active_followers)}/{len(peers)}): {sorted(active_followers)}")
+            print(f"[NAMENODE] ✅ [HEARTBEAT] Seguidores activos: {sorted(active_followers)}")
             inactive = [p for p in peers if p not in active_followers]
             if inactive:
-                print(f"[NAMENODE] ⚠️  Seguidores inactivos ({len(inactive)}): {sorted(inactive)}")
+                print(f"[NAMENODE] ⚠️  [HEARTBEAT] Seguidores inactivos: {sorted(inactive)}")
         else:
-            print(f"[NAMENODE] ⚠️  No hay seguidores activos de {len(peers)} peers conocidos")
+            print(f"[NAMENODE] ⚠️  [HEARTBEAT] No hay seguidores activos de {len(peers)} peers verificados")
 
 
 # Intervalo de sincronización (segundos)
 SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL", "30"))
 
 
+def detect_and_log_table_changes(node_id: str = None):
+    """
+    Detecta cambios en las tablas file_replicas y datanodes y los registra en el log de operaciones.
+    Solo se ejecuta en el líder.
+    """
+    if not is_leader():
+        return
+    
+    if node_id is None:
+        node_id = NODE_ID
+    
+    import json
+    from namenode.database import get_db_path, get_connection, close_connection, db_lock
+    
+    try:
+        db_path = get_db_path(node_id_db=node_id)
+        
+        with db_lock:
+            conn, cursor = get_connection(db_path=db_path, node_id=node_id)
+            
+            try:
+                # Obtener snapshot actual de file_replicas
+                cursor.execute("""
+                    SELECT file_id, datanode_id, replica_type
+                    FROM file_replicas
+                    ORDER BY file_id, datanode_id
+                """)
+                current_file_replicas = {(row[0], row[1]): row[2] for row in cursor.fetchall()}
+                
+                # Obtener snapshot actual de datanodes
+                cursor.execute("""
+                    SELECT node_id, url, port, ip, total_space, free_space, 
+                           last_heartbeat, status, draining, registered_at
+                    FROM datanodes
+                    ORDER BY node_id
+                """)
+                current_datanodes = {}
+                for row in cursor.fetchall():
+                    current_datanodes[row[0]] = {
+                        "node_id": row[0],
+                        "url": row[1],
+                        "port": row[2],
+                        "ip": row[3],
+                        "total_space": row[4],
+                        "free_space": row[5],
+                        "last_heartbeat": row[6],
+                        "status": row[7],
+                        "draining": bool(row[8]),
+                        "registered_at": row[9]
+                    }
+                
+            finally:
+                close_connection(conn)
+        
+        # Comparar con snapshots anteriores
+        with cluster_lock:
+            last_file_replicas = cluster_state.get("last_file_replicas_snapshot")
+            last_datanodes = cluster_state.get("last_datanodes_snapshot")
+            
+            # Si es la primera vez (snapshots None), inicializar con estado actual (sin cambios)
+            if last_file_replicas is None:
+                cluster_state["last_file_replicas_snapshot"] = current_file_replicas.copy()
+                last_file_replicas = {}
+            if last_datanodes is None:
+                cluster_state["last_datanodes_snapshot"] = current_datanodes.copy()
+                last_datanodes = {}
+        
+        changes_detected = False
+        
+        # Detectar cambios en file_replicas
+        if last_file_replicas != current_file_replicas:
+            changes_detected = True
+            
+            # Identificar cambios: agregados, modificados, eliminados
+            current_keys = set(current_file_replicas.keys())
+            last_keys = set(last_file_replicas.keys())
+            
+            added = {k: current_file_replicas[k] for k in current_keys - last_keys}
+            removed = {k: last_file_replicas[k] for k in last_keys - current_keys}
+            modified = {
+                k: current_file_replicas[k] 
+                for k in current_keys & last_keys 
+                if current_file_replicas[k] != last_file_replicas[k]
+            }
+            
+            if added or removed or modified:
+                # Crear lista completa de replicas para sincronización
+                file_replicas_list = [
+                    {"file_id": file_id, "datanode_id": datanode_id, "replica_type": replica_type}
+                    for (file_id, datanode_id), replica_type in current_file_replicas.items()
+                ]
+                
+                # Generar operación de sincronización
+                with cluster_lock:
+                    term = cluster_state["term"]
+                
+                operation = OperationLog(
+                    operation="sync_file_replicas",
+                    data={
+                        "file_replicas": file_replicas_list,
+                        "changes": {
+                            "added": [{"file_id": k[0], "datanode_id": k[1], "replica_type": v} for k, v in added.items()],
+                            "removed": [{"file_id": k[0], "datanode_id": k[1], "replica_type": v} for k, v in removed.items()],
+                            "modified": [{"file_id": k[0], "datanode_id": k[1], "replica_type": v} for k, v in modified.items()]
+                        }
+                    },
+                    term=term,
+                    timestamp=time.time()
+                )
+                
+                save_operation_to_log(operation, node_id)
+                with log_lock:
+                    operation_log.append(operation)
+                
+                change_summary = []
+                if added:
+                    change_summary.append(f"{len(added)} agregadas")
+                if removed:
+                    change_summary.append(f"{len(removed)} eliminadas")
+                if modified:
+                    change_summary.append(f"{len(modified)} modificadas")
+                
+                print(f"[NAMENODE] 📋 [TABLE_SYNC] Cambios detectados en file_replicas: {', '.join(change_summary)}")
+                print(f"[NAMENODE] 📋 [TABLE_SYNC] Total de réplicas: {len(current_file_replicas)}")
+        
+        # Detectar cambios en datanodes
+        if last_datanodes != current_datanodes:
+            changes_detected = True
+            
+            # Identificar cambios: agregados, modificados, eliminados
+            current_keys = set(current_datanodes.keys())
+            last_keys = set(last_datanodes.keys())
+            
+            added = {k: current_datanodes[k] for k in current_keys - last_keys}
+            removed = {k: last_datanodes[k] for k in last_keys - current_keys}
+            modified = {
+                k: current_datanodes[k] 
+                for k in current_keys & last_keys 
+                if current_datanodes[k] != last_datanodes[k]
+            }
+            
+            if added or removed or modified:
+                # Generar operación de sincronización
+                with cluster_lock:
+                    term = cluster_state["term"]
+                
+                operation = OperationLog(
+                    operation="sync_datanodes",
+                    data={
+                        "datanodes": list(current_datanodes.values()),
+                        "changes": {
+                            "added": [added[k] for k in added],
+                            "removed": [removed[k] for k in removed],
+                            "modified": [modified[k] for k in modified]
+                        }
+                    },
+                    term=term,
+                    timestamp=time.time()
+                )
+                
+                save_operation_to_log(operation, node_id)
+                with log_lock:
+                    operation_log.append(operation)
+                
+                change_summary = []
+                if added:
+                    change_summary.append(f"{len(added)} agregados")
+                if removed:
+                    change_summary.append(f"{len(removed)} eliminados")
+                if modified:
+                    change_summary.append(f"{len(modified)} modificados")
+                
+                print(f"[NAMENODE] 📋 [TABLE_SYNC] Cambios detectados en datanodes: {', '.join(change_summary)}")
+                print(f"[NAMENODE] 📋 [TABLE_SYNC] Total de datanodes: {len(current_datanodes)}")
+        
+        # Actualizar snapshots si hubo cambios
+        if changes_detected:
+            with cluster_lock:
+                cluster_state["last_file_replicas_snapshot"] = current_file_replicas.copy()
+                cluster_state["last_datanodes_snapshot"] = current_datanodes.copy()
+        
+    except Exception as e:
+        print(f"[NAMENODE] ⚠️  [TABLE_SYNC] Error detectando cambios en tablas: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 def leader_sync_loop():
     """
     Loop que sincroniza periódicamente el log de operaciones del líder con los seguidores.
     Esto asegura que los seguidores tengan una copia actualizada de los datos.
+    También detecta y registra cambios en las tablas file_replicas y datanodes.
     """
     # Esperar a que el cluster se estabilice
     time.sleep(15)
@@ -1987,6 +2263,12 @@ def leader_sync_loop():
         
         if not is_leader():
             continue
+        
+        # Detectar y registrar cambios en file_replicas y datanodes
+        try:
+            detect_and_log_table_changes(NODE_ID)
+        except Exception as e:
+            print(f"[NAMENODE] ⚠️  [SYNC] Error en detección de cambios de tablas: {e}")
         
         with cluster_lock:
             peers = cluster_state["peers"].copy()
@@ -1999,7 +2281,7 @@ def leader_sync_loop():
         
         print(f"[NAMENODE] 🔄 [SYNC] Iniciando sincronización periódica con {len(active_followers)} seguidores...")
         
-        # Cargar el log de operaciones local
+        # Cargar el log de operaciones local (incluye los cambios recién detectados)
         local_operations = load_operation_log(NODE_ID)
         
         if not local_operations:
@@ -2401,7 +2683,7 @@ async def lifespan(app: FastAPI):
             print(f"[NAMENODE] 🗳️  [STARTUP] No se encontró líder activo vía DNS. Iniciando elección...")
         else:
             print(f"[NAMENODE] 🗳️  [STARTUP] No hay peers conocidos. Iniciando elección (nodo único se convertirá en líder)...")
-        start_election()
+    start_election()
     
     yield
     
@@ -4415,6 +4697,111 @@ def internal_replicate(
                 conn.rollback()
             finally:
                 conn.close()
+        elif operation == "sync_file_replicas":
+            # Sincronizar tabla file_replicas desde el líder
+            from namenode.database import get_db_path, get_connection, close_connection, db_lock
+            
+            db_path = get_db_path(node_id_db=NODE_ID)
+            file_replicas_data = operation_data.get("file_replicas", [])
+            
+            with db_lock:
+                conn, cursor = get_connection(db_path=db_path, node_id=NODE_ID)
+                try:
+                    # Limpiar tabla file_replicas (sincronización completa)
+                    cursor.execute("DELETE FROM file_replicas")
+                    
+                    # Insertar todas las réplicas del líder
+                    for replica in file_replicas_data:
+                        cursor.execute("""
+                            INSERT OR REPLACE INTO file_replicas (file_id, datanode_id, replica_type)
+                            VALUES (?, ?, ?)
+                        """, (replica["file_id"], replica["datanode_id"], replica["replica_type"]))
+                    
+                    conn.commit()
+                    
+                    changes = operation_data.get("changes", {})
+                    change_count = (
+                        len(changes.get("added", [])) +
+                        len(changes.get("removed", [])) +
+                        len(changes.get("modified", []))
+                    )
+                    print(f"[NAMENODE] [REPLICATE] ✅ Tabla file_replicas sincronizada: {len(file_replicas_data)} réplicas ({change_count} cambios)")
+                except Exception as e:
+                    conn.rollback()
+                    print(f"[NAMENODE] [REPLICATE] ❌ Error sincronizando file_replicas: {e}")
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    close_connection(conn)
+        elif operation == "sync_datanodes":
+            # Sincronizar tabla datanodes desde el líder
+            from namenode.database import get_db_path, get_connection, close_connection, db_lock
+            
+            db_path = get_db_path(node_id_db=NODE_ID)
+            datanodes_data = operation_data.get("datanodes", [])
+            
+            with db_lock:
+                conn, cursor = get_connection(db_path=db_path, node_id=NODE_ID)
+                try:
+                    # Limpiar tabla datanodes (sincronización completa)
+                    cursor.execute("DELETE FROM datanodes")
+                    
+                    # Insertar todos los datanodes del líder
+                    for datanode in datanodes_data:
+                        cursor.execute("""
+                            INSERT OR REPLACE INTO datanodes 
+                            (node_id, url, port, ip, total_space, free_space, 
+                             last_heartbeat, status, draining, registered_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            datanode["node_id"],
+                            datanode["url"],
+                            datanode["port"],
+                            datanode.get("ip"),
+                            datanode["total_space"],
+                            datanode["free_space"],
+                            datanode.get("last_heartbeat"),
+                            datanode["status"],
+                            1 if datanode.get("draining") else 0,
+                            datanode.get("registered_at")
+                        ))
+                    
+                    conn.commit()
+                    
+                    changes = operation_data.get("changes", {})
+                    change_count = (
+                        len(changes.get("added", [])) +
+                        len(changes.get("removed", [])) +
+                        len(changes.get("modified", []))
+                    )
+                    print(f"[NAMENODE] [REPLICATE] ✅ Tabla datanodes sincronizada: {len(datanodes_data)} datanodes ({change_count} cambios)")
+                    
+                    # Actualizar cache de datanodes si está disponible
+                    try:
+                        from namenode.datanode_cache import get_datanode_cache
+                        cache = get_datanode_cache(node_id_db=NODE_ID)
+                        for datanode in datanodes_data:
+                            cache.update(datanode["node_id"], {
+                                "url": datanode["url"],
+                                "port": datanode["port"],
+                                "ip": datanode.get("ip"),
+                                "total_space": datanode["total_space"],
+                                "free_space": datanode["free_space"],
+                                "last_heartbeat": datanode.get("last_heartbeat"),
+                                "status": datanode["status"],
+                                "draining": datanode.get("draining", False)
+                            })
+                        print(f"[NAMENODE] [REPLICATE] ✅ Cache de datanodes actualizado")
+                    except Exception as cache_error:
+                        print(f"[NAMENODE] [REPLICATE] ⚠️  No se pudo actualizar cache de datanodes: {cache_error}")
+                
+                except Exception as e:
+                    conn.rollback()
+                    print(f"[NAMENODE] [REPLICATE] ❌ Error sincronizando datanodes: {e}")
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    close_connection(conn)
         
         # IMPORTANTE: Guardar la operación en el log local del seguidor
         # Esto permite que si este nodo se convierte en líder, pueda replicar a nuevos seguidores

@@ -151,7 +151,7 @@ cluster_state = {
     "term": 0,
     "last_heartbeat_time": 0,
     "last_election_time": 0,
-    "peers": [],  # Lista de peers conocidos (descubiertos mediante gossip)
+    "peers": [],  # Lista de peers conocidos (descubiertos mediante DNS de Docker)
     "peer_status": {},  # {peer_id: {"last_seen": float, "status": "alive"/"suspected"/"dead"}}
     "version": 0,  # Versión del estado local (incrementa en cada cambio de peers)
     "reconciliation_in_progress": False,  # Flag para evitar reconciliaciones simultáneas
@@ -163,10 +163,9 @@ cluster_lock = threading.Lock()
 HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", "30"))
 LEADER_HEARTBEAT_INTERVAL = int(os.getenv("LEADER_HEARTBEAT_INTERVAL", "5"))
 ELECTION_TIMEOUT = int(os.getenv("ELECTION_TIMEOUT", "15"))
+FOLLOWER_LEADER_CHECK_INTERVAL = int(os.getenv("FOLLOWER_LEADER_CHECK_INTERVAL", "12"))  # Verificar líder cada 12 segundos
+LEADER_TIMEOUT = int(os.getenv("LEADER_TIMEOUT", "15"))  # Tiempo sin respuesta antes de considerar líder muerto (10-15s)
 NAMENODE_PORT = int(os.getenv("NAMENODE_PORT", "8010"))
-# Configuración de Gossip
-GOSSIP_INTERVAL = int(os.getenv("GOSSIP_INTERVAL", "5"))  # Intervalo entre rondas de gossip (segundos)
-GOSSIP_FANOUT = int(os.getenv("GOSSIP_FANOUT", "2"))  # Número de peers a contactar en cada ronda
 NAMENODE_SERVICE = os.getenv("NAMENODE_SERVICE", "namenode")  # Alias DNS de Docker para descubrimiento
 
 # Los peers se descubren automáticamente via DNS de Docker
@@ -204,16 +203,6 @@ class VoteRequest(BaseModel):
 class VoteResponse(BaseModel):
     granted: bool
     term: int
-
-
-class GossipExchange(BaseModel):
-    """Intercambio de estado en protocolo Gossip entre namenodes"""
-    sender_id: str
-    sender_version: int
-    known_peers: List[str]  # Lista de peers conocidos por el nodo remoto
-    is_leader: bool  # Si el sender es el líder
-    leader_id: Optional[str]  # ID del líder conocido por el sender
-    timestamp: float
 
 
 class OperationLog(BaseModel):
@@ -336,79 +325,123 @@ def discover_peers_dns() -> List[str]:
     Docker DNS devuelve todas las IPs de los contenedores con el alias 'namenode'.
     
     Returns:
-        Lista de nombres/IPs de peers descubiertos (excluyendo este nodo)
+        Lista de IPs de peers descubiertos (SOLO IPs, excluyendo la IP local de este nodo)
     """
-    discovered_peers = []
+    discovered_ips = []
     
     try:
-        # Resolver DNS para obtener todas las IPs de los namenodes
+        # Resolver DNS para obtener todas las IPs de los namenodes con alias 'namenode'
         addr_info = socket.getaddrinfo(
             NAMENODE_SERVICE, 
             NAMENODE_PORT,
             proto=socket.IPPROTO_TCP
         )
         
-        # Obtener IP local para excluirla
+        # Obtener la IP local de este nodo para excluirla
         local_ip = None
         try:
+            # Método principal: IP de la interfaz de salida
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(('8.8.8.8', 80))
             local_ip = s.getsockname()[0]
             s.close()
         except Exception:
-            pass
+            # Método alternativo: IP del hostname
+            try:
+                hostname = socket.gethostname()
+                local_ip = socket.gethostbyname(hostname)
+            except Exception:
+                print(f"[NAMENODE] ⚠️  No se pudo detectar la IP local")
         
-        # Extraer IPs únicas
+        # Extraer SOLO IPs únicas del DNS, excluyendo la IP local
+        all_resolved_ips = set()
         for info in addr_info:
-            ip = info[4][0]  # info[4] es (ip, port)
-            # Excluir la IP local
-            if ip != local_ip and ip not in discovered_peers:
-                discovered_peers.append(ip)
+            ip = info[4][0]  # info[4] es (ip, port) - solo queremos la IP
+            all_resolved_ips.add(ip)
         
-        if discovered_peers:
-            print(f"[NAMENODE] 🔍 DNS descubrió {len(discovered_peers)} peers: {discovered_peers}")
+        # Filtrar: incluir todas las IPs excepto la propia
+        for ip in all_resolved_ips:
+            if ip != local_ip:
+                discovered_ips.append(ip)
+        
+        if discovered_ips:
+            print(f"[NAMENODE] 🔍 DNS descubrió {len(discovered_ips)} peers (IP local: {local_ip}, peers: {sorted(discovered_ips)})")
+        elif local_ip:
+            print(f"[NAMENODE] 🔍 DNS solo encontró la IP local {local_ip}, no hay otros peers")
+        else:
+            print(f"[NAMENODE] 🔍 DNS no descubrió peers")
         
     except socket.gaierror as e:
         print(f"[NAMENODE] ⚠️  Error DNS resolviendo '{NAMENODE_SERVICE}': {e}")
     except Exception as e:
         print(f"[NAMENODE] ⚠️  Error inesperado en descubrimiento DNS: {e}")
     
-    return discovered_peers
+    return discovered_ips
 
 
 def refresh_peers_from_dns():
     """
     Actualiza la lista de peers usando DNS de Docker.
-    Combina peers existentes con nuevos descubiertos.
+    Reemplaza la lista actual con los peers descubiertos via DNS (solo IPs).
     """
     global cluster_state
     
+    # Obtener IP local para filtrar
+    local_ip = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        try:
+            hostname = socket.gethostname()
+            local_ip = socket.gethostbyname(hostname)
+        except Exception:
+            pass
+    
+    # Descubrir peers via DNS (ya viene filtrado, solo IPs)
     dns_peers = discover_peers_dns()
     
-    if not dns_peers:
-        return
-    
     with cluster_lock:
-        current_node_id = cluster_state["node_id"]
-        current_peers = set(cluster_state["peers"])
+        # Obtener IPs locales para filtrado final (por si acaso)
+        local_ips_set = {local_ip} if local_ip else set()
+        try:
+            hostname = socket.gethostname()
+            local_ips_set.add(socket.gethostbyname(hostname))
+        except Exception:
+            pass
         
-        # Agregar nuevos peers descubiertos
-        for peer_ip in dns_peers:
-            # No agregarnos a nosotros mismos
-            if peer_ip != current_node_id and peer_ip not in current_peers:
-                cluster_state["peers"].append(peer_ip)
-                # Inicializar estado del peer
-                if peer_ip not in cluster_state["peer_status"]:
-                    cluster_state["peer_status"][peer_ip] = {
-                        "last_seen": 0.0,
-                        "status": "unknown"
-                    }
-                print(f"[NAMENODE] 🆕 Nuevo peer descubierto via DNS: {peer_ip}")
+        # Limpiar la lista actual: remover todo lo que no sea una IP válida de peers DNS
+        # O mejor: reemplazar completamente con los peers descubiertos via DNS
+        old_peers = cluster_state["peers"].copy()
         
-        # Limpiar duplicados
+        # Filtrar peers DNS para asegurar que no incluimos la IP local
+        valid_dns_peers = [ip for ip in dns_peers if ip not in local_ips_set]
+        
+        # Reemplazar lista de peers con los descubiertos via DNS (solo IPs)
+        cluster_state["peers"] = valid_dns_peers.copy()
+        
+        # Inicializar estado de los nuevos peers
+        for peer_ip in valid_dns_peers:
+            if peer_ip not in cluster_state["peer_status"]:
+                cluster_state["peer_status"][peer_ip] = {
+                    "last_seen": 0.0,
+                    "status": "unknown"
+                }
+        
+        # Remover duplicados (por si acaso)
         cluster_state["peers"] = list(set(cluster_state["peers"]))
-        # Asegurar que no estamos en nuestra propia lista
-        cluster_state["peers"] = [p for p in cluster_state["peers"] if p != current_node_id]
+        
+        # Log de cambios
+        added = set(valid_dns_peers) - set(old_peers)
+        removed = set(old_peers) - set(valid_dns_peers)
+        if added:
+            print(f"[NAMENODE] 🆕 Peers agregados via DNS: {sorted(added)}")
+        if removed:
+            print(f"[NAMENODE] 🗑️  Peers removidos (ya no en DNS o filtrados): {sorted(removed)}")
+        
+        print(f"[NAMENODE] 📋 Lista final de peers (solo IPs): {sorted(cluster_state['peers'])}")
 
 
 def is_leader() -> bool:
@@ -429,7 +462,7 @@ def get_leader_url() -> Optional[str]:
 
 def update_peer_status(peer_id: str, alive: bool):
     """
-    Actualiza el estado de un peer basado en si está vivo o no (para gossip).
+    Actualiza el estado de un peer basado en si está vivo o no.
     Detecta reunificación cuando un peer pasa de "dead"/"suspected" a "alive".
     
     Args:
@@ -452,7 +485,7 @@ def update_peer_status(peer_id: str, alive: bool):
             peer_info["last_seen"] = time.time()
             # Detectar reunificación: si el peer estaba "dead" o "suspected" y ahora está "alive"
             if previous_status in ["dead", "suspected"]:
-                print(f"[NAMENODE] [GOSSIP] 🔄 Peer {peer_id} reunificado: {previous_status} -> alive")
+                print(f"[NAMENODE] 🔄 Peer {peer_id} reunificado: {previous_status} -> alive")
                 reunited_peers.append(peer_id)
             peer_info["status"] = "alive"
         else:
@@ -462,309 +495,18 @@ def update_peer_status(peer_id: str, alive: bool):
             if time_since_seen > PEER_FAILURE_TIMEOUT:
                 if peer_info["status"] == "alive":
                     peer_info["status"] = "suspected"
-                    print(f"[NAMENODE] [GOSSIP] Peer {peer_id} marcado como suspected (sin contacto por {time_since_seen:.1f}s)")
+                    print(f"[NAMENODE] Peer {peer_id} marcado como suspected (sin contacto por {time_since_seen:.1f}s)")
                 elif peer_info["status"] == "suspected" and time_since_seen > (PEER_FAILURE_TIMEOUT * 2):
                     peer_info["status"] = "dead"
-                    print(f"[NAMENODE] [GOSSIP] Peer {peer_id} marcado como dead (sin contacto por {time_since_seen:.1f}s)")
+                    print(f"[NAMENODE] Peer {peer_id} marcado como dead (sin contacto por {time_since_seen:.1f}s)")
     
     # Disparar reconciliación si se detectó reunificación
     if reunited_peers:
-        print(f"[NAMENODE] [GOSSIP] 🔄 ========== DETECCIÓN DE REUNIFICACIÓN ==========")
-        print(f"[NAMENODE] [GOSSIP] 🔄 Peers reunificados detectados: {reunited_peers}")
-        print(f"[NAMENODE] [GOSSIP] 🔄 Timestamp: {datetime.now().isoformat()}")
-        print(f"[NAMENODE] [GOSSIP] 🔄 Disparando reconciliación en hilo separado...")
-        # Ejecutar en un hilo separado para no bloquear gossip
+        print(f"[NAMENODE] 🔄 ========== DETECCIÓN DE REUNIFICACIÓN ==========")
+        print(f"[NAMENODE] 🔄 Peers reunificados detectados: {reunited_peers}")
+        print(f"[NAMENODE] 🔄 Timestamp: {datetime.now().isoformat()}")
+        print(f"[NAMENODE] 🔄 Disparando reconciliación en hilo separado...")
         threading.Thread(target=trigger_reconciliation, args=(reunited_peers,), daemon=True).start()
-
-
-def get_peers_to_contact() -> List[str]:
-    """
-    Obtiene la lista de peers a contactar para gossip.
-    Incluye peers con estado "alive", "unknown" (para bootstrap) y los configurados inicialmente.
-    
-    Returns:
-        Lista de peer IDs que se deben contactar (excluyendo este nodo)
-    """
-    with cluster_lock:
-        # Obtener todos los peers únicos conocidos (excluyendo este nodo)
-        unique_peers = set([p for p in cluster_state["peers"] if p != cluster_state["node_id"]])
-        peers_to_contact = []
-        
-        # Incluir todos los peers configurados (incluso si no tienen estado aún)
-        for peer_id in unique_peers:
-            if peer_id != cluster_state["node_id"]:
-                # Incluir si está en la lista de peers configurados
-                # o si tiene estado "alive" o "unknown" (para bootstrap)
-                if peer_id not in cluster_state["peer_status"]:
-                    peers_to_contact.append(peer_id)
-                elif cluster_state["peer_status"][peer_id]["status"] in ["alive", "unknown"]:
-                    peers_to_contact.append(peer_id)
-        
-        return list(set(peers_to_contact))  # Eliminar duplicados
-
-
-def gossip_exchange(peer_id: str) -> bool:
-    """
-    Realiza un intercambio de estado Gossip con un peer namenode.
-    
-    Args:
-        peer_id: ID del peer con el que hacer intercambio
-    
-    Returns:
-        True si el intercambio fue exitoso, False en caso contrario
-    """
-    try:
-        peer_url = get_peer_url(peer_id)
-        
-        # Obtener token de servicio para autenticación
-        try:
-            service_token = generate_service_token(cluster_state["node_id"], "service")
-        except Exception as e:
-            print(f"[NAMENODE] [GOSSIP] Error generando token, usando token de entorno: {e}")
-            service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
-        
-        # Obtener estado local
-        with cluster_lock:
-            local_version = cluster_state["version"]
-            sender_id = cluster_state["node_id"]
-            is_leader = cluster_state["is_leader"]
-            leader_id = cluster_state["leader_id"]
-            # Obtener lista de peers conocidos (incluyendo nosotros mismos y el líder si existe)
-            known_peers_list = cluster_state["peers"].copy()
-            known_peers_list.append(sender_id)  # Incluir este nodo
-            # Incluir el líder si existe y es diferente del sender_id
-            if leader_id and leader_id != sender_id:
-                if leader_id not in known_peers_list:
-                    known_peers_list.append(leader_id)
-            known_peers = list(set(known_peers_list))
-        
-        print(f"[NAMENODE] [GOSSIP] 📤 Enviando intercambio a {peer_id}")
-        print(f"[NAMENODE] [GOSSIP] 📋 Peers conocidos que se envían ({len(known_peers)}): {sorted(known_peers)}")
-        print(f"[NAMENODE] [GOSSIP] 📋 Detalle: peers={sorted(cluster_state['peers'])}, node_id={sender_id}, leader_id={leader_id}, is_leader={is_leader}")
-        
-        # Enviar nuestro estado al peer
-        response = requests.post(
-            f"{peer_url}/internal/gossip",
-            json={
-                "sender_id": sender_id,
-                "sender_version": local_version,
-                "known_peers": known_peers,
-                "is_leader": is_leader,
-                "leader_id": leader_id,
-                "timestamp": time.time()
-            },
-            headers={"Authorization": f"Bearer {service_token}"},
-            timeout=3
-        )
-        
-        if response.status_code == 200:
-            # Recibir estado del peer
-            data = response.json()
-            remote_version = data.get("version", 0)
-            remote_known_peers = data.get("known_peers", [])
-            remote_is_leader = data.get("is_leader", False)
-            remote_leader_id = data.get("leader_id")
-            
-            print(f"[NAMENODE] [GOSSIP] 📥 Respuesta recibida de {peer_id}")
-            print(f"[NAMENODE] [GOSSIP] 📋 Peers conocidos recibidos ({len(remote_known_peers)}): {sorted(remote_known_peers)}")
-            print(f"[NAMENODE] [GOSSIP] 📋 Detalle remoto: is_leader={remote_is_leader}, leader_id={remote_leader_id}, version={remote_version}")
-            
-            # Actualizar versión del cluster si la remota es mayor
-            peers_changed = False
-            with cluster_lock:
-                peers_before = cluster_state["peers"].copy()
-                # Actualizar versión al máximo entre local y remota
-                max_version = max(local_version, remote_version)
-                if max_version > cluster_state["version"]:
-                    old_version = cluster_state["version"]
-                    cluster_state["version"] = max_version
-                    print(f"[NAMENODE] [GOSSIP] Versión actualizada de {old_version} a {max_version} (de {peer_id})")
-                
-                # Agregar nuevos peers descubiertos a la lista de peers conocidos
-                # Remover duplicados y el node_id primero
-                cluster_state["peers"] = [p for p in cluster_state["peers"] if p != cluster_state["node_id"]]
-                cluster_state["peers"] = list(set(cluster_state["peers"]))
-                our_peers = set(cluster_state["peers"] + [cluster_state["node_id"]])
-                
-                for remote_peer in remote_known_peers:
-                    # Nunca agregar este nodo a la lista de peers
-                    if remote_peer != cluster_state["node_id"] and remote_peer not in our_peers:
-                        if remote_peer not in cluster_state["peers"]:
-                            cluster_state["peers"].append(remote_peer)
-                            print(f"[NAMENODE] [GOSSIP] Nuevo peer descubierto: {remote_peer}")
-                        # Inicializar estado del nuevo peer si no existe
-                        if remote_peer not in cluster_state["peer_status"]:
-                            cluster_state["peer_status"][remote_peer] = {
-                                "last_seen": 0.0,
-                                "status": "unknown"
-                            }
-                        peers_changed = True
-                
-                # Asegurar que no hay duplicados ni el node_id después de agregar
-                cluster_state["peers"] = [p for p in cluster_state["peers"] if p != cluster_state["node_id"]]
-                cluster_state["peers"] = list(set(cluster_state["peers"]))
-                
-                # Actualizar información del líder si el peer remoto es líder o conoce un líder
-                # IMPORTANTE: No cambiar is_leader si este nodo ya es el líder
-                if remote_is_leader and remote_leader_id == peer_id:
-                    # El peer remoto dice ser el líder
-                    if cluster_state["is_leader"]:
-                        # Este nodo es el líder, ignorar la información del peer
-                        print(f"[NAMENODE] [GOSSIP] ⚠️ Ignorando info de líder de {peer_id} - este nodo es el líder")
-                    elif cluster_state["leader_id"] != peer_id:
-                        # No somos líder, actualizar leader_id
-                        print(f"[NAMENODE] [GOSSIP] Líder actualizado desde gossip: {peer_id}")
-                        cluster_state["leader_id"] = peer_id
-                elif remote_leader_id and remote_leader_id != cluster_state["leader_id"]:
-                    # El peer remoto conoce un líder diferente
-                    if not cluster_state["is_leader"]:
-                        print(f"[NAMENODE] [GOSSIP] Líder conocido actualizado desde gossip: {remote_leader_id}")
-                        cluster_state["leader_id"] = remote_leader_id
-            
-            # Actualizar estado del peer como vivo
-            update_peer_status(peer_id, True)
-            
-            with cluster_lock:
-                peers_after = cluster_state["peers"].copy()
-                current_leader_id = cluster_state["leader_id"]
-                # Construir lista completa de peers conocidos (incluyendo líder)
-                all_known_peers_complete = peers_after.copy()
-                if current_leader_id and current_leader_id not in all_known_peers_complete:
-                    all_known_peers_complete.append(current_leader_id)
-            
-            print(f"[NAMENODE] [GOSSIP] ✅ Intercambio exitoso con {peer_id}")
-            print(f"[NAMENODE] [GOSSIP] 📊 Resumen: Peers antes={len(peers_before)}, Peers después={len(peers_after)}, Cambios={peers_changed}")
-            print(f"[NAMENODE] [GOSSIP] 📋 Lista completa de peers conocidos ({len(all_known_peers_complete)}): {sorted(all_known_peers_complete)}")
-            print(f"[NAMENODE] [GOSSIP] 📋 Líder conocido: {current_leader_id}")
-            return True
-        else:
-            update_peer_status(peer_id, False)
-            print(f"[NAMENODE] [GOSSIP] Error en intercambio con {peer_id}: HTTP {response.status_code}")
-        return False
-
-    except requests.exceptions.ConnectionError as e:
-        # Errores de conexión (DNS, red, etc.) - esperados cuando el peer no está disponible
-        update_peer_status(peer_id, False)
-        error_msg = str(e)
-        if "Failed to resolve" in error_msg or "name resolution" in error_msg.lower():
-            print(f"[NAMENODE] [GOSSIP] ⚠️  Peer {peer_id} no disponible (no se puede resolver DNS)")
-        elif "Connection refused" in error_msg or "refused" in error_msg.lower():
-            print(f"[NAMENODE] [GOSSIP] ⚠️  Peer {peer_id} no disponible (conexión rechazada)")
-        else:
-            print(f"[NAMENODE] [GOSSIP] ⚠️  Peer {peer_id} no disponible: {type(e).__name__}")
-        return False
-    except requests.exceptions.Timeout:
-        update_peer_status(peer_id, False)
-        print(f"[NAMENODE] [GOSSIP] ⚠️  Peer {peer_id} no responde (timeout)")
-        return False
-    except Exception as e:
-        update_peer_status(peer_id, False)
-        print(f"[NAMENODE] [GOSSIP] ⚠️  Error en intercambio con {peer_id}: {type(e).__name__}: {e}")
-        return False
-
-
-def gossip_loop():
-    """
-    Loop principal de Gossip que periódicamente selecciona peers aleatorios y hace intercambio.
-    Usa DNS de Docker para descubrir peers además de la lista configurada.
-    """
-    import random
-    
-    # Esperar un poco al inicio para que todos los nodos estén listos
-    time.sleep(5)
-    
-    # Descubrir peers via DNS de Docker al inicio
-    print(f"[NAMENODE] [GOSSIP] Descubriendo peers via DNS de Docker...")
-    refresh_peers_from_dns()
-    
-    # Intentar contacto inicial con todos los peers configurados
-    print(f"[NAMENODE] [GOSSIP] Iniciando loop de gossip...")
-    with cluster_lock:
-        initial_peers = [p for p in cluster_state["peers"] if p != cluster_state["node_id"]]
-    
-    if initial_peers:
-        print(f"[NAMENODE] [GOSSIP] Intentando contacto inicial con {len(initial_peers)} peers: {initial_peers}")
-        for peer in initial_peers:
-            # Inicializar estado si no existe
-            update_peer_status(peer, False)  # Esto lo inicializa como "unknown"
-            thread = threading.Thread(target=gossip_exchange, args=(peer,), daemon=True)
-            thread.start()
-    
-    # Contador para refrescar DNS periódicamente
-    dns_refresh_counter = 0
-    DNS_REFRESH_INTERVAL = 6  # Refrescar DNS cada 6 ciclos de gossip (~30 segundos)
-    
-    while True:
-        try:
-            time.sleep(GOSSIP_INTERVAL)
-            
-            # Refrescar peers via DNS periódicamente
-            dns_refresh_counter += 1
-            if dns_refresh_counter >= DNS_REFRESH_INTERVAL:
-                dns_refresh_counter = 0
-                refresh_peers_from_dns()
-            
-            # Obtener lista de peers a contactar (incluye "alive" y "unknown" para bootstrap)
-            peers_to_contact = get_peers_to_contact()
-            
-            if not peers_to_contact:
-                # Si no hay peers, intentar descubrir via DNS
-                refresh_peers_from_dns()
-                # Verificar si hay peers configurados que no están en peer_status
-                with cluster_lock:
-                    configured_peers = [p for p in cluster_state["peers"] if p != cluster_state["node_id"]]
-                    for peer in configured_peers:
-                        if peer not in cluster_state["peer_status"]:
-                            update_peer_status(peer, False)  # Inicializar como "unknown"
-                            peers_to_contact.append(peer)
-            
-            if not peers_to_contact:
-                print(f"[NAMENODE] [GOSSIP] No hay peers para contactar (DNS tampoco encontró peers)")
-                continue
-            
-            # Seleccionar número aleatorio de peers (fanout)
-            num_peers = min(GOSSIP_FANOUT, len(peers_to_contact))
-            selected_peers = random.sample(peers_to_contact, num_peers) if len(peers_to_contact) > 0 else []
-            
-            print(f"[NAMENODE] [GOSSIP] Contactando {len(selected_peers)} de {len(peers_to_contact)} peers disponibles: {selected_peers}")
-            
-            # Hacer intercambio con cada peer seleccionado
-            for peer in selected_peers:
-                # No hacer gossip con nosotros mismos
-                if peer == cluster_state["node_id"]:
-                    continue
-                
-                # Ejecutar en un hilo separado para no bloquear
-                thread = threading.Thread(target=gossip_exchange, args=(peer,), daemon=True)
-                thread.start()
-        
-            # Verificar si el líder está desconectado basado en el estado de gossip
-            # (solo si no somos el líder)
-            if not is_leader():
-                with cluster_lock:
-                    leader_id = cluster_state.get("leader_id")
-                    if leader_id:
-                        # Verificar estado del líder en peer_status
-                        if leader_id in cluster_state.get("peer_status", {}):
-                            leader_status = cluster_state["peer_status"][leader_id].get("status")
-                            time_since_seen = time.time() - cluster_state["peer_status"][leader_id].get("last_seen", 0)
-                            
-                            # Si el líder está marcado como "dead" o ha estado "suspected" por mucho tiempo
-                            if leader_status == "dead":
-                                print(f"[NAMENODE] [GOSSIP] 🗳️  Líder {leader_id} detectado como dead mediante gossip, iniciando elección...")
-                                cluster_state["leader_id"] = None
-                                cluster_state["last_heartbeat_time"] = 0
-                                # Iniciar elección en un hilo separado para no bloquear gossip
-                                threading.Thread(target=start_election, daemon=True).start()
-                            elif leader_status == "suspected" and time_since_seen > (ELECTION_TIMEOUT * 1.5):
-                                print(f"[NAMENODE] [GOSSIP] 🗳️  Líder {leader_id} suspected por {time_since_seen:.1f}s, iniciando elección...")
-                                cluster_state["leader_id"] = None
-                                cluster_state["last_heartbeat_time"] = 0
-                                threading.Thread(target=start_election, daemon=True).start()
-                
-        except Exception as e:
-            print(f"[NAMENODE] [GOSSIP] ⚠️  Error en gossip loop: {type(e).__name__}: {e}")
-            # No imprimir traceback completo para errores esperados
 
 
 def trigger_reconciliation(reunited_peers: List[str]):
@@ -1983,93 +1725,62 @@ def request_vote(candidate_id: str, term: int) -> bool:
 
 def check_existing_leader(peers: List[str]) -> Optional[str]:
     """
-    Verifica si hay un líder activo intentando comunicarse directamente con él.
-    Si el líder conocido no responde, retorna None para iniciar una votación.
-    Solo si no hay líder conocido, consulta a los peers.
+    Verifica si hay un líder activo consultando peers descubiertos vía DNS de Docker.
+    Solo usa DNS para descubrimiento, no gossip.
     
     Returns:
         ID del líder si se encuentra uno activo y responde, None en caso contrario
     """
-    with cluster_lock:
-        known_leader_id = cluster_state.get("leader_id")
-    
-    # PRIMERO: Intentar comunicarse directamente con el líder conocido (si existe)
-    if known_leader_id:
-        print(f"[NAMENODE] 🔍 Verificando líder conocido directamente: {known_leader_id}")
-        try:
-            leader_url = get_peer_url(known_leader_id)
-            response = requests.get(f"{leader_url}/", timeout=3)
-            if response.status_code == 200:
-                data = response.json()
-                # Verificar que realmente es el líder
-                if data.get("is_leader") and (data.get("leader_id") == known_leader_id or data.get("node_id") == known_leader_id):
-                    print(f"[NAMENODE] ✅ Líder conocido {known_leader_id} está activo y responde correctamente")
-                    # Actualizar estado del líder en gossip
-                    update_peer_status(known_leader_id, True)
-                    return known_leader_id
-                else:
-                    print(f"[NAMENODE] ⚠️  Líder conocido {known_leader_id} no es líder activo según su respuesta")
-                    # El líder conocido no es realmente el líder, iniciar votación
-                    return None
-        except Exception as e:
-            print(f"[NAMENODE] ❌ Líder conocido {known_leader_id} no responde: {e}")
-            print(f"[NAMENODE] 🗳️  Se iniciará votación porque el líder conocido no está disponible")
-            # Actualizar estado del líder en gossip como no disponible
-            update_peer_status(known_leader_id, False)
-            return None
-    
-    # SEGUNDO: Si no hay líder conocido, consultar a los peers para descubrir uno
     if not peers:
-        print(f"[NAMENODE] 🔍 Verificación de líder: No hay peers conocidos para consultar")
+        print(f"[NAMENODE] 🔍 [LEADER_CHECK] No hay peers conocidos vía DNS para consultar")
         return None
     
-    print(f"[NAMENODE] 🔍 No hay líder conocido localmente, consultando {len(peers)} peers conocidos: {sorted(peers)}")
+    print(f"[NAMENODE] 🔍 [LEADER_CHECK] Consultando {len(peers)} peers vía DNS para encontrar líder: {sorted(peers)}")
     
-    # Consultar cada peer para ver si hay un líder activo
-    for peer in peers:
+    # Consultar cada peer descubierto vía DNS para ver si hay un líder activo
+    for peer_ip in peers:
         try:
-            peer_url = get_peer_url(peer)
-            response = requests.get(f"{peer_url}/", timeout=2)
+            peer_url = get_peer_url(peer_ip)
+            print(f"[NAMENODE] 🔍 [LEADER_CHECK] Consultando peer {peer_ip} ({peer_url})...")
+            response = requests.get(f"{peer_url}/", timeout=3)
             if response.status_code == 200:
                 data = response.json()
-                # Si este peer es el líder, intentar comunicarse directamente con él
+                # Si este peer es el líder, verificar que responde directamente
                 if data.get("is_leader"):
                     leader_id = data.get("leader_id") or data.get("node_id")
                     # Verificar que el líder responde directamente
                     try:
                         leader_url = get_peer_url(leader_id)
-                        leader_response = requests.get(f"{leader_url}/", timeout=2)
+                        leader_response = requests.get(f"{leader_url}/", timeout=3)
                         if leader_response.status_code == 200:
                             leader_data = leader_response.json()
                             if leader_data.get("is_leader"):
-                                print(f"[NAMENODE] ✅ Líder activo encontrado y verificado: {leader_id}")
-                                update_peer_status(leader_id, True)
+                                print(f"[NAMENODE] ✅ [LEADER_CHECK] Líder activo encontrado vía DNS: {leader_id}")
                                 return leader_id
                     except Exception as e:
-                        print(f"[NAMENODE] ⚠️  Líder {leader_id} reportado por {peer} pero no responde: {e}")
+                        print(f"[NAMENODE] ⚠️  [LEADER_CHECK] Líder {leader_id} reportado por {peer_ip} pero no responde: {e}")
                         continue
-                # Si este peer conoce un líder, intentar comunicarse directamente con él
+                # Si este peer conoce un líder, verificar que responde directamente
                 elif data.get("leader_id"):
                     leader_id = data.get("leader_id")
                     try:
                         leader_url = get_peer_url(leader_id)
-                        leader_response = requests.get(f"{leader_url}/", timeout=2)
+                        leader_response = requests.get(f"{leader_url}/", timeout=3)
                         if leader_response.status_code == 200:
                             leader_data = leader_response.json()
                             if leader_data.get("is_leader"):
-                                print(f"[NAMENODE] ✅ Líder conocido encontrado y verificado: {leader_id}")
-                                update_peer_status(leader_id, True)
+                                print(f"[NAMENODE] ✅ [LEADER_CHECK] Líder conocido encontrado vía DNS: {leader_id} (reportado por {peer_ip})")
                                 return leader_id
                     except Exception as e:
-                        print(f"[NAMENODE] ⚠️  Líder {leader_id} reportado por {peer} pero no responde: {e}")
+                        print(f"[NAMENODE] ⚠️  [LEADER_CHECK] Líder {leader_id} reportado por {peer_ip} pero no responde: {e}")
                         continue
         except Exception as e:
             # Continuar con el siguiente peer si este no responde
-            print(f"[NAMENODE] ⚠️  No se pudo contactar a peer {peer} para verificar líder: {e}")
+            print(f"[NAMENODE] ⚠️  [LEADER_CHECK] No se pudo contactar peer {peer_ip}: {e}")
             continue
     
-    print(f"[NAMENODE] ❌ No se encontró líder activo después de consultar {len(peers)} peers")
-    print(f"[NAMENODE] 🗳️  Se iniciará votación porque no hay líder disponible")
+    print(f"[NAMENODE] ❌ [LEADER_CHECK] No se encontró líder activo después de consultar {len(peers)} peers vía DNS")
+    print(f"[NAMENODE] 🗳️  [LEADER_CHECK] Se iniciará votación porque no hay líder disponible")
     return None
 
 
@@ -2170,12 +1881,11 @@ def leader_heartbeat_loop():
         with cluster_lock:
             term = cluster_state["term"]
             leader_id = cluster_state["node_id"]
-            # Obtener la lista de peers conocidos (descubiertos mediante gossip)
-            peers = cluster_state["peers"].copy()
-            # Incluir al líder en la lista de peers conocidos
+            # Obtener la lista de peers conocidos (descubiertos mediante DNS)
+            # NUNCA incluir el leader_id (este nodo) en la lista de peers que se envía
+            peers = [p for p in cluster_state["peers"] if p != leader_id]
+            # NO incluir al líder en all_known_peers (no somos nuestro propio peer)
             all_known_peers = peers.copy()
-            if leader_id not in all_known_peers:
-                all_known_peers.append(leader_id)
         
         # Obtener token de servicio para autenticación
         try:
@@ -2240,16 +1950,17 @@ def leader_heartbeat_loop():
             cluster_state["last_heartbeat_time"] = time.time()
             cluster_state["active_followers"] = active_followers.copy()
         
-        # Log del estado de peers
+        # Log del estado de peers (excluyendo este nodo de la lista)
         with cluster_lock:
-            current_peers = cluster_state["peers"].copy()
+            current_node_id = cluster_state["node_id"]
+            current_peers = [p for p in cluster_state["peers"] if p != current_node_id]
             current_leader = cluster_state["leader_id"]
-            # Construir lista completa incluyendo líder
+            # Construir lista completa para logging (excluyendo este nodo)
             complete_peers_list = current_peers.copy()
-            if current_leader and current_leader not in complete_peers_list:
+            if current_leader and current_leader != current_node_id and current_leader not in complete_peers_list:
                 complete_peers_list.append(current_leader)
         
-        print(f"[NAMENODE] 💓 [HEARTBEAT] 📋 Estado final de peers conocidos ({len(complete_peers_list)}): {sorted(complete_peers_list)}")
+        print(f"[NAMENODE] 💓 [HEARTBEAT] 📋 Estado final de peers conocidos ({len(complete_peers_list)}): {sorted(complete_peers_list)} (excluyendo este nodo {cluster_state['node_id']})")
         if active_followers:
             print(f"[NAMENODE] ✅ Seguidores activos ({len(active_followers)}/{len(peers)}): {sorted(active_followers)}")
             inactive = [p for p in peers if p not in active_followers]
@@ -2380,80 +2091,69 @@ def leader_sync_loop():
 
 
 def follower_heartbeat_check():
-    """Verifica si el líder sigue activo (para seguidores)"""
+    """
+    Verifica periódicamente si el líder sigue activo (para seguidores).
+    Si el líder no responde después de LEADER_TIMEOUT (10-15s), inicia elección comunicándose con peers vía DNS.
+    """
     while True:
-        # Verificar más frecuentemente (cada 5 segundos en lugar de ELECTION_TIMEOUT)
-        time.sleep(5)
+        # Verificar cada FOLLOWER_LEADER_CHECK_INTERVAL segundos (10-15s)
+        time.sleep(FOLLOWER_LEADER_CHECK_INTERVAL)
         
         if is_leader():
             continue
         
         with cluster_lock:
-            time_since_heartbeat = time.time() - cluster_state["last_heartbeat_time"]
             leader_id = cluster_state["leader_id"]
-            # Verificar también el estado del líder en gossip
-            leader_status = None
-            if leader_id and leader_id in cluster_state.get("peer_status", {}):
-                leader_status = cluster_state["peer_status"][leader_id].get("status")
+            last_heartbeat_time = cluster_state.get("last_heartbeat_time", 0)
         
-        # Verificar si el líder está marcado como "dead" o "suspected" en gossip
-        if leader_id and leader_status in ["dead", "suspected"]:
-            print(f"[NAMENODE] ⚠️  Líder {leader_id} detectado como {leader_status} mediante gossip, iniciando elección...")
-            with cluster_lock:
-                # Marcar líder como dead para excluirlo de la votación
-                if leader_id in cluster_state.get("peer_status", {}):
-                    cluster_state["peer_status"][leader_id]["status"] = "dead"
-                cluster_state["leader_id"] = None
-                cluster_state["last_heartbeat_time"] = 0  # Resetear para forzar elección
+        current_time = time.time()
+        time_since_heartbeat = current_time - last_heartbeat_time
+        
+        if not leader_id:
+            # No hay líder conocido, iniciar elección
+            print(f"[NAMENODE] 🗳️  [FOLLOWER] No hay líder conocido, iniciando elección vía DNS...")
+            # Refrescar peers vía DNS antes de elección
+            refresh_peers_from_dns()
             start_election()
             continue
         
-        if leader_id:
-            # Si han pasado más de ELECTION_TIMEOUT sin heartbeat, verificar conectividad
-            if time_since_heartbeat > ELECTION_TIMEOUT:
-                print(f"[NAMENODE] ⏱️  Sin heartbeat del líder {leader_id} por {time_since_heartbeat:.1f}s, verificando conectividad...")
-                try:
-                    leader_url = get_peer_url(leader_id)
-                    response = requests.get(f"{leader_url}/", timeout=3)
-                    if response.status_code == 200:
-                        # El líder está vivo, actualizar timestamp
-                        with cluster_lock:
-                            cluster_state["last_heartbeat_time"] = time.time()
-                            # Actualizar estado del líder en gossip
-                            if leader_id in cluster_state.get("peer_status", {}):
-                                cluster_state["peer_status"][leader_id]["status"] = "alive"
-                                cluster_state["peer_status"][leader_id]["last_seen"] = time.time()
-                        print(f"[NAMENODE] ✅ Líder {leader_id} responde correctamente")
-                        continue
-                    else:
-                        print(f"[NAMENODE] ❌ Líder {leader_id} no responde correctamente (HTTP {response.status_code}), iniciando elección...")
-                        with cluster_lock:
-                            # Marcar líder como dead
-                            if leader_id in cluster_state.get("peer_status", {}):
-                                cluster_state["peer_status"][leader_id]["status"] = "dead"
-                            cluster_state["leader_id"] = None
-                            cluster_state["last_heartbeat_time"] = 0
-                        start_election()
-                except Exception as e:
-                    # Si el timeout es mayor, definitivamente el líder está desconectado
-                    if time_since_heartbeat > (ELECTION_TIMEOUT * 1.5):
-                        print(f"[NAMENODE] ❌ Líder {leader_id} inaccesible ({time_since_heartbeat:.1f}s sin contacto): {e}")
-                        print(f"[NAMENODE] 🗳️  Iniciando elección...")
-                        with cluster_lock:
-                            # Marcar líder como dead para excluirlo de la votación
-                            if leader_id in cluster_state.get("peer_status", {}):
-                                cluster_state["peer_status"][leader_id]["status"] = "dead"
-                            cluster_state["leader_id"] = None
-                            cluster_state["last_heartbeat_time"] = 0
-                        start_election()
-                    else:
-                        # Aún no ha pasado suficiente tiempo, solo marcar como suspected
-                        print(f"[NAMENODE] ⚠️  Líder {leader_id} no responde temporalmente ({time_since_heartbeat:.1f}s), marcando como suspected...")
-                        if leader_id in cluster_state.get("peer_status", {}):
-                            cluster_state["peer_status"][leader_id]["status"] = "suspected"
-        elif time_since_heartbeat > ELECTION_TIMEOUT:
-            print(f"[NAMENODE] 🗳️  No hay líder conocido después de {time_since_heartbeat:.1f}s, intentando elección...")
-            start_election()
+        # Verificar si el líder responde directamente
+        print(f"[NAMENODE] 🔍 [FOLLOWER] Verificando líder {leader_id} (último heartbeat hace {time_since_heartbeat:.1f}s)...")
+        leader_responding = False
+        
+        try:
+            leader_url = get_peer_url(leader_id)
+            response = requests.get(f"{leader_url}/", timeout=3)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("is_leader"):
+                    # El líder está vivo, actualizar timestamp
+                    with cluster_lock:
+                        cluster_state["last_heartbeat_time"] = current_time
+                    print(f"[NAMENODE] ✅ [FOLLOWER] Líder {leader_id} responde correctamente")
+                    leader_responding = True
+                else:
+                    print(f"[NAMENODE] ⚠️  [FOLLOWER] Líder {leader_id} reportado pero no es líder activo")
+        except Exception as e:
+            print(f"[NAMENODE] ⚠️  [FOLLOWER] Líder {leader_id} no responde: {e}")
+        
+        # Si el líder no responde Y ha pasado LEADER_TIMEOUT, iniciar elección
+        if not leader_responding:
+            if time_since_heartbeat >= LEADER_TIMEOUT:
+                print(f"[NAMENODE] ❌ [FOLLOWER] Líder {leader_id} no responde después de {time_since_heartbeat:.1f}s (timeout: {LEADER_TIMEOUT}s)")
+                print(f"[NAMENODE] 🗳️  [FOLLOWER] Iniciando elección comunicándose con peers vía DNS...")
+                
+                # Refrescar peers vía DNS antes de elección (para asegurar lista actualizada)
+                refresh_peers_from_dns()
+                
+                with cluster_lock:
+                    cluster_state["leader_id"] = None
+                    cluster_state["last_heartbeat_time"] = 0
+                
+                # Iniciar elección (start_election ya usa DNS para descubrimiento)
+                start_election()
+            else:
+                print(f"[NAMENODE] ⏳ [FOLLOWER] Líder {leader_id} no responde temporalmente ({time_since_heartbeat:.1f}s < {LEADER_TIMEOUT}s), esperando...")
 
 
 def election_retry_loop():
@@ -2487,10 +2187,10 @@ async def lifespan(app: FastAPI):
     
     print(f"[NAMENODE] 🚀 Nodo iniciado: {node_id}")
     print(f"[NAMENODE] ⏱️  [CONFIG] Tiempos de reconciliación configurados:")
-    print(f"[NAMENODE] ⏱️  [CONFIG]   - GOSSIP_INTERVAL: {GOSSIP_INTERVAL}s (intervalo entre rondas de gossip)")
+    print(f"[NAMENODE] ⏱️  [CONFIG]   - FOLLOWER_LEADER_CHECK_INTERVAL: {FOLLOWER_LEADER_CHECK_INTERVAL}s (verificación periódica del líder)")
+    print(f"[NAMENODE] ⏱️  [CONFIG]   - LEADER_TIMEOUT: {LEADER_TIMEOUT}s (tiempo sin respuesta antes de considerar líder muerto)")
     print(f"[NAMENODE] ⏱️  [CONFIG]   - PEER_FAILURE_TIMEOUT: 30s (tiempo para marcar como suspected)")
     print(f"[NAMENODE] ⏱️  [CONFIG]   - PEER_DEAD_TIMEOUT: 60s (tiempo para marcar como dead)")
-    print(f"[NAMENODE] ⏱️  [CONFIG]   - Tiempo mínimo para detectar reunificación: ~5s (próximo gossip)")
     print(f"[NAMENODE] ⏱️  [CONFIG]   - Tiempo para marcar peer como dead: 60s sin contacto")
     print(f"[NAMENODE] ⏱️  [CONFIG]   - Tiempo esperado para reconciliación completa: 10-30s (depende de operaciones)")
     
@@ -2596,11 +2296,6 @@ async def lifespan(app: FastAPI):
     election_thread = threading.Thread(target=election_retry_loop, daemon=True)
     election_thread.start()
     
-    # Iniciar loop de gossip para descubrimiento de peers
-    gossip_thread = threading.Thread(target=gossip_loop, daemon=True)
-    gossip_thread.start()
-    print(f"[NAMENODE] [GOSSIP] Loop de gossip iniciado (interval={GOSSIP_INTERVAL}s, fanout={GOSSIP_FANOUT})")
-    
     # Iniciar loop de sincronización periódica (líder -> seguidores)
     sync_thread = threading.Thread(target=leader_sync_loop, daemon=True)
     sync_thread.start()
@@ -2633,11 +2328,80 @@ async def lifespan(app: FastAPI):
     datanode_monitor_thread = threading.Thread(target=datanode_monitor_loop, daemon=True)
     datanode_monitor_thread.start()
     
-    # Intentar elección inicial después de un delay breve
-    print(f"[NAMENODE] ⏳ Esperando 5 segundos antes de la elección inicial...")
-    time.sleep(5)
+    # ========== LÓGICA DE INICIO: BUSCAR LÍDER VÍA DNS ==========
+    print(f"[NAMENODE] 🔍 [STARTUP] Buscando líder existente vía DNS de Docker...")
     
-    start_election()
+    # Descubrir peers via DNS de Docker (excluyendo este nodo)
+    refresh_peers_from_dns()
+    
+    with cluster_lock:
+        peers = cluster_state["peers"].copy()
+        current_node_id = cluster_state["node_id"]
+    
+    print(f"[NAMENODE] 🔍 [STARTUP] Peers descubiertos vía DNS ({len(peers)}): {sorted(peers) if peers else '[]'}")
+    
+    # Buscar líder activo consultando cada peer descubierto vía DNS
+    leader_found = None
+    if peers:
+        print(f"[NAMENODE] 🔍 [STARTUP] Consultando peers vía DNS para encontrar líder...")
+        for peer_ip in peers:
+            try:
+                peer_url = get_peer_url(peer_ip)
+                print(f"[NAMENODE] 🔍 [STARTUP] Consultando peer {peer_ip} ({peer_url})...")
+                response = requests.get(f"{peer_url}/", timeout=3)
+                if response.status_code == 200:
+                    data = response.json()
+                    # Si este peer es el líder, verificar que responde directamente
+                    if data.get("is_leader"):
+                        leader_id = data.get("leader_id") or data.get("node_id")
+                        # Verificar que el líder responde directamente
+                        try:
+                            leader_url = get_peer_url(leader_id)
+                            leader_response = requests.get(f"{leader_url}/", timeout=3)
+                            if leader_response.status_code == 200:
+                                leader_data = leader_response.json()
+                                if leader_data.get("is_leader"):
+                                    leader_found = leader_id
+                                    print(f"[NAMENODE] ✅ [STARTUP] Líder activo encontrado vía DNS: {leader_id}")
+                                    break
+                        except Exception as e:
+                            print(f"[NAMENODE] ⚠️  [STARTUP] Líder {leader_id} reportado por {peer_ip} pero no responde: {e}")
+                            continue
+                    # Si este peer conoce un líder, verificar que responde directamente
+                    elif data.get("leader_id"):
+                        leader_id = data.get("leader_id")
+                        try:
+                            leader_url = get_peer_url(leader_id)
+                            leader_response = requests.get(f"{leader_url}/", timeout=3)
+                            if leader_response.status_code == 200:
+                                leader_data = leader_response.json()
+                                if leader_data.get("is_leader"):
+                                    leader_found = leader_id
+                                    print(f"[NAMENODE] ✅ [STARTUP] Líder conocido encontrado vía DNS: {leader_id} (reportado por {peer_ip})")
+                                    break
+                        except Exception as e:
+                            print(f"[NAMENODE] ⚠️  [STARTUP] Líder {leader_id} reportado por {peer_ip} pero no responde: {e}")
+                            continue
+            except Exception as e:
+                print(f"[NAMENODE] ⚠️  [STARTUP] No se pudo contactar peer {peer_ip}: {e}")
+                continue
+    
+    # Decisión: ¿Líder encontrado o iniciar elección?
+    if leader_found:
+        # Incorporarse como seguidor
+        print(f"[NAMENODE] 📋 [STARTUP] Incorporándose como seguidor del líder {leader_found}")
+        with cluster_lock:
+            cluster_state["leader_id"] = leader_found
+            cluster_state["is_leader"] = False
+            cluster_state["last_heartbeat_time"] = time.time()
+        print(f"[NAMENODE] ✅ [STARTUP] Estado: seguidor del líder {leader_found}")
+    else:
+        # No hay líder, iniciar elección
+        if peers:
+            print(f"[NAMENODE] 🗳️  [STARTUP] No se encontró líder activo vía DNS. Iniciando elección...")
+        else:
+            print(f"[NAMENODE] 🗳️  [STARTUP] No hay peers conocidos. Iniciando elección (nodo único se convertirá en líder)...")
+        start_election()
     
     yield
     
@@ -3699,11 +3463,60 @@ def finalize_chunked_upload(
         
         # Verificar que el archivo existe haciendo una petición HEAD o GET pequeño
         # Usamos /retrieve con Range para solo obtener los primeros bytes (más eficiente)
-        verify_response = requests.get(
-            f"{datanode_url}/retrieve/{file_hash}",
-            headers={"Authorization": f"Bearer {service_token}", "Range": "bytes=0-0"},
-            timeout=10
-        )
+        # Para archivos grandes, aumentamos el timeout (calculado basado en tamaño)
+        # Timeout base: 30 segundos + 1 segundo por cada 100MB (mínimo 30s, máximo 300s)
+        base_timeout = 30
+        timeout_per_100mb = 1
+        max_timeout = 300  # 5 minutos máximo
+        file_size_mb = file_size / (1024 * 1024)
+        calculated_timeout = base_timeout + int((file_size_mb / 100) * timeout_per_100mb)
+        verification_timeout = min(max_timeout, max(base_timeout, calculated_timeout))
+        
+        print(f"[NAMENODE] [CHUNKED_UPLOAD] Verificando archivo ({file_size_mb:.2f} MB) con timeout de {verification_timeout}s...")
+        
+        # Hacer verificación con retries (hasta 3 intentos con backoff exponencial)
+        max_retries = 3
+        retry_delay = 2  # segundos
+        verify_response = None
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                verify_response = requests.get(
+                    f"{datanode_url}/retrieve/{file_hash}",
+                    headers={"Authorization": f"Bearer {service_token}", "Range": "bytes=0-0"},
+                    timeout=verification_timeout
+                )
+                # Si la respuesta es exitosa, salir del loop
+                if verify_response.status_code in [200, 206, 404]:
+                    break
+                else:
+                    last_error = f"HTTP {verify_response.status_code}"
+            except requests.Timeout as e:
+                last_error = f"Timeout después de {verification_timeout}s"
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)  # Backoff exponencial: 2s, 4s, 8s
+                    print(f"[NAMENODE] [CHUNKED_UPLOAD] ⚠️  Intento {attempt + 1}/{max_retries} falló ({last_error}), esperando {wait_time}s antes de reintentar...")
+                    time.sleep(wait_time)
+                else:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Timeout verificando archivo en DataNode {datanode_id} después de {max_retries} intentos. El archivo puede estar aún siendo procesado."
+                    )
+            except Exception as e:
+                last_error = str(e)
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    print(f"[NAMENODE] [CHUNKED_UPLOAD] ⚠️  Intento {attempt + 1}/{max_retries} falló ({last_error}), esperando {wait_time}s antes de reintentar...")
+                    time.sleep(wait_time)
+                else:
+                    raise
+        
+        if verify_response is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Error verificando archivo en DataNode {datanode_id} después de {max_retries} intentos: {last_error}"
+            )
         
         if verify_response.status_code == 404:
             raise HTTPException(
@@ -4915,10 +4728,12 @@ def internal_heartbeat(
         # El líder conoce todos los peers del clúster, así que actualizamos nuestra lista
         if peers_from_leader:
             # Excluir este nodo de la lista de peers (no somos nuestro propio peer)
-            updated_peers = [p for p in peers_from_leader if p != current_node_id]
+            # Filtrar todas las variaciones del node_id (IPs y nombres DNS)
+            node_id_variations = [current_node_id, f"tbfs-{current_node_id}", current_node_id.replace("tbfs-", "")]
+            updated_peers = [p for p in peers_from_leader if p not in node_id_variations]
             
-            # Asegurar que el líder esté incluido en la lista de peers conocidos
-            if leader_id and leader_id != current_node_id:
+            # Asegurar que el líder esté incluido en la lista de peers conocidos (solo si no es este nodo)
+            if leader_id and leader_id != current_node_id and leader_id not in node_id_variations:
                 if leader_id not in updated_peers:
                     updated_peers.append(leader_id)
                     print(f"[NAMENODE] 📥 Líder {leader_id} agregado a la lista de peers conocidos")
@@ -4994,127 +4809,6 @@ def internal_heartbeat(
         "success": True,
         "node_id": follower_node_id  # Enviar node_id al líder para que lo almacene y distribuya
     }
-
-
-@app.post("/internal/gossip")
-def internal_gossip(
-    exchange: GossipExchange,
-    authorization: Optional[str] = Header(None, alias="Authorization")
-):
-    """
-    Endpoint interno para intercambio de estado en protocolo Gossip entre namenodes.
-    Recibe estado de un peer y retorna el estado local.
-    """
-    # Verificar autenticación de servicio
-    if not authorization or not authorization.startswith("Bearer "):
-        print(f"[NAMENODE] [GOSSIP] Error: Se requiere token de servicio")
-        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
-    
-    token = authorization.split(" ")[1]
-    payload = verify_service_token(token)
-    if not payload:
-        print(f"[NAMENODE] [GOSSIP] Error: Token de servicio inválido o expirado")
-        raise HTTPException(status_code=403, detail="Token de servicio inválido")
-    
-    # Verificar que viene de otro namenode
-    service_id = payload.get("service_id") or payload.get("sub", "")
-    if "namenode" not in service_id.lower():
-        print(f"[NAMENODE] [GOSSIP] Error: service_id '{service_id}' no es un namenode")
-        raise HTTPException(status_code=403, detail="Solo namenodes pueden hacer gossip")
-    
-    sender_id = exchange.sender_id
-    
-    print(f"[NAMENODE] [GOSSIP] 📥 Intercambio recibido de {sender_id}")
-    print(f"[NAMENODE] [GOSSIP] 📋 Peers conocidos recibidos ({len(exchange.known_peers)}): {sorted(exchange.known_peers)}")
-    print(f"[NAMENODE] [GOSSIP] 📋 Detalle remoto: is_leader={exchange.is_leader}, leader_id={exchange.leader_id}, version={exchange.sender_version}")
-    
-    # Actualizar estado del peer como vivo
-    update_peer_status(sender_id, True)
-    
-    # Actualizar versión y peers conocidos
-    peers_changed = False
-    with cluster_lock:
-        peers_before = cluster_state["peers"].copy()
-        leader_before = cluster_state["leader_id"]
-        local_version = cluster_state["version"]
-        # Actualizar versión al máximo entre local y remota
-        max_version = max(local_version, exchange.sender_version)
-        if max_version > cluster_state["version"]:
-            old_version = cluster_state["version"]
-            cluster_state["version"] = max_version
-            print(f"[NAMENODE] [GOSSIP] Versión actualizada de {old_version} a {max_version} (de {sender_id})")
-        local_version = cluster_state["version"]
-        
-        # Remover duplicados y el node_id primero
-        cluster_state["peers"] = [p for p in cluster_state["peers"] if p != cluster_state["node_id"]]
-        cluster_state["peers"] = list(set(cluster_state["peers"]))
-        
-        # Agregar nuevos peers descubiertos a la lista de peers conocidos
-        our_peers = set(cluster_state["peers"] + [cluster_state["node_id"]])
-        for remote_peer in exchange.known_peers:
-            # Nunca agregar este nodo a la lista de peers
-            if remote_peer != cluster_state["node_id"] and remote_peer not in our_peers:
-                if remote_peer not in cluster_state["peers"]:
-                    cluster_state["peers"].append(remote_peer)
-                    print(f"[NAMENODE] [GOSSIP] Nuevo peer descubierto: {remote_peer}")
-                # Inicializar estado del nuevo peer si no existe
-                if remote_peer not in cluster_state["peer_status"]:
-                    cluster_state["peer_status"][remote_peer] = {
-                        "last_seen": 0.0,
-                        "status": "unknown"
-                    }
-                peers_changed = True
-        
-        # Asegurar que no hay duplicados ni el node_id después de agregar
-        cluster_state["peers"] = [p for p in cluster_state["peers"] if p != cluster_state["node_id"]]
-        cluster_state["peers"] = list(set(cluster_state["peers"]))
-        
-        # Actualizar información del líder si el peer remoto es líder o conoce un líder
-        # IMPORTANTE: No cambiar is_leader si este nodo ya es el líder
-        if exchange.is_leader and exchange.leader_id == sender_id:
-            # El peer remoto dice ser el líder
-            if cluster_state["is_leader"]:
-                # Este nodo es el líder, ignorar la información del peer
-                print(f"[NAMENODE] [GOSSIP] ⚠️ Ignorando info de líder de {sender_id} - este nodo es el líder")
-            elif cluster_state["leader_id"] != sender_id:
-                # No somos líder, actualizar leader_id
-                print(f"[NAMENODE] [GOSSIP] Líder actualizado desde gossip: {sender_id}")
-                cluster_state["leader_id"] = sender_id
-        elif exchange.leader_id and exchange.leader_id != cluster_state["leader_id"]:
-            # El peer remoto conoce un líder diferente
-            if not cluster_state["is_leader"]:
-                print(f"[NAMENODE] [GOSSIP] Líder conocido actualizado desde gossip: {exchange.leader_id}")
-                cluster_state["leader_id"] = exchange.leader_id
-        
-        # Preparar lista de peers conocidos para retornar (sin duplicados, incluyendo este nodo y el líder si existe)
-        known_peers_list = [p for p in cluster_state["peers"] if p != cluster_state["node_id"]]
-        known_peers_list.append(cluster_state["node_id"])  # Incluir este nodo
-        # Incluir el líder si existe y es diferente del node_id
-        if cluster_state["leader_id"] and cluster_state["leader_id"] != cluster_state["node_id"]:
-            if cluster_state["leader_id"] not in known_peers_list:
-                known_peers_list.append(cluster_state["leader_id"])
-        known_peers = list(set(known_peers_list))
-        
-        peers_after = cluster_state["peers"].copy()
-        leader_after = cluster_state["leader_id"]
-    
-    print(f"[NAMENODE] [GOSSIP] 📊 Resumen del intercambio:")
-    print(f"[NAMENODE] [GOSSIP] 📋 Peers antes: {len(peers_before)} -> después: {len(peers_after)}, Cambios: {peers_changed}")
-    print(f"[NAMENODE] [GOSSIP] 📋 Líder antes: {leader_before} -> después: {leader_after}")
-    print(f"[NAMENODE] [GOSSIP] 📋 Lista completa de peers conocidos que se retornará ({len(known_peers)}): {sorted(known_peers)}")
-    print(f"[NAMENODE] [GOSSIP] 📋 Líder incluido en lista retornada: {leader_after in known_peers if leader_after else 'N/A'}")
-    
-    # Retornar nuestro estado actualizado
-    with cluster_lock:
-        return {
-            "success": True,
-            "node_id": cluster_state["node_id"],
-            "version": local_version,
-            "known_peers": known_peers,
-            "is_leader": cluster_state["is_leader"],
-            "leader_id": cluster_state["leader_id"],
-            "timestamp": time.time()
-        }
 
 
 @app.get("/internal/operation-log")

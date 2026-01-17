@@ -105,7 +105,7 @@ class NameNodeClient:
     def get_leader_url(self) -> Tuple[Optional[str], Optional[str]]:
         """
         Obtiene la URL del líder del cluster de namenodes.
-        Consulta cada namenode hasta encontrar el líder.
+        Consulta cada namenode hasta encontrar el líder con reintentos y timeouts más robustos.
         
         Returns:
             Tupla (leader_url, error_message)
@@ -118,12 +118,14 @@ class NameNodeClient:
         # Mezclar para distribuir carga
         random.shuffle(namenodes)
         
-        last_error = None
+        last_errors = []
+        leader_candidates = []  # URLs candidatas de líder para verificar al final
         
+        # Primera pasada: consultar todos los namenodes (incluso si algunos fallan con timeout)
         for namenode_url in namenodes:
             try:
                 print(f"[NAMENODE_CLIENT] Consultando namenode: {namenode_url}")
-                response = requests.get(f"{namenode_url}/", timeout=5)
+                response = requests.get(f"{namenode_url}/", timeout=10)  # Aumentado a 10s para cambios de líder
                 response.raise_for_status()
                 data = response.json()
                 
@@ -132,50 +134,76 @@ class NameNodeClient:
                     print(f"[NAMENODE_CLIENT] ✅ Líder encontrado: {namenode_url}")
                     return namenode_url, None
                 
-                # Si conoce al líder, intentar conectar directamente
+                # Si conoce al líder, guardarlo como candidato para verificar después
                 leader_url = data.get("leader_url")
-                if leader_url:
-                    try:
-                        leader_response = requests.get(f"{leader_url}/", timeout=3)
-                        leader_response.raise_for_status()
-                        leader_data = leader_response.json()
-                        if leader_data.get("is_leader"):
-                            print(f"[NAMENODE_CLIENT] ✅ Líder verificado: {leader_url}")
-                            return leader_url, None
-                    except requests.RequestException:
-                        continue
-                
-                # Si hay leader_id, construir URL
                 leader_id = data.get("leader_id")
-                if leader_id:
-                    # Intentar con el nombre DNS del líder
+                
+                if leader_url:
+                    leader_candidates.append(leader_url)
+                elif leader_id:
+                    # Construir URL del líder
                     if leader_id.startswith("namenode-"):
                         constructed_url = f"http://tbfs-{leader_id}:{self.namenode_port}"
                     elif leader_id.startswith("tbfs-"):
                         constructed_url = f"http://{leader_id}:{self.namenode_port}"
                     else:
                         constructed_url = f"http://{leader_id}:{self.namenode_port}"
-                    
-                    try:
-                        verify_response = requests.get(f"{constructed_url}/", timeout=3)
-                        verify_response.raise_for_status()
-                        verify_data = verify_response.json()
-                        if verify_data.get("is_leader"):
-                            print(f"[NAMENODE_CLIENT] ✅ Líder construido y verificado: {constructed_url}")
-                            return constructed_url, None
-                    except requests.RequestException:
-                        continue
+                    leader_candidates.append(constructed_url)
                         
+            except requests.Timeout as e:
+                # Timeout no es crítico, continuar con otros namenodes
+                error_msg = f"{namenode_url}: Read timed out"
+                last_errors.append(error_msg)
+                print(f"[NAMENODE_CLIENT] ⚠️  Timeout consultando {namenode_url}, continuando...")
+                continue
             except requests.RequestException as e:
-                last_error = str(e)
+                # Otros errores de conexión, continuar con otros namenodes
+                error_msg = f"{namenode_url}: {str(e)}"
+                last_errors.append(error_msg)
+                print(f"[NAMENODE_CLIENT] ⚠️  Error consultando {namenode_url}: {e}")
                 continue
             except Exception as e:
-                last_error = str(e)
+                error_msg = f"{namenode_url}: {str(e)}"
+                last_errors.append(error_msg)
+                print(f"[NAMENODE_CLIENT] ⚠️  Excepción consultando {namenode_url}: {e}")
                 continue
         
-        error_msg = f"No se encontró líder después de consultar {len(namenodes)} namenodes."
-        if last_error:
-            error_msg += f" Último error: {last_error}"
+        # Segunda pasada: verificar candidatos de líder (pueden ser más confiables)
+        # Remover duplicados manteniendo orden
+        seen = set()
+        unique_candidates = []
+        for candidate in leader_candidates:
+            if candidate not in seen:
+                seen.add(candidate)
+                unique_candidates.append(candidate)
+        
+        print(f"[NAMENODE_CLIENT] Verificando {len(unique_candidates)} candidatos de líder: {unique_candidates}")
+        
+        for leader_url in unique_candidates:
+            try:
+                print(f"[NAMENODE_CLIENT] Verificando candidato de líder: {leader_url}")
+                leader_response = requests.get(f"{leader_url}/", timeout=10)  # 10s timeout
+                leader_response.raise_for_status()
+                leader_data = leader_response.json()
+                if leader_data.get("is_leader"):
+                    print(f"[NAMENODE_CLIENT] ✅ Líder verificado: {leader_url}")
+                    return leader_url, None
+            except requests.Timeout:
+                print(f"[NAMENODE_CLIENT] ⚠️  Timeout verificando candidato {leader_url}")
+                continue
+            except requests.RequestException as e:
+                print(f"[NAMENODE_CLIENT] ⚠️  Error verificando candidato {leader_url}: {e}")
+                continue
+        
+        # Si no se encontró líder, construir mensaje de error con más detalle
+        error_msg = f"No se encontró líder después de consultar {len(namenodes)} namenodes"
+        if last_errors:
+            # Mostrar solo algunos errores (no todos) para no saturar
+            errors_to_show = last_errors[:3]  # Mostrar solo los primeros 3
+            error_msg += f". Últimos errores: {'; '.join(errors_to_show)}"
+            if len(last_errors) > 3:
+                error_msg += f" (y {len(last_errors) - 3} más...)"
+        
         return None, error_msg
     
     def get_any_namenode_url(self) -> Tuple[Optional[str], Optional[str]]:

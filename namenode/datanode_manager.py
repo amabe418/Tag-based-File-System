@@ -122,22 +122,26 @@ def register_datanode(node_id: str, url: str, port: int, ip: Optional[str],
         thread = threading.Thread(target=trigger_rereplication_async, daemon=True)
         thread.start()
     
-    # Si un datanode pasó de inactive a active, eliminar réplicas redundantes
-    if exists and old_status == 'inactive':
-        print(f"[DATANODE_MANAGER] DataNode {node_id} pasó de inactive a active, verificando réplicas redundantes...")
+    # Si un datanode pasó de inactive a active, eliminar réplicas redundantes y re-replicar archivos subreplicados
+    if exists and old_status == 'inactive' and actual_status == 'active':
+        print(f"[DATANODE_MANAGER] DataNode {node_id} pasó de inactive a active, verificando réplicas redundantes y re-replicando archivos subreplicados...")
         # Ejecutar en background para no bloquear el registro
         import threading
-        def remove_redundant_replicas_async():
+        def handle_datanode_recovery_async():
             try:
                 # Esperar 5 segundos antes de empezar para no bloquear el registro
                 time.sleep(5)
+                # Primero eliminar réplicas redundantes
                 remove_redundant_replicas_from_datanode(node_id, node_id_db=node_id_db)
+                # Luego disparar re-replicación de archivos subreplicados
+                print(f"[DATANODE_MANAGER] Disparando re-replicación de archivos subreplicados después de que DataNode {node_id} volvió a estar activo...")
+                trigger_rereplication_for_undereplicated(node_id_db=node_id_db)
             except Exception as e:
-                print(f"[DATANODE_MANAGER] Error eliminando réplicas redundantes: {e}")
+                print(f"[DATANODE_MANAGER] Error en recuperación de DataNode {node_id}: {e}")
                 import traceback
                 traceback.print_exc()
         
-        thread = threading.Thread(target=remove_redundant_replicas_async, daemon=True)
+        thread = threading.Thread(target=handle_datanode_recovery_async, daemon=True)
         thread.start()
     
     return True
@@ -160,10 +164,13 @@ def update_datanode_heartbeat(node_id: str, free_space: int, total_space: int,
         print(f"[DATANODE_MANAGER] DataNode {node_id} no encontrado para heartbeat")
         return False
     
+    # Guardar el estado anterior para verificar si pasó de inactive a active
+    previous_status = datanode_info.get("status")
+    
     # Verificar conectividad real antes de marcar como active
     # Esto previene oscilaciones cuando un DataNode está inactivo pero envía heartbeats en cola
     should_mark_active = True
-    if datanode_info.get("status") == "inactive":
+    if previous_status == "inactive":
         # Si el DataNode estaba marcado como inactive, verificar que realmente responde
         print(f"[DATANODE_MANAGER] DataNode {node_id} estaba inactive, verificando conectividad antes de marcar como active...")
         datanode_url = datanode_info.get("url")
@@ -226,12 +233,32 @@ def update_datanode_heartbeat(node_id: str, free_space: int, total_space: int,
     
     # Actualizar cache fuera del lock de BD
     cache = get_datanode_cache(node_id_db)
+    new_status = "active" if should_mark_active else "inactive"
     cache.update(node_id, {
         "free_space": free_space,
         "total_space": total_space,
         "last_heartbeat": current_time,
-        "status": "active" if should_mark_active else "inactive"
+        "status": new_status
     })
+    
+    # Si un datanode pasó de inactive a active, disparar re-replicación de archivos subreplicados
+    if should_mark_active and previous_status == "inactive":
+        print(f"[DATANODE_MANAGER] DataNode {node_id} pasó de inactive a active vía heartbeat, disparando re-replicación de archivos subreplicados...")
+        # Ejecutar en background para no bloquear el heartbeat
+        import threading
+        def trigger_rereplication_after_recovery_async():
+            try:
+                # Esperar 5 segundos antes de empezar para no bloquear el heartbeat
+                time.sleep(5)
+                print(f"[DATANODE_MANAGER] Iniciando re-replicación después de que DataNode {node_id} volvió a estar activo...")
+                trigger_rereplication_for_undereplicated(node_id_db=node_id_db)
+            except Exception as e:
+                print(f"[DATANODE_MANAGER] Error en re-replicación después de recuperación de DataNode {node_id}: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        thread = threading.Thread(target=trigger_rereplication_after_recovery_async, daemon=True)
+        thread.start()
     
     return True
 

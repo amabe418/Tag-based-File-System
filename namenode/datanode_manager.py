@@ -28,7 +28,7 @@ def register_datanode(node_id: str, url: str, port: int, ip: Optional[str],
     old_status = None
     new_status = 'active'  # Status por defecto (para nuevos DataNodes)
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             # Verificar si ya existe y obtener status anterior
@@ -200,7 +200,7 @@ def update_datanode_heartbeat(node_id: str, free_space: int, total_space: int,
     
     # Solo mantener el lock durante la operación de BD
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             if should_mark_active:
@@ -282,7 +282,7 @@ def get_datanode(node_id: str, node_id_db: str = None) -> Optional[Dict]:
     db_path = get_db_path(node_id_db)
     
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             cursor.execute("""
@@ -330,7 +330,7 @@ def list_datanodes(status: Optional[str] = None, node_id_db: str = None) -> List
     db_path = get_db_path(node_id_db)
     
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             if status:
@@ -476,7 +476,7 @@ def update_replica_count(file_id: int, count: int, node_id_db: str = None) -> bo
     db_path = get_db_path(node_id_db)
     
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             cursor.execute("""
@@ -518,7 +518,7 @@ def save_file_replicas(file_id: int, datanode_ids: List[str], node_id_db: str = 
     db_path = get_db_path(node_id_db)
     
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             replica_types = ["primary", "secondary", "tertiary"]
@@ -560,7 +560,7 @@ def get_file_replicas(file_id: int, node_id_db: str = None) -> List[Dict]:
     db_path = get_db_path(node_id_db)
     
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             cursor.execute("""
@@ -863,7 +863,7 @@ def get_files_affected_by_datanode(datanode_id: str, node_id_db: str = None) -> 
     db_path = get_db_path(node_id_db)
     
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             cursor.execute("""
@@ -908,7 +908,7 @@ def remove_redundant_replicas_from_datanode(datanode_id: str, node_id_db: str = 
     removed_count = 0
     
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             for file_id in affected_files:
@@ -1140,7 +1140,7 @@ def rereplicate_file(file_id: int, file_hash: str, failed_datanode_id: str,
         # Actualizar la base de datos
         db_path = get_db_path(node_id_db)
         with db_lock:
-            conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+            conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
             try:
                 # Eliminar réplica del DataNode fallido
                 cursor.execute("""
@@ -1373,7 +1373,7 @@ def rereplicate_to_reach_3(file_id: int, node_id_db: str = None) -> bool:
                 
                 db_path = get_db_path(node_id_db)
                 with db_lock:
-                    conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+                    conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
                     try:
                         cursor.execute("""
                             INSERT INTO file_replicas (file_id, datanode_id, replica_type)
@@ -1431,7 +1431,7 @@ def fix_missing_primary_replicas(node_id_db: str = None) -> int:
     db_path = get_db_path(node_id_db)
     
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             # Encontrar archivos que no tienen réplica "primary" activa
@@ -1522,7 +1522,7 @@ def trigger_rereplication_for_undereplicated(node_id_db: str = None, max_files: 
     
     # Obtener TODOS los archivos y contar réplicas activas reales (no usar replica_count)
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             # Obtener todos los archivos con sus réplicas activas
@@ -1585,7 +1585,7 @@ def mark_datanode_inactive(node_id: str, node_id_db: str = None) -> bool:
     db_path = get_db_path(node_id_db)
     
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             cursor.execute("""
@@ -1621,7 +1621,7 @@ def mark_datanode_draining(node_id: str, node_id_db: str = None) -> bool:
     db_path = get_db_path(node_id_db)
     
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             cursor.execute("""
@@ -1657,7 +1657,7 @@ def unmark_datanode_draining(node_id: str, node_id_db: str = None) -> bool:
     db_path = get_db_path(node_id_db)
     
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             cursor.execute("""
@@ -1746,7 +1746,7 @@ def detect_inactive_datanodes(timeout_seconds: int = 30, node_id_db: str = None)
     inactive_ids = []
     
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             # Buscar DataNodes activos sin heartbeat reciente
@@ -1846,7 +1846,7 @@ def cleanup_overreplicated_files(node_id_db: str = None) -> int:
     db_path = get_db_path(node_id_db)
     
     with db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db)
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id_db, db_type="metadata")
         
         try:
             # Encontrar archivos con más de 3 réplicas activas

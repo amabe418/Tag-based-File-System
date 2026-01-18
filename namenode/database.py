@@ -64,7 +64,7 @@ def _start_replication_thread_if_needed():
 
 def _replication_worker():
     """Worker thread que procesa la cola de replicación SQL de forma asíncrona"""
-    print("[DATABASE] Worker de replicación SQL iniciado")
+    print("[DATABASE] [REPLICATE] Worker de replicación SQL iniciado")
     while True:
         try:
             # Esperar hasta 1 segundo por un item (timeout para permitir shutdown graceful)
@@ -77,23 +77,37 @@ def _replication_worker():
             node_id = item.get('node_id')
             
             if not sql_writes:
+                print(f"[DATABASE] [REPLICATE] ⚠️ Item en cola sin escrituras SQL")
+                _sql_replication_queue.task_done()
                 continue
+            
+            print(f"[DATABASE] [REPLICATE] 🔄 Procesando {len(sql_writes)} escrituras SQL de la cola...")
+            for idx, write in enumerate(sql_writes):
+                sql_preview = write.get('sql', '')[:50]
+                db_type = write.get('db_type', 'unknown')
+                print(f"[DATABASE] [REPLICATE]   [{idx+1}/{len(sql_writes)}] SQL: {sql_preview}... (db_type={db_type})")
             
             try:
                 from namenode.namenode import replicate_sql_writes, is_leader
                 # Solo replicar si aún somos líder (puede haber cambiado)
-                if is_leader():
-                    replicate_sql_writes(sql_writes, node_id)
+                is_leader_flag = is_leader()
+                if is_leader_flag:
+                    print(f"[DATABASE] [REPLICATE] ✅ Nodo es líder, iniciando replicación...")
+                    result = replicate_sql_writes(sql_writes, node_id)
+                    if result:
+                        print(f"[DATABASE] [REPLICATE] ✅ Replicación completada exitosamente")
+                    else:
+                        print(f"[DATABASE] [REPLICATE] ⚠️ Replicación completada pero sin quorum")
                 else:
-                    print(f"[DATABASE] Saltando replicación - ya no somos líder")
+                    print(f"[DATABASE] [REPLICATE] ❌ Saltando replicación - ya no somos líder")
             except Exception as e:
-                print(f"[DATABASE] Error en worker de replicación: {e}")
+                print(f"[DATABASE] [REPLICATE] ❌ Error en worker de replicación: {e}")
                 import traceback
                 traceback.print_exc()
             
             _sql_replication_queue.task_done()
         except Exception as e:
-            print(f"[DATABASE] Error crítico en worker de replicación: {e}")
+            print(f"[DATABASE] [REPLICATE] ❌ Error crítico en worker de replicación: {e}")
             import traceback
             traceback.print_exc()
             time.sleep(0.1)  # Pequeña pausa antes de continuar
@@ -149,15 +163,22 @@ class ReplicatingConnection:
         if self._pending_writes and not self._is_replicating:
             try:
                 from namenode.namenode import is_leader
-                if is_leader():
+                is_leader_flag = is_leader()
+                if is_leader_flag:
                     # Enviar a cola para replicación asíncrona (no bloquea)
                     _start_replication_thread_if_needed()
+                    writes_to_replicate = self._pending_writes.copy()
                     _sql_replication_queue.put({
-                        'sql_writes': self._pending_writes.copy(),
+                        'sql_writes': writes_to_replicate,
                         'node_id': self._node_id
                     })
+                    print(f"[DATABASE] [REPLICATE] ✅ {len(writes_to_replicate)} escrituras SQL enviadas a cola de replicación (db_type={self._db_type if writes_to_replicate else 'N/A'})")
+                else:
+                    print(f"[DATABASE] [REPLICATE] ⚠️ {len(self._pending_writes)} escrituras NO replicadas: nodo no es líder durante commit()")
             except Exception as e:
-                print(f"[DATABASE] Error programando replicación: {e}")
+                print(f"[DATABASE] [REPLICATE] ❌ Error programando replicación: {e}")
+                import traceback
+                traceback.print_exc()
             finally:
                 self._pending_writes = []
     
@@ -179,10 +200,13 @@ class ReplicatingCursor:
     
     def execute(self, sql, params=None):
         """Ejecuta SQL y captura escrituras para replicación"""
-        # Normalizar SQL para detectar escrituras
-        sql_upper = sql.strip().upper()
+        # Normalizar SQL para detectar escrituras (eliminar espacios y saltos de línea al inicio)
+        # Reemplazar múltiples espacios/saltos de línea con un solo espacio y luego normalizar
+        sql_normalized = ' '.join(sql.strip().split())
+        sql_upper = sql_normalized.upper()
         
         # Detectar si es escritura (INSERT, UPDATE, DELETE, REPLACE)
+        # También detectar variantes como "INSERT OR REPLACE", "INSERT INTO", etc.
         is_write = any(sql_upper.startswith(cmd) for cmd in ['INSERT', 'UPDATE', 'DELETE', 'REPLACE'])
         
         # Ejecutar en BD local
@@ -196,7 +220,8 @@ class ReplicatingCursor:
             try:
                 # Verificar si somos líder (importar aquí para evitar circular imports)
                 from namenode.namenode import is_leader
-                if is_leader():
+                is_leader_flag = is_leader()
+                if is_leader_flag:
                     # Serializar parámetros para replicación
                     params_serialized = None
                     if params:
@@ -206,15 +231,21 @@ class ReplicatingCursor:
                         else:
                             params_serialized = self._serialize_param(params)
                     
-                    self._conn_wrapper._pending_writes.append({
+                    write_info = {
                         'sql': sql,
                         'params': params_serialized,
                         'db_type': self._db_type
-                    })
+                    }
+                    self._conn_wrapper._pending_writes.append(write_info)
+                    print(f"[DATABASE] [REPLICATE] ✅ Escritura capturada para replicación: {sql[:50]}... (db_type={self._db_type}, pending={len(self._conn_wrapper._pending_writes)})")
+                else:
+                    print(f"[DATABASE] [REPLICATE] ⚠️ Escritura NO capturada: nodo no es líder (SQL: {sql[:50]}...)")
             except Exception as e:
                 # Si falla la verificación de líder, continuar sin replicar
                 # (puede pasar durante inicialización)
-                pass
+                print(f"[DATABASE] [REPLICATE] ❌ Error verificando líder para replicación: {e}")
+                import traceback
+                traceback.print_exc()
         
         return result
     

@@ -24,3 +24,11 @@ Al incorporarse nuevamente al clúster el namenode viejo continúa con la inform
 
 Test 3 (Reconciliar la red luego de una partición):
 Ajustar la forma en que se reconcilian dos nodos líderes una vez unida la red nuevamente
+
+Test 4
+Crear un namenode lider y al menos un seguidor
+Tumbar un datanode
+Esperar a que el lider reconozca la inactividad del datanode
+Tumbar el lider
+Esperar a que los seguidores hagan la nueva elección
+Levantar el datanode inactivo.

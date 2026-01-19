@@ -238,6 +238,11 @@ def save_operation_to_log(operation: OperationLog, node_id: str = None):
     
     db_path = get_operations_db_path(node_id)
     
+    # 🔍 DEBUG: Log antes de guardar
+    op_type = operation.operation
+    op_name = operation.data.get('name', 'N/A') if operation.operation in ['add_file', 'delete_file'] else 'N/A'
+    print(f"[DEBUG] 💾 Guardando en log persistente: {op_type} | archivo='{op_name}' | term={operation.term} | timestamp={operation.timestamp:.2f}")
+    
     with operations_db_lock:
         # IMPORTANTE: Especificar db_type="operations" explícitamente para que la replicación SQL funcione correctamente
         conn, cursor = get_connection(db_path=db_path, node_id=node_id, db_type="operations")
@@ -253,8 +258,13 @@ def save_operation_to_log(operation: OperationLog, node_id: str = None):
                 node_id
             ))
             conn.commit()
+            
+            # 🔍 DEBUG: Confirmar guardado
+            print(f"[DEBUG] ✅ Operación guardada en BD: {op_type} | archivo='{op_name}'")
+            
         except Exception as e:
-            print(f"[ERROR] Error guardando operación en log persistente: {e}")
+            print(f"[ERROR] ❌ Error guardando operación en log persistente: {e}")
+            print(f"[DEBUG] Operación que falló: {op_type} | archivo='{op_name}' | term={operation.term}")
             conn.rollback()
         finally:
             close_connection(conn)
@@ -273,6 +283,9 @@ def load_operation_log(node_id: str = None) -> List[OperationLog]:
     
     db_path = get_operations_db_path(node_id)
     operations = []
+    
+    # 🔍 DEBUG: Log antes de cargar
+    print(f"[DEBUG] 📂 Cargando log de operaciones desde: {db_path}")
     
     with operations_db_lock:
         # IMPORTANTE: Especificar db_type="operations" explícitamente
@@ -302,6 +315,21 @@ def load_operation_log(node_id: str = None) -> List[OperationLog]:
             print(f"[ERROR] Error cargando log de operaciones: {e}")
         finally:
             close_connection(conn)
+    
+    # 🔍 DEBUG: Resumen de operaciones cargadas
+    op_counts = {}
+    for op in operations:
+        op_counts[op.operation] = op_counts.get(op.operation, 0) + 1
+    
+    print(f"[DEBUG] 📂 Log cargado: {len(operations)} operaciones | Desglose: {op_counts}")
+    
+    # 🔍 DEBUG: Mostrar operaciones de archivos (últimas 10)
+    file_ops = [op for op in operations if op.operation in ['add_file', 'delete_file']]
+    if file_ops:
+        print(f"[DEBUG] 📂 Operaciones de archivos en log ({len(file_ops)} total, mostrando últimas 10):")
+        for op in file_ops[-10:]:
+            op_name = op.data.get('name', 'N/A')
+            print(f"[DEBUG] 📂   - {op.operation}: '{op_name}' | term={op.term} | t={op.timestamp:.2f}")
     
     return operations
 
@@ -390,6 +418,9 @@ def refresh_peers_from_dns():
     """
     global cluster_state
     
+    # 🔍 DEBUG: Inicio de descubrimiento
+    print(f"[DEBUG] 🔍 ========== REFRESH PEERS FROM DNS ==========")
+    
     # Obtener IP local para filtrar
     local_ip = None
     try:
@@ -397,33 +428,56 @@ def refresh_peers_from_dns():
         s.connect(('8.8.8.8', 80))
         local_ip = s.getsockname()[0]
         s.close()
-    except Exception:
+        print(f"[DEBUG] 🔍 IP local detectada: {local_ip}")
+    except Exception as e:
+        print(f"[DEBUG] ⚠️  Error detectando IP local (método 1): {e}")
         try:
             hostname = socket.gethostname()
             local_ip = socket.gethostbyname(hostname)
-        except Exception:
+            print(f"[DEBUG] 🔍 IP local detectada (método 2): {local_ip}")
+        except Exception as e2:
+            print(f"[DEBUG] ⚠️  Error detectando IP local (método 2): {e2}")
             pass
     
     # Descubrir peers via DNS (ya viene filtrado, solo IPs)
+    print(f"[DEBUG] 🔍 Llamando discover_peers_dns()...")
     dns_peers = discover_peers_dns()
+    print(f"[DEBUG] 🔍 DNS retornó {len(dns_peers)} peers: {dns_peers}")
     
     with cluster_lock:
-        # Obtener IPs locales para filtrado final (por si acaso)
-        local_ips_set = {local_ip} if local_ip else set()
+        # Obtener identificadores locales para filtrado completo
+        current_node_id = cluster_state["node_id"]
+        
+        # Crear set con todas las variaciones del nodo local para filtrar
+        local_identifiers = {local_ip} if local_ip else set()
+        
+        # Agregar hostname y sus variaciones
         try:
             hostname = socket.gethostname()
-            local_ips_set.add(socket.gethostbyname(hostname))
+            local_identifiers.add(hostname)
+            local_identifiers.add(socket.gethostbyname(hostname))
         except Exception:
             pass
+        
+        # Agregar todas las variaciones del node_id
+        local_identifiers.add(current_node_id)
+        local_identifiers.add(f"tbfs-{current_node_id}")
+        local_identifiers.add(current_node_id.replace("tbfs-", ""))
+        if "namenode" in current_node_id:
+            local_identifiers.add(current_node_id.replace("namenode-", ""))
+            local_identifiers.add(f"namenode-{current_node_id.replace('namenode-', '')}")
         
         # Limpiar la lista actual: remover todo lo que no sea una IP válida de peers DNS
         # O mejor: reemplazar completamente con los peers descubiertos via DNS
         old_peers = cluster_state["peers"].copy()
         
-        # Filtrar peers DNS para asegurar que no incluimos la IP local
-        valid_dns_peers = [ip for ip in dns_peers if ip not in local_ips_set]
+        # Filtrar peers DNS para asegurar que NO incluimos NINGUNA variación del nodo local
+        valid_dns_peers = [ip for ip in dns_peers if ip not in local_identifiers]
         
-        # Reemplazar lista de peers con los descubiertos via DNS (solo IPs)
+        # DOBLE VERIFICACIÓN: Asegurar que el node_id actual no esté en la lista final
+        valid_dns_peers = [p for p in valid_dns_peers if p not in local_identifiers]
+        
+        # Reemplazar lista de peers con los descubiertos via DNS (solo IPs, sin este nodo)
         cluster_state["peers"] = valid_dns_peers.copy()
         
         # Inicializar estado de los nuevos peers
@@ -440,12 +494,20 @@ def refresh_peers_from_dns():
         # Log de cambios
         added = set(valid_dns_peers) - set(old_peers)
         removed = set(old_peers) - set(valid_dns_peers)
+        
+        # 🔍 DEBUG: Mostrar cambios detallados
+        print(f"[DEBUG] 🔍 Peers ANTES: {old_peers}")
+        print(f"[DEBUG] 🔍 Peers DESPUÉS: {valid_dns_peers}")
+        print(f"[DEBUG] 🔍 Agregados: {added}")
+        print(f"[DEBUG] 🔍 Removidos: {removed}")
+        
         if added:
             print(f"[NAMENODE] 🆕 Peers agregados via DNS: {sorted(added)}")
         if removed:
             print(f"[NAMENODE] 🗑️  Peers removidos (ya no en DNS o filtrados): {sorted(removed)}")
         
         print(f"[NAMENODE] 📋 Lista final de peers (solo IPs): {sorted(cluster_state['peers'])}")
+        print(f"[DEBUG] 🔍 ============================================================")
 
 
 def is_leader() -> bool:
@@ -481,12 +543,17 @@ def update_peer_status(peer_id: str, alive: bool):
                 "last_seen": 0.0,
                 "status": "unknown"
             }
+            # 🔍 DEBUG: Nuevo peer detectado
+            print(f"[DEBUG] 🆕 Nuevo peer detectado: {peer_id} (status=unknown)")
         
         peer_info = cluster_state["peer_status"][peer_id]
         previous_status = peer_info["status"]
         
         if alive:
             peer_info["last_seen"] = time.time()
+            # 🔍 DEBUG: Actualización de estado
+            print(f"[DEBUG] ✅ Peer {peer_id}: {previous_status} -> alive")
+            
             # Detectar reunificación: si el peer estaba "dead" o "suspected" y ahora está "alive"
             if previous_status in ["dead", "suspected"]:
                 print(f"[NAMENODE] 🔄 Peer {peer_id} reunificado: {previous_status} -> alive")
@@ -522,19 +589,26 @@ def trigger_reconciliation(reunited_peers: List[str]):
     Args:
         reunited_peers: Lista de peer IDs que han vuelto a estar disponibles
     """
+    # 🔍 DEBUG: Confirmar que se llamó a trigger_reconciliation
+    print(f"[DEBUG] 🔔 trigger_reconciliation() LLAMADA con peers: {reunited_peers}")
+    
     if not reunited_peers:
+        print(f"[DEBUG] ⚠️  trigger_reconciliation() - Lista de peers vacía, abortando")
         return
     
     with cluster_lock:
         if cluster_state["reconciliation_in_progress"]:
             print(f"[NAMENODE] FASE 3: Reconciliación ya en progreso, ignorando nueva detección")
+            print(f"[DEBUG] ⚠️  Reconciliación ya en progreso, abortando")
             return
         
         cluster_state["reconciliation_in_progress"] = True
+        print(f"[DEBUG] ✅ Flag reconciliation_in_progress activado")
     
     try:
         start_time = time.time()
         print(f"[NAMENODE] 🔄 ========== INICIANDO RECONCILIACIÓN ==========")
+        print(f"[DEBUG] 🚀 RECONCILIACIÓN INICIADA - Este log confirma que perform_full_reconciliation() se ejecutará")
         print(f"[NAMENODE] 🔄 Timestamp inicio: {datetime.now().isoformat()}")
         print(f"[NAMENODE] 🔄 Nodo actual: {cluster_state['node_id']}")
         print(f"[NAMENODE] 🔄 Peers reunificados: {reunited_peers}")
@@ -867,11 +941,104 @@ def apply_operation_safely(operation: OperationLog, node_id: str = None):
                     save_file_replicas(file_id, operation_data["datanode_ids"], node_id_db=NODE_ID)
         
         elif operation.operation == "delete_file":
-            delete_file_metadata(
-                operation_data["file_id"],
-                node_id=node_id,
-                term=operation.term
-            )
+            file_hash = operation_data.get("hash")  # NUEVO: Hash como identificador único
+            file_name = operation_data.get("name", "N/A")
+            file_id_to_delete = operation_data.get("file_id")
+            
+            # 🔍 DEBUG: Información de la operación de borrado
+            print(f"[DEBUG] 🗑️  Operación delete_file recibida: hash={file_hash[:16] if file_hash else 'N/A'}..., name='{file_name}', file_id={file_id_to_delete}")
+            
+            # ESTRATEGIA DE BORRADO (para evitar colisiones de file_id):
+            # 1. Si hay hash, buscar y borrar por hash (identificador único global)
+            # 2. Si no hay hash pero hay nombre, buscar por nombre
+            # 3. Como último recurso, usar file_id (puede causar inconsistencias entre particiones)
+            
+            deleted = False
+            actual_file_id = None
+            
+            if file_hash:
+                # PRIORIDAD 1: Buscar por hash (identificador único)
+                print(f"[DEBUG] 🔍 Buscando archivo por hash: {file_hash[:16]}...")
+                
+                try:
+                    from namenode.database import get_db_path, get_connection, close_connection
+                    from namenode.rw_lock import ReadLock
+                    from namenode.database import metadata_rw_lock
+                    
+                    db_path = get_db_path(node_id)
+                    
+                    with ReadLock(metadata_rw_lock):
+                        conn, cursor = get_connection(db_path=db_path, node_id=node_id)
+                        try:
+                            cursor.execute("SELECT id, name FROM files WHERE hash = ?", (file_hash,))
+                            row = cursor.fetchone()
+                            if row:
+                                actual_file_id = row[0]
+                                actual_name = row[1]
+                                print(f"[DEBUG] ✅ Archivo encontrado por hash: ID={actual_file_id}, nombre='{actual_name}'")
+                            else:
+                                print(f"[DEBUG] ⚠️  Archivo con hash {file_hash[:16]}... NO encontrado")
+                        finally:
+                            close_connection(conn)
+                
+                except Exception as e:
+                    print(f"[DEBUG] ⚠️  Error buscando por hash: {e}")
+            
+            elif file_name != "N/A":
+                # PRIORIDAD 2: Buscar por nombre (si no hay hash)
+                print(f"[DEBUG] 🔍 Buscando archivo por nombre: '{file_name}'...")
+                
+                try:
+                    from namenode.manager import query_files
+                    user_id = operation_data.get("user_id", "system")
+                    
+                    # Buscar archivos con cualquier tag del mismo usuario
+                    all_files = query_files(query_tags=[], node_id=node_id, user_id=user_id)
+                    
+                    for fid, fname, tags in all_files:
+                        if fname == file_name:
+                            actual_file_id = fid
+                            print(f"[DEBUG] ✅ Archivo encontrado por nombre: ID={actual_file_id}")
+                            break
+                    
+                    if not actual_file_id:
+                        print(f"[DEBUG] ⚠️  Archivo '{file_name}' NO encontrado por nombre")
+                
+                except Exception as e:
+                    print(f"[DEBUG] ⚠️  Error buscando por nombre: {e}")
+            
+            # PRIORIDAD 3: Usar file_id (fallback, puede ser incorrecto entre particiones)
+            if not actual_file_id:
+                actual_file_id = file_id_to_delete
+                print(f"[DEBUG] ⚠️  Usando file_id como fallback: {actual_file_id} (puede causar inconsistencias)")
+            
+            # Borrar usando el file_id correcto
+            if actual_file_id:
+                # Verificar antes de borrar
+                try:
+                    from namenode.manager import get_file_by_id
+                    file_info = get_file_by_id(actual_file_id, node_id=node_id)
+                    if file_info:
+                        print(f"[DEBUG] 🗑️  Confirmado: Borrando archivo ID={actual_file_id}, nombre='{file_info.get('name')}', hash={file_info.get('hash', 'N/A')[:16]}...")
+                    else:
+                        print(f"[DEBUG] ⚠️  Archivo ID={actual_file_id} NO existe, saltando borrado")
+                        return
+                except Exception as e:
+                    print(f"[DEBUG] ⚠️  Error verificando archivo: {e}")
+                
+                deleted = delete_file_metadata(
+                    actual_file_id,
+                    node_id=node_id,
+                    term=operation.term
+                )
+                
+                # 🔍 DEBUG: Resultado del borrado
+                if deleted:
+                    print(f"[DEBUG] ✅ Archivo ID={actual_file_id} borrado exitosamente")
+                else:
+                    print(f"[DEBUG] ⚠️  Archivo ID={actual_file_id} NO se pudo borrar (no existía)")
+            else:
+                print(f"[DEBUG] ❌ No se pudo determinar el archivo a borrar (sin hash, nombre ni file_id válido)")
         
         elif operation.operation == "delete_files_by_tags":
             delete_files_by_tags(
@@ -962,12 +1129,14 @@ def apply_operation_safely(operation: OperationLog, node_id: str = None):
 def detect_multiple_leaders(peers: List[str]) -> List[Dict]:
     """
     Detecta si hay múltiples líderes activos en el clúster.
+    Deduplica líderes basándose en el node_id reportado por el endpoint.
     
     Returns:
         Lista de diccionarios con información de líderes detectados:
         [{"node_id": str, "term": int, "timestamp": float}, ...]
     """
     leaders = []
+    leaders_by_id = {}  # Deduplicar por node_id reportado
     
     for peer in peers:
         try:
@@ -976,25 +1145,237 @@ def detect_multiple_leaders(peers: List[str]) -> List[Dict]:
             if response.status_code == 200:
                 peer_data = response.json()
                 if peer_data.get("is_leader", False):
-                    leaders.append({
-                        "node_id": peer,
-                        "term": peer_data.get("term", 0),
-                        "timestamp": time.time()
-                    })
+                    # Usar el node_id que el peer reporta, no el identificador usado para contactarlo
+                    reported_node_id = peer_data.get("node_id", peer)
+                    
+                    # 🔍 DEBUG: Mostrar qué peer y qué reporta
+                    print(f"[DEBUG] 🔍 Peer {peer} reporta: node_id='{reported_node_id}', is_leader={peer_data.get('is_leader')}, term={peer_data.get('term')}")
+                    
+                    # Deduplicar por node_id reportado
+                    if reported_node_id not in leaders_by_id:
+                        leaders_by_id[reported_node_id] = {
+                            "node_id": reported_node_id,  # Usar el ID reportado, no el peer
+                            "term": peer_data.get("term", 0),
+                            "timestamp": time.time()
+                        }
+                    else:
+                        print(f"[DEBUG] ⏭️  Líder duplicado detectado y filtrado: {reported_node_id}")
         except Exception as e:
             # Peer no responde, no es líder
             pass
     
     # También verificar si este nodo es líder
     with cluster_lock:
+        current_node_id = cluster_state["node_id"]
         if cluster_state.get("is_leader", False):
-            leaders.append({
-                "node_id": cluster_state["node_id"],
-                "term": cluster_state.get("term", 0),
-                "timestamp": time.time()
-            })
+            # Solo agregar si no está ya en la lista (deduplicación)
+            if current_node_id not in leaders_by_id:
+                leaders_by_id[current_node_id] = {
+                    "node_id": current_node_id,
+                    "term": cluster_state.get("term", 0),
+                    "timestamp": time.time()
+                }
+                print(f"[DEBUG] ✅ Este nodo agregado como líder: {current_node_id}")
+            else:
+                print(f"[DEBUG] ⏭️  Este nodo ya está en lista de líderes, no duplicar")
+    
+    # Convertir dict a lista
+    leaders = list(leaders_by_id.values())
+    
+    # 🔍 DEBUG: Mostrar líderes finales después de deduplicación
+    print(f"[DEBUG] 🔍 Líderes únicos detectados: {len(leaders)}")
+    for leader in leaders:
+        print(f"[DEBUG] 🔍   - {leader['node_id']}: term={leader['term']}")
     
     return leaders
+
+
+def calculate_operations_checksum(operations: List[OperationLog]) -> str:
+    """
+    Calcula un checksum del orden y contenido de operaciones para verificar consenso.
+    
+    Args:
+        operations: Lista ordenada de operaciones
+    
+    Returns:
+        Hash SHA256 del orden de operaciones
+    """
+    import hashlib
+    import json
+    
+    # Crear representación serializable de operaciones
+    ops_data = []
+    for op in operations:
+        ops_data.append({
+            "operation": op.operation,
+            "term": op.term,
+            "timestamp": op.timestamp,
+            "data_key": get_operation_key(op)
+        })
+    
+    # Calcular hash
+    ops_json = json.dumps(ops_data, sort_keys=True)
+    return hashlib.sha256(ops_json.encode()).hexdigest()
+
+
+def propose_operation_order(operations: List[OperationLog], peers: List[str], 
+                            coordinator_id: str, term: int) -> Dict:
+    """
+    Fase 1: PROPOSE - El coordinador propone un orden de operaciones a los peers.
+    
+    Args:
+        operations: Lista ordenada de operaciones propuestas
+        peers: Lista de peers a quienes proponer
+        coordinator_id: ID del coordinador que propone
+        term: Término de consenso
+    
+    Returns:
+        Dict con resultados de la propuesta {peer_id: {"accepted": bool, "checksum": str}}
+    """
+    print(f"[NAMENODE] 🤝 [CONSENSUS] Fase 1: PROPOSE - Proponiendo orden de {len(operations)} operaciones")
+    print(f"[DEBUG] 🔍 PROPOSE: Coordinador={coordinator_id}, Term={term}, Peers={peers}")
+    
+    # 🔍 DEBUG: Mostrar operaciones a proponer
+    print(f"[DEBUG] 📋 Operaciones a proponer ({len(operations)}):")
+    for idx, op in enumerate(operations[:20], 1):  # Primeras 20
+        op_name = op.data.get('name', 'N/A') if op.operation in ['add_file', 'delete_file'] else 'N/A'
+        print(f"[DEBUG] 📋   [{idx}] {op.operation} | '{op_name}' | term={op.term} | t={op.timestamp:.2f}")
+    if len(operations) > 20:
+        print(f"[DEBUG] 📋   ... y {len(operations) - 20} operaciones más")
+    
+    # Calcular checksum del orden propuesto
+    proposed_checksum = calculate_operations_checksum(operations)
+    print(f"[NAMENODE] 🤝 [CONSENSUS] Checksum propuesto: {proposed_checksum[:16]}...")
+    print(f"[DEBUG] 🔍 Checksum completo: {proposed_checksum}")
+    
+    # Serializar operaciones para envío
+    operations_data = []
+    for op in operations:
+        operations_data.append({
+            "operation": op.operation,
+            "data": op.data,
+            "term": op.term,
+            "timestamp": op.timestamp
+        })
+    
+    # Obtener token de servicio
+    try:
+        service_token = generate_service_token(coordinator_id, "service")
+    except Exception:
+        service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+    
+    # Proponer a cada peer
+    results = {}
+    for peer in peers:
+        try:
+            peer_url = get_peer_url(peer)
+            response = requests.post(
+                f"{peer_url}/internal/consensus-propose",
+                json={
+                    "coordinator_id": coordinator_id,
+                    "term": term,
+                    "operations": operations_data,
+                    "checksum": proposed_checksum,
+                    "operation_count": len(operations)
+                },
+                headers={"Authorization": f"Bearer {service_token}"},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                results[peer] = {
+                    "accepted": result.get("accepted", False),
+                    "checksum": result.get("checksum", ""),
+                    "message": result.get("message", "")
+                }
+                status = "✅" if result.get("accepted") else "❌"
+                print(f"[NAMENODE] 🤝 [CONSENSUS] {status} Respuesta de {peer}: {result.get('message')}")
+            else:
+                results[peer] = {"accepted": False, "error": f"HTTP {response.status_code}"}
+                print(f"[NAMENODE] 🤝 [CONSENSUS] ❌ Error de {peer}: HTTP {response.status_code}")
+        
+        except Exception as e:
+            results[peer] = {"accepted": False, "error": str(e)}
+            print(f"[NAMENODE] 🤝 [CONSENSUS] ❌ Error contactando {peer}: {e}")
+    
+    # Calcular resultado del consenso
+    accepted_count = sum(1 for r in results.values() if r.get("accepted", False))
+    total = len(peers) + 1  # +1 por el coordinador
+    quorum = (total // 2) + 1
+    
+    consensus_reached = (accepted_count + 1) >= quorum  # +1 por el coordinador
+    
+    print(f"[NAMENODE] 🤝 [CONSENSUS] Resultado PROPOSE: {accepted_count + 1}/{total} aceptaron (quorum: {quorum})")
+    print(f"[NAMENODE] 🤝 [CONSENSUS] Consenso alcanzado: {consensus_reached}")
+    
+    return {
+        "consensus_reached": consensus_reached,
+        "accepted_count": accepted_count + 1,
+        "total_nodes": total,
+        "quorum": quorum,
+        "proposed_checksum": proposed_checksum,
+        "peer_results": results
+    }
+
+
+def commit_consensus_order(peers: List[str], coordinator_id: str, 
+                           term: int, checksum: str) -> bool:
+    """
+    Fase 3: COMMIT - Notifica a los peers que el consenso fue alcanzado y deben aplicar el orden.
+    
+    Args:
+        peers: Lista de peers a notificar
+        coordinator_id: ID del coordinador
+        term: Término de consenso
+        checksum: Checksum del orden acordado
+    
+    Returns:
+        True si la mayoría confirmó la aplicación
+    """
+    print(f"[NAMENODE] 🤝 [CONSENSUS] Fase 3: COMMIT - Notificando consenso alcanzado")
+    
+    # Obtener token de servicio
+    try:
+        service_token = generate_service_token(coordinator_id, "service")
+    except Exception:
+        service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+    
+    committed_count = 0
+    for peer in peers:
+        try:
+            peer_url = get_peer_url(peer)
+            response = requests.post(
+                f"{peer_url}/internal/consensus-commit",
+                json={
+                    "coordinator_id": coordinator_id,
+                    "term": term,
+                    "checksum": checksum
+                },
+                headers={"Authorization": f"Bearer {service_token}"},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("committed", False):
+                    committed_count += 1
+                    print(f"[NAMENODE] 🤝 [CONSENSUS] ✅ {peer} confirmó commit")
+                else:
+                    print(f"[NAMENODE] 🤝 [CONSENSUS] ⚠️  {peer} no confirmó commit: {result.get('message')}")
+            else:
+                print(f"[NAMENODE] 🤝 [CONSENSUS] ❌ Error commit en {peer}: HTTP {response.status_code}")
+        
+        except Exception as e:
+            print(f"[NAMENODE] 🤝 [CONSENSUS] ❌ Error contactando {peer} para commit: {e}")
+    
+    total = len(peers) + 1
+    quorum = (total // 2) + 1
+    consensus_committed = (committed_count + 1) >= quorum
+    
+    print(f"[NAMENODE] 🤝 [CONSENSUS] Resultado COMMIT: {committed_count + 1}/{total} confirmaron (quorum: {quorum})")
+    
+    return consensus_committed
 
 
 def merge_and_order_operations(all_logs: Dict[str, List[OperationLog]]) -> List[OperationLog]:
@@ -1064,8 +1445,12 @@ def perform_full_reconciliation(reunited_peers: List[str]):
     
     # Paso 0: Detectar múltiples líderes activos
     print(f"[NAMENODE] 🔄 [PASO 0] Detectando múltiples líderes activos...")
-    all_peers_to_check = list(set(reunited_peers + [current_node_id]))
-    detected_leaders = detect_multiple_leaders(all_peers_to_check)
+    # 🔍 DEBUG: Mostrar peers a verificar
+    print(f"[DEBUG] 🔍 [PASO 0] Verificando líderes en peers reunificados: {reunited_peers}")
+    print(f"[DEBUG] 🔍 [PASO 0] Este nodo: {current_node_id}")
+    
+    # NO incluir current_node_id en la lista - la función detect_multiple_leaders ya lo verifica internamente
+    detected_leaders = detect_multiple_leaders(reunited_peers)
     
     if len(detected_leaders) > 1:
         print(f"[NAMENODE] 🔄 [PASO 0] ⚠️  MÚLTIPLES LÍDERES DETECTADOS: {len(detected_leaders)}")
@@ -1105,6 +1490,15 @@ def perform_full_reconciliation(reunited_peers: List[str]):
     print(f"[NAMENODE] 🔄 [PASO 2] ✅ Log local: {len(local_log)} operaciones totales")
     print(f"[NAMENODE] 🔄 [PASO 2]   Desglose: {op_counts_local}")
     
+    # 🔍 DEBUG: Mostrar operaciones de archivos en log local ANTES de reconciliar
+    print(f"[DEBUG] 📝 ========== LOG LOCAL ANTES DE RECONCILIACIÓN ==========")
+    file_ops_local = [op for op in local_log if op.operation in ['add_file', 'delete_file']]
+    print(f"[DEBUG] 📝 Operaciones de archivos en log local: {len(file_ops_local)}")
+    for op in file_ops_local:
+        op_name = op.data.get('name', 'N/A')
+        print(f"[DEBUG] 📝   - {op.operation}: '{op_name}' | term={op.term} | t={op.timestamp:.2f}")
+    print(f"[DEBUG] 📝 ==========================================================")
+    
     # Paso 2.5: Incluir log local en la colección de logs
     print(f"[NAMENODE] 🔄 [PASO 2.5] Incluyendo log local en fusión...")
     all_logs = peer_logs.copy()
@@ -1115,6 +1509,190 @@ def perform_full_reconciliation(reunited_peers: List[str]):
     print(f"[NAMENODE] 🔄 [PASO 3] Fusionando y ordenando operaciones de forma determinística...")
     merged_operations = merge_and_order_operations(all_logs)
     print(f"[NAMENODE] 🔄 [PASO 3] ✅ Total de operaciones únicas después de fusión: {len(merged_operations)}")
+    
+    # 🔍 DEBUG: Mostrar TODAS las operaciones fusionadas
+    print(f"[DEBUG] 📋 ========== OPERACIONES FUSIONADAS ==========")
+    for idx, op in enumerate(merged_operations, 1):
+        op_name = op.data.get('name', 'N/A') if op.operation in ['add_file', 'delete_file'] else str(op.data)[:50]
+        op_hash = op.data.get('hash', 'N/A')[:16] if op.operation in ['add_file', 'delete_file'] else 'N/A'
+        print(f"[DEBUG] 📋 [{idx}/{len(merged_operations)}] {op.operation} | archivo='{op_name}' | hash={op_hash}... | term={op.term} | t={op.timestamp:.2f}")
+    print(f"[DEBUG] 📋 ==================================================")
+    
+    # 🔍 ANÁLISIS: Detectar secuencias add→delete del mismo archivo
+    print(f"[DEBUG] 🔍 ========== ANÁLISIS DE SECUENCIAS ADD→DELETE ==========")
+    file_operations = {}  # hash → [operaciones]
+    
+    for op in merged_operations:
+        if op.operation in ['add_file', 'delete_file']:
+            op_hash = op.data.get('hash', '')
+            op_name = op.data.get('name', 'N/A')
+            
+            # Usar hash si está disponible, sino nombre
+            key = op_hash if op_hash else op_name
+            
+            if key and key != 'N/A':
+                if key not in file_operations:
+                    file_operations[key] = []
+                file_operations[key].append(op)
+    
+    # Detectar archivos con múltiples operaciones (add y delete)
+    for file_key, ops in file_operations.items():
+        if len(ops) > 1:
+            add_ops = [o for o in ops if o.operation == 'add_file']
+            delete_ops = [o for o in ops if o.operation == 'delete_file']
+            
+            if add_ops and delete_ops:
+                print(f"[DEBUG] 🔍 Secuencia ADD→DELETE detectada para: {file_key[:30]}...")
+                print(f"[DEBUG] 🔍   - {len(add_ops)} add_file: terms={[o.term for o in add_ops]}, timestamps={[f'{o.timestamp:.2f}' for o in add_ops]}")
+                print(f"[DEBUG] 🔍   - {len(delete_ops)} delete_file: terms={[o.term for o in delete_ops]}, timestamps={[f'{o.timestamp:.2f}' for o in delete_ops]}")
+                
+                # Verificar si el delete es posterior al último add
+                last_add = max(add_ops, key=lambda x: (x.term, x.timestamp))
+                last_delete = max(delete_ops, key=lambda x: (x.term, x.timestamp))
+                
+                if (last_delete.term, last_delete.timestamp) > (last_add.term, last_add.timestamp):
+                    print(f"[DEBUG] ✅ Delete es posterior al último add → Archivo será borrado finalmente")
+                else:
+                    print(f"[DEBUG] ⚠️  Add es posterior al delete → Archivo sobrevivirá (posible resurrección)")
+    
+    print(f"[DEBUG] 🔍 ============================================================")
+    
+    # Paso 3.5: CONSENSO EXPLÍCITO si hay múltiples líderes
+    if len(detected_leaders) > 1:
+        print(f"[NAMENODE] 🤝 [PASO 3.5] ========== INICIANDO PROTOCOLO DE CONSENSO ==========")
+        print(f"[NAMENODE] 🤝 [PASO 3.5] Múltiples líderes detectados, requiere consenso explícito")
+        
+        # 🔍 DEBUG: Mostrar líderes detectados
+        print(f"[DEBUG] 🔍 Líderes detectados:")
+        for leader in detected_leaders:
+            print(f"[DEBUG] 🔍   - {leader['node_id']}: term={leader['term']}, is_leader={leader.get('is_leader', 'N/A')}")
+        
+        # Determinar coordinador (líder con mayor term, o menor node_id si empate)
+        coordinator = max(detected_leaders, key=lambda x: (x['term'], -int(hashlib.md5(x['node_id'].encode()).hexdigest()[:8], 16)))
+        coordinator_id = coordinator['node_id']
+        consensus_term = coordinator['term']
+        
+        print(f"[NAMENODE] 🤝 [PASO 3.5] Coordinador seleccionado: {coordinator_id} (term: {consensus_term})")
+        print(f"[DEBUG] 🔍 Este nodo: {current_node_id}, Es coordinador: {coordinator_id == current_node_id}")
+        
+        is_coordinator = (coordinator_id == current_node_id)
+        
+        if is_coordinator:
+            print(f"[NAMENODE] 🤝 [PASO 3.5] Este nodo ES el coordinador, iniciando protocolo 3PC...")
+            
+            # Calcular checksum del orden propuesto
+            proposed_checksum = calculate_operations_checksum(merged_operations)
+            print(f"[NAMENODE] 🤝 [PASO 3.5] Checksum del orden propuesto: {proposed_checksum[:16]}...")
+            
+            # Obtener otros líderes (excluir este nodo)
+            other_leaders = [l['node_id'] for l in detected_leaders if l['node_id'] != current_node_id]
+            
+            # FASE 1: PROPOSE
+            propose_result = propose_operation_order(
+                operations=merged_operations,
+                peers=other_leaders + [p for p in reunited_peers if p not in other_leaders],  # Incluir todos los peers
+                coordinator_id=coordinator_id,
+                term=consensus_term
+            )
+            
+            if propose_result["consensus_reached"]:
+                print(f"[NAMENODE] 🤝 [PASO 3.5] ✅ CONSENSO ALCANZADO en fase PROPOSE")
+                print(f"[NAMENODE] 🤝 [PASO 3.5] Aplicando orden acordado...")
+                
+                # Guardar checksum del consenso para verificación
+                with cluster_lock:
+                    cluster_state["last_consensus_checksum"] = proposed_checksum
+                    cluster_state["last_consensus_term"] = consensus_term
+                
+                # FASE 3: COMMIT - Notificar a todos que apliquen el orden
+                commit_success = commit_consensus_order(
+                    peers=other_leaders + [p for p in reunited_peers if p not in other_leaders],
+                    coordinator_id=coordinator_id,
+                    term=consensus_term,
+                    checksum=proposed_checksum
+                )
+                
+                if commit_success:
+                    print(f"[NAMENODE] 🤝 [PASO 3.5] ✅ COMMIT confirmado por la mayoría")
+                else:
+                    print(f"[NAMENODE] 🤝 [PASO 3.5] ⚠️  WARNING: COMMIT no confirmado por todos")
+                
+            else:
+                print(f"[NAMENODE] 🤝 [PASO 3.5] ❌ CONSENSO NO ALCANZADO")
+                print(f"[NAMENODE] 🤝 [PASO 3.5] Solo {propose_result['accepted_count']}/{propose_result['total_nodes']} nodos aceptaron")
+                print(f"[NAMENODE] 🤝 [PASO 3.5] Continuando con aplicación local (sin garantía de consenso)")
+        
+        else:
+            print(f"[NAMENODE] 🤝 [PASO 3.5] Este nodo NO es el coordinador, esperando propuesta de {coordinator_id}...")
+            # Los followers esperarán la propuesta vía el endpoint /internal/consensus-propose
+            # y aplicarán las operaciones cuando reciban el COMMIT
+            
+            # IMPORTANTE: Esperar a recibir la propuesta y el commit del coordinador
+            # Timeout de 30 segundos para recibir el consenso
+            print(f"[NAMENODE] 🤝 [PASO 3.5] ⏳ Esperando PROPOSE y COMMIT del coordinador (timeout: 30s)...")
+            print(f"[DEBUG] 🔍 Coordinador: {coordinator_id}, Este nodo: {current_node_id}")
+            
+            # Calcular checksum local para comparar
+            local_checksum = calculate_operations_checksum(merged_operations)
+            print(f"[DEBUG] 🔍 Checksum local de operaciones fusionadas: {local_checksum[:16]}...")
+            
+            # Esperar hasta 30 segundos a que llegue el COMMIT
+            wait_start = time.time()
+            consensus_applied = False
+            checks_count = 0
+            
+            while (time.time() - wait_start) < 30:
+                checks_count += 1
+                elapsed = time.time() - wait_start
+                
+                # Verificar si ya se aplicó el consenso
+                with _consensus_lock:
+                    proposals_found = len(_consensus_proposals)
+                    
+                    # 🔍 DEBUG: Mostrar propuestas pendientes cada 5 segundos
+                    if checks_count % 10 == 1:  # Cada 5 segundos (0.5s * 10)
+                        print(f"[DEBUG] ⏳ Esperando consenso... ({elapsed:.1f}s) | Propuestas pendientes: {proposals_found}")
+                        if proposals_found > 0:
+                            for prop_checksum, proposal in _consensus_proposals.items():
+                                print(f"[DEBUG]    - Checksum: {prop_checksum[:16]}... | Coordinador: {proposal.get('coordinator_id')} | Aplicado: {proposal.get('applied', False)}")
+                    
+                    # Buscar si hay una propuesta con nuestro checksum local o cualquier propuesta del coordinador
+                    for prop_checksum, proposal in _consensus_proposals.items():
+                        if (proposal.get("coordinator_id") == coordinator_id and 
+                            proposal.get("term") == consensus_term and
+                            proposal.get("applied", False)):
+                            consensus_applied = True
+                            print(f"[NAMENODE] 🤝 [PASO 3.5] ✅ Consenso recibido y aplicado vía endpoint")
+                            print(f"[DEBUG] ✅ Propuesta aplicada: checksum={prop_checksum[:16]}... | ops={len(proposal.get('operations', []))}")
+                            break
+                
+                if consensus_applied:
+                    break
+                
+                # Esperar 0.5 segundos antes de verificar de nuevo
+                time.sleep(0.5)
+            
+            if not consensus_applied:
+                print(f"[NAMENODE] 🤝 [PASO 3.5] ⚠️  TIMEOUT esperando consenso del coordinador ({elapsed:.1f}s)")
+                print(f"[DEBUG] ❌ TIMEOUT: Propuestas en memoria: {len(_consensus_proposals)}")
+                with _consensus_lock:
+                    for prop_checksum, proposal in _consensus_proposals.items():
+                        print(f"[DEBUG]    - {prop_checksum[:16]}...: aplicado={proposal.get('applied', False)}")
+                print(f"[NAMENODE] 🤝 [PASO 3.5] Continuando con aplicación local (fallback)...")
+            else:
+                print(f"[NAMENODE] 🤝 [PASO 3.5] ✅ Consenso aplicado exitosamente por el coordinador")
+                print(f"[DEBUG] ✅ Recargando log para incluir operaciones del consenso...")
+                # Saltar el PASO 5 ya que las operaciones ya fueron aplicadas vía consenso
+                # Actualizar índice local para marcar todas como aplicadas
+                local_log = load_operation_log(NODE_ID)
+                print(f"[DEBUG] 📋 Log recargado: {len(local_log)} operaciones")
+                local_op_index = {}
+                for op in local_log:
+                    op_key = (op.operation, op.term, op.timestamp, get_operation_key(op))
+                    local_op_index[op_key] = op
+    
+    else:
+        print(f"[NAMENODE] 🔄 [PASO 3.5] No hay múltiples líderes, consenso no necesario")
     
     # Paso 4: Determinar líder válido (mayor term) y actualizar term si es necesario
     print(f"[NAMENODE] 🔄 [PASO 4] Determinando líder válido (mayor term)...")
@@ -1164,17 +1742,32 @@ def perform_full_reconciliation(reunited_peers: List[str]):
     # Paso 5: Aplicar operaciones fusionadas en orden determinístico
     print(f"[NAMENODE] 🔄 [PASO 5] Aplicando operaciones fusionadas en orden causal...")
     
+    # Verificar si el consenso ya fue aplicado (evitar duplicación)
+    consensus_already_applied = False
+    if len(detected_leaders) > 1:
+        with cluster_lock:
+            last_consensus_term = cluster_state.get("last_consensus_term", -1)
+        
+        # Si ya se aplicó un consenso con el mismo term, verificar si ya tenemos las operaciones
+        if last_consensus_term == consensus_term if 'consensus_term' in locals() else False:
+            print(f"[NAMENODE] 🔄 [PASO 5] ℹ️  Consenso ya aplicado previamente (term={last_consensus_term})")
+            consensus_already_applied = True
+    
     # Crear índice de operaciones locales para verificación rápida
-    local_op_index = {}
-    for op in local_log:
-        op_key = (op.operation, op.term, op.timestamp, get_operation_key(op))
-        local_op_index[op_key] = op
+    if 'local_op_index' not in locals():
+        local_op_index = {}
+        for op in local_log:
+            op_key = (op.operation, op.term, op.timestamp, get_operation_key(op))
+            local_op_index[op_key] = op
     
     applied_count = 0
     skipped_count = 0
     op_type_counts = {}
     
-    for operation in merged_operations:
+    for idx, operation in enumerate(merged_operations, 1):
+        # 🔍 DEBUG: Log de cada operación procesada
+        op_name = operation.data.get('name', 'N/A') if operation.operation in ['add_file', 'delete_file'] else 'N/A'
+        
         # Verificar si la operación ya está en local
         op_key = (operation.operation, operation.term, operation.timestamp, get_operation_key(operation))
         
@@ -1187,21 +1780,31 @@ def perform_full_reconciliation(reunited_peers: List[str]):
             
             if term_match and timestamp_match and operation_match:
                 skipped_count += 1
+                # 🔍 DEBUG: Operación saltada
+                print(f"[DEBUG] ⏭️  [{idx}/{len(merged_operations)}] SKIP {operation.operation} | archivo='{op_name}' | term={operation.term} | ya existe en local")
                 continue
         
         # Aplicar operación
-        print(f"[NAMENODE] 🔄 [PASO 5] Aplicando operación: {operation.operation} (term {operation.term}, timestamp {operation.timestamp:.2f})")
+        print(f"[NAMENODE] 🔄 [PASO 5] [{idx}/{len(merged_operations)}] Aplicando operación: {operation.operation} (term {operation.term}, timestamp {operation.timestamp:.2f})")
+        print(f"[DEBUG] ✨ [{idx}/{len(merged_operations)}] APLICAR {operation.operation} | archivo='{op_name}' | term={operation.term} | t={operation.timestamp:.2f}")
+        
         apply_operation_safely(operation, NODE_ID)
+        
         # Guardar operación aplicada en el log persistente
         save_operation_to_log(operation, NODE_ID)
+        
         # Agregar al log en memoria
         with log_lock:
             operation_log.append(operation)
+        
         applied_count += 1
         op_type_counts[operation.operation] = op_type_counts.get(operation.operation, 0) + 1
         
         # Actualizar índice local
         local_op_index[op_key] = operation
+        
+        # 🔍 DEBUG: Confirmación
+        print(f"[DEBUG] ✅ [{idx}/{len(merged_operations)}] Aplicada y guardada: {operation.operation} | archivo='{op_name}'")
     
     print(f"[NAMENODE] 🔄 [PASO 5] ✅ Resumen aplicación de operaciones:")
     print(f"[NAMENODE] 🔄 [PASO 5]   - Operaciones aplicadas: {applied_count}")
@@ -1445,11 +2048,271 @@ def perform_full_reconciliation(reunited_peers: List[str]):
     print(f"[NAMENODE] 🔄 [PASO 9] ✅ Sincronización de term completada: {synced_count} exitosos, {failed_count} con problemas")
     print(f"[NAMENODE] 🔄 [PASO 9] Term final: {final_term} (debe ser el mismo en todos los namenodes después de heartbeats)")
     
+    # PASO 10: Fusionar y sincronizar tabla datanodes desde todos los peers
+    print(f"[NAMENODE] 🔄 [PASO 10] Fusionando y sincronizando tabla datanodes desde todos los peers...")
+    
+    with cluster_lock:
+        is_leader_now = cluster_state["is_leader"]
+    
+    # PRIMERO: Recolectar tablas de datanodes de TODOS los peers (incluyendo este nodo)
+    print(f"[NAMENODE] 🔄 [PASO 10.1] Recolectando tablas de datanodes de todos los peers...")
+    
+    all_datanodes_by_peer = {}
+    
+    # Obtener datanodes locales
+    try:
+        db_path = get_db_path(NODE_ID)
+        from namenode.rw_lock import ReadLock
+        from namenode.database import metadata_rw_lock
+        
+        local_datanodes = []
+        with ReadLock(metadata_rw_lock):
+            conn, cursor = get_connection(db_path=db_path, node_id=NODE_ID)
+            try:
+                cursor.execute("""
+                    SELECT node_id, url, port, ip, total_space, free_space, 
+                           last_heartbeat, status, registered_at, draining
+                    FROM datanodes
+                """)
+                for row in cursor.fetchall():
+                    local_datanodes.append({
+                        "node_id": row[0],
+                        "url": row[1],
+                        "port": row[2],
+                        "ip": row[3],
+                        "total_space": row[4],
+                        "free_space": row[5],
+                        "last_heartbeat": row[6],
+                        "status": row[7],
+                        "registered_at": row[8],
+                        "draining": bool(row[9]) if row[9] is not None else False
+                    })
+            finally:
+                close_connection(conn)
+        
+        all_datanodes_by_peer[current_node_id] = local_datanodes
+        print(f"[NAMENODE] 🔄 [PASO 10.1] Datanodes locales: {len(local_datanodes)}")
+    except Exception as e:
+        print(f"[NAMENODE] ⚠️  [PASO 10.1] Error obteniendo datanodes locales: {e}")
+        all_datanodes_by_peer[current_node_id] = []
+    
+    # Obtener datanodes de cada peer reunificado
+    try:
+        service_token = generate_service_token(current_node_id, "service")
+    except Exception:
+        service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+    
+    for peer in reunited_peers:
+        try:
+            peer_url = get_peer_url(peer)
+            response = requests.get(
+                f"{peer_url}/internal/get-datanodes",
+                headers={"Authorization": f"Bearer {service_token}"},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                peer_datanodes = response.json().get("datanodes", [])
+                all_datanodes_by_peer[peer] = peer_datanodes
+                print(f"[NAMENODE] 🔄 [PASO 10.1] Datanodes de {peer}: {len(peer_datanodes)}")
+            else:
+                print(f"[NAMENODE] ⚠️  [PASO 10.1] Error obteniendo datanodes de {peer}: HTTP {response.status_code}")
+                all_datanodes_by_peer[peer] = []
+        except Exception as e:
+            print(f"[NAMENODE] ⚠️  [PASO 10.1] Error obteniendo datanodes de {peer}: {e}")
+            all_datanodes_by_peer[peer] = []
+    
+    # SEGUNDO: Fusionar tablas de datanodes (tomar la versión más reciente de cada datanode)
+    print(f"[NAMENODE] 🔄 [PASO 10.2] Fusionando tablas de datanodes...")
+    
+    merged_datanodes = {}
+    for peer_id, peer_datanodes in all_datanodes_by_peer.items():
+        for datanode in peer_datanodes:
+            dn_id = datanode["node_id"]
+            dn_last_heartbeat = datanode.get("last_heartbeat", 0)
+            
+            # Si el datanode no existe en merged o tiene heartbeat más reciente, actualizar
+            if dn_id not in merged_datanodes:
+                merged_datanodes[dn_id] = datanode
+                print(f"[NAMENODE] 🔄 [PASO 10.2] Agregado datanode {dn_id} desde {peer_id} (heartbeat={dn_last_heartbeat})")
+            else:
+                existing_heartbeat = merged_datanodes[dn_id].get("last_heartbeat", 0)
+                if dn_last_heartbeat > existing_heartbeat:
+                    old_status = merged_datanodes[dn_id].get("status", "unknown")
+                    new_status = datanode.get("status", "unknown")
+                    merged_datanodes[dn_id] = datanode
+                    print(f"[NAMENODE] 🔄 [PASO 10.2] Actualizado datanode {dn_id} desde {peer_id} (heartbeat {existing_heartbeat} -> {dn_last_heartbeat}, status {old_status} -> {new_status})")
+    
+    final_datanodes = list(merged_datanodes.values())
+    print(f"[NAMENODE] 🔄 [PASO 10.2] ✅ Tabla fusionada: {len(final_datanodes)} datanodes")
+    
+    # Log de datanodes por estado
+    active_count = sum(1 for dn in final_datanodes if dn.get("status") == "active")
+    inactive_count = sum(1 for dn in final_datanodes if dn.get("status") == "inactive")
+    print(f"[NAMENODE] 🔄 [PASO 10.2]   - Activos: {active_count}, Inactivos: {inactive_count}")
+    
+    # TERCERO: Aplicar tabla fusionada localmente
+    print(f"[NAMENODE] 🔄 [PASO 10.3] Aplicando tabla fusionada localmente...")
+    
+    try:
+        db_path = get_db_path(NODE_ID)
+        
+        with db_lock:
+            conn, cursor = get_connection(db_path=db_path, node_id=NODE_ID)
+            
+            try:
+                conn._is_replicating = True
+                
+                # Limpiar y reemplazar con tabla fusionada
+                cursor.execute("DELETE FROM datanodes")
+                
+                if final_datanodes:
+                    insert_values = []
+                    for datanode in final_datanodes:
+                        insert_values.append((
+                            datanode["node_id"],
+                            datanode["url"],
+                            datanode["port"],
+                            datanode.get("ip"),
+                            datanode["total_space"],
+                            datanode["free_space"],
+                            datanode.get("last_heartbeat"),
+                            datanode["status"],
+                            1 if datanode.get("draining") else 0,
+                            datanode.get("registered_at")
+                        ))
+                    
+                    cursor.executemany("""
+                        INSERT INTO datanodes 
+                        (node_id, url, port, ip, total_space, free_space, 
+                         last_heartbeat, status, draining, registered_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, insert_values)
+                
+                conn.commit()
+                print(f"[NAMENODE] 🔄 [PASO 10.3] ✅ Tabla fusionada aplicada localmente: {len(final_datanodes)} datanodes")
+            except Exception as e:
+                conn.rollback()
+                print(f"[NAMENODE] ❌ [PASO 10.3] Error aplicando tabla fusionada: {e}")
+            finally:
+                close_connection(conn)
+        
+        # Invalidar cache
+        try:
+            from namenode.datanode_cache import get_datanode_cache
+            cache = get_datanode_cache(node_id_db=NODE_ID)
+            cache.invalidate()
+            print(f"[NAMENODE] 🔄 [PASO 10.3] ✅ Cache de datanodes invalidado")
+        except Exception as cache_error:
+            print(f"[NAMENODE] ⚠️  [PASO 10.3] Error invalidando cache: {cache_error}")
+    
+    except Exception as e:
+        print(f"[NAMENODE] ❌ [PASO 10.3] Error en aplicación local: {e}")
+    
+    # CUARTO: Si somos el líder, sincronizar tabla fusionada a todos los peers
+    print(f"[NAMENODE] 🔄 [PASO 10.4] Sincronizando tabla fusionada a todos los peers...")
+    
+    if is_leader_now:
+        try:
+            # Ejecutar sincronización en background para no bloquear la reconciliación
+            def sync_merged_table():
+                try:
+                    # Esperar 2 segundos para que los peers terminen su reconciliación
+                    time.sleep(2)
+                    
+                    # Enviar tabla fusionada a cada peer reunificado
+                    with cluster_lock:
+                        term = cluster_state["term"]
+                        leader_id = cluster_state["node_id"]
+                    
+                    try:
+                        service_token = generate_service_token(leader_id, "service")
+                    except Exception:
+                        service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+                    
+                    sync_count = 0
+                    for peer in reunited_peers:
+                        try:
+                            peer_url = get_peer_url(peer)
+                            response = requests.post(
+                                f"{peer_url}/internal/sync-datanodes",
+                                json={
+                                    "datanodes": final_datanodes,  # Usar tabla fusionada
+                                    "term": term,
+                                    "leader_id": leader_id,
+                                    "timestamp": time.time()
+                                },
+                                headers={"Authorization": f"Bearer {service_token}"},
+                                timeout=10
+                            )
+                            
+                            if response.status_code == 200:
+                                sync_count += 1
+                                print(f"[NAMENODE] ✅ [PASO 10.4] Tabla fusionada sincronizada a {peer}")
+                            else:
+                                print(f"[NAMENODE] ⚠️  [PASO 10.4] Error sincronizando a {peer}: HTTP {response.status_code}")
+                        except Exception as e:
+                            print(f"[NAMENODE] ⚠️  [PASO 10.4] Error sincronizando a {peer}: {e}")
+                    
+                    print(f"[NAMENODE] 🔄 [PASO 10.4] ✅ Sincronización completada: {sync_count}/{len(reunited_peers)} peers")
+                
+                except Exception as e:
+                    print(f"[NAMENODE] ❌ [PASO 10.4] Error en sincronización: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Ejecutar en background
+            sync_thread = threading.Thread(target=sync_merged_table, daemon=True, name="merged-table-sync")
+            sync_thread.start()
+            print(f"[NAMENODE] 🔄 [PASO 10.4] Líder sincronizando tabla fusionada en background...")
+            
+        except Exception as e:
+            print(f"[NAMENODE] ⚠️  [PASO 10.4] Error iniciando sincronización: {e}")
+    else:
+        print(f"[NAMENODE] 🔄 [PASO 10.4] Este nodo NO es líder, tabla fusionada ya aplicada localmente")
+    
     # Estadísticas finales
     final_log = load_operation_log(NODE_ID)
     final_op_counts = {}
     for op in final_log:
         final_op_counts[op.operation] = final_op_counts.get(op.operation, 0) + 1
+    
+    # 🔍 DEBUG: Listar todos los archivos en la BD después de reconciliación
+    print(f"[DEBUG] 📊 ========== ESTADO FINAL DE ARCHIVOS EN BD ==========")
+    try:
+        from namenode.database import get_db_path, get_connection, close_connection, db_lock
+        from namenode.rw_lock import ReadLock
+        from namenode.database import metadata_rw_lock
+        
+        db_path = get_db_path(NODE_ID)
+        
+        with ReadLock(metadata_rw_lock):
+            conn, cursor = get_connection(db_path=db_path, node_id=NODE_ID)
+            try:
+                cursor.execute("SELECT id, name, hash, size, user_id FROM files ORDER BY id")
+                files = cursor.fetchall()
+                
+                print(f"[DEBUG] 📊 Total archivos en BD: {len(files)}")
+                for file_row in files:
+                    file_id, name, hash_val, size, user_id = file_row
+                    print(f"[DEBUG] 📊   - [ID={file_id}] '{name}' | hash={hash_val[:16] if hash_val else 'N/A'}... | size={size} | user={user_id}")
+                
+                if len(files) == 0:
+                    print(f"[DEBUG] 📊 ⚠️  ¡TABLA DE ARCHIVOS VACÍA!")
+            finally:
+                close_connection(conn)
+    except Exception as e:
+        print(f"[DEBUG] 📊 ❌ Error listando archivos: {e}")
+    print(f"[DEBUG] 📊 ====================================================")
+    
+    # 🔍 DEBUG: Mostrar operaciones de archivos en el log final
+    file_ops_final = [op for op in final_log if op.operation in ['add_file', 'delete_file']]
+    print(f"[DEBUG] 📝 ========== OPERACIONES DE ARCHIVOS EN LOG FINAL ==========")
+    print(f"[DEBUG] 📝 Total operaciones de archivos en log: {len(file_ops_final)}")
+    for op in file_ops_final:
+        op_name = op.data.get('name', 'N/A')
+        print(f"[DEBUG] 📝   - {op.operation}: '{op_name}' | term={op.term} | t={op.timestamp:.2f}")
+    print(f"[DEBUG] 📝 ============================================================")
     
     elapsed_time = time.time() - reconciliation_start
     print(f"[NAMENODE] 🔄 ========== RECONCILIACIÓN COMPLETA - FINALIZADA ==========")
@@ -2058,13 +2921,116 @@ def update_active_followers_from_dns():
         print(f"[NAMENODE] 🔍 [FOLLOWER_TRACKING] 📋 Lista actualizada: {len(verified_active_followers)}/{len(peers)} seguidores activos: {sorted(verified_active_followers)}")
 
 
+def sync_datanodes_to_followers():
+    """
+    Sincroniza la tabla completa de datanodes del líder con los seguidores.
+    Se ejecuta periódicamente desde el líder para asegurar consistencia.
+    """
+    if not is_leader():
+        return
+    
+    try:
+        # Obtener todos los datanodes del líder (solo lectura, rápido)
+        db_path = get_db_path(NODE_ID)
+        
+        # Usar solo read lock para lectura, liberar rápidamente
+        from namenode.rw_lock import ReadLock
+        from namenode.database import metadata_rw_lock
+        
+        datanodes = []
+        with ReadLock(metadata_rw_lock):
+            conn, cursor = get_connection(db_path=db_path, node_id=NODE_ID)
+            
+            try:
+                cursor.execute("""
+                    SELECT node_id, url, port, ip, total_space, free_space, 
+                           last_heartbeat, status, registered_at, draining
+                    FROM datanodes
+                """)
+                
+                for row in cursor.fetchall():
+                    datanodes.append({
+                        "node_id": row[0],
+                        "url": row[1],
+                        "port": row[2],
+                        "ip": row[3],
+                        "total_space": row[4],
+                        "free_space": row[5],
+                        "last_heartbeat": row[6],
+                        "status": row[7],
+                        "registered_at": row[8],
+                        "draining": bool(row[9]) if row[9] is not None else False
+                    })
+            finally:
+                close_connection(conn)
+        
+        if not datanodes:
+            print(f"[NAMENODE] 🔄 [SYNC_DATANODES] No hay datanodes para sincronizar")
+            return
+        
+        print(f"[NAMENODE] 🔄 [SYNC_DATANODES] Sincronizando {len(datanodes)} datanodes a seguidores")
+        
+        # Obtener lista de seguidores activos
+        with cluster_lock:
+            leader_id = cluster_state["node_id"]
+            active_followers = cluster_state.get("active_followers", [])
+            term = cluster_state["term"]
+        
+        if not active_followers:
+            print(f"[NAMENODE] 🔄 [SYNC_DATANODES] No hay seguidores activos para sincronizar")
+            return
+        
+        # Obtener token de servicio
+        try:
+            service_token = generate_service_token(leader_id, "service")
+        except Exception:
+            service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+        
+        # Enviar snapshot a cada seguidor activo
+        success_count = 0
+        for follower in active_followers:
+            try:
+                follower_url = get_peer_url(follower)
+                response = requests.post(
+                    f"{follower_url}/internal/sync-datanodes",
+                    json={
+                        "datanodes": datanodes,
+                        "term": term,
+                        "leader_id": leader_id,
+                        "timestamp": time.time()
+                    },
+                    headers={"Authorization": f"Bearer {service_token}"},
+                    timeout=10
+                )
+                
+                if response.status_code == 200:
+                    success_count += 1
+                    print(f"[NAMENODE] ✅ [SYNC_DATANODES] Tabla datanodes sincronizada a {follower}")
+                else:
+                    print(f"[NAMENODE] ⚠️  [SYNC_DATANODES] Error sincronizando a {follower}: HTTP {response.status_code}")
+            except Exception as e:
+                print(f"[NAMENODE] ⚠️  [SYNC_DATANODES] Error sincronizando a {follower}: {e}")
+        
+        print(f"[NAMENODE] 🔄 [SYNC_DATANODES] Sincronización completada: {success_count}/{len(active_followers)} seguidores actualizados")
+        
+    except Exception as e:
+        print(f"[NAMENODE] ❌ [SYNC_DATANODES] Error en sincronización: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 def leader_heartbeat_loop():
     """
     Loop que envía heartbeats a los seguidores y mantiene actualizada la lista de seguidores activos.
     También verifica periódicamente los seguidores vía DNS para asegurar que la lista esté actualizada.
+    Detecta y reconcilia múltiples líderes automáticamente.
     """
     follower_check_counter = 0
+    datanode_sync_counter = 0
+    multi_leader_check_counter = 0
     FOLLOWER_CHECK_INTERVAL = 6  # Verificar seguidores vía DNS cada 6 ciclos (~30 segundos)
+    DATANODE_SYNC_INTERVAL = 12  # Sincronizar datanodes cada 12 ciclos (~60 segundos)
+    MULTI_LEADER_CHECK_INTERVAL = 6  # Verificar múltiples líderes cada 6 ciclos (~30 segundos)
     
     while True:
         time.sleep(LEADER_HEARTBEAT_INTERVAL)
@@ -2072,11 +3038,93 @@ def leader_heartbeat_loop():
         if not is_leader():
             continue
         
+        # 🔍 DEBUG: Verificar periódicamente si hay múltiples líderes activos
+        multi_leader_check_counter += 1
+        if multi_leader_check_counter >= MULTI_LEADER_CHECK_INTERVAL:
+            multi_leader_check_counter = 0
+            
+            # Obtener todos los peers conocidos
+            with cluster_lock:
+                all_peers = cluster_state["peers"].copy()
+                current_node_id = cluster_state["node_id"]
+                current_is_leader = cluster_state["is_leader"]
+            
+            # 🔍 DEBUG: Mostrar estado actual del líder
+            print(f"[DEBUG] 👑 ========== VERIFICACIÓN DE MÚLTIPLES LÍDERES ==========")
+            print(f"[DEBUG] 👑 Este nodo: {current_node_id}, Es líder: {current_is_leader}")
+            print(f"[DEBUG] 👑 Peers conocidos ({len(all_peers)}): {all_peers}")
+            print(f"[DEBUG] 👑 ============================================================")
+            
+            if not all_peers:
+                print(f"[DEBUG] ⚠️  No hay peers conocidos, saltando verificación de múltiples líderes")
+                print(f"[DEBUG] 💡 Ejecutando discover_peers_dns() para actualizar lista...")
+                refresh_peers_from_dns()
+                with cluster_lock:
+                    all_peers = cluster_state["peers"].copy()
+                print(f"[DEBUG] 📋 Peers después de DNS: {all_peers}")
+            
+            # Detectar múltiples líderes (solo verificar peers, no incluir este nodo en la lista)
+            # La función detect_multiple_leaders ya agrega este nodo internamente si es líder
+            print(f"[DEBUG] 🔍 Llamando detect_multiple_leaders con peers: {all_peers}")
+            detected_leaders = detect_multiple_leaders(all_peers)
+            
+            print(f"[DEBUG] 🔍 Resultado: {len(detected_leaders)} líder(es) detectado(s)")
+            
+            if len(detected_leaders) > 1:
+                print(f"[DEBUG] 🚨 ========== MÚLTIPLES LÍDERES DETECTADOS ==========")
+                print(f"[DEBUG] 🚨 Se detectaron {len(detected_leaders)} líderes activos:")
+                for leader in detected_leaders:
+                    print(f"[DEBUG] 🚨   - {leader['node_id']}: term={leader['term']}")
+                print(f"[DEBUG] 🚨 Disparando reconciliación automática...")
+                print(f"[DEBUG] 🚨 ====================================================")
+                
+                # Disparar reconciliación con todos los líderes detectados
+                other_leaders = [l['node_id'] for l in detected_leaders if l['node_id'] != current_node_id]
+                print(f"[DEBUG] 🚨 Otros líderes para reconciliar: {other_leaders}")
+                
+                if other_leaders:
+                    with cluster_lock:
+                        if not cluster_state["reconciliation_in_progress"]:
+                            print(f"[DEBUG] 🚀 Iniciando thread de reconciliación...")
+                            threading.Thread(
+                                target=trigger_reconciliation, 
+                                args=(other_leaders,), 
+                                daemon=True
+                            ).start()
+                        else:
+                            print(f"[DEBUG] ⚠️  Reconciliación ya en progreso, no iniciar otra")
+                else:
+                    print(f"[DEBUG] ⚠️  Lista de otros líderes vacía, no iniciar reconciliación")
+            elif len(detected_leaders) == 1:
+                print(f"[DEBUG] ✅ Un solo líder en el cluster: {detected_leaders[0]['node_id']}")
+            else:
+                print(f"[DEBUG] ⚠️  No se detectaron líderes (esto no debería pasar si este nodo es líder)")
+        
         # Verificar seguidores activos vía DNS periódicamente (cada ~30 segundos)
         follower_check_counter += 1
         if follower_check_counter >= FOLLOWER_CHECK_INTERVAL:
             follower_check_counter = 0
             update_active_followers_from_dns()
+        
+        # Sincronizar tabla datanodes periódicamente (cada ~60 segundos)
+        # Ejecutar en thread separado para no bloquear heartbeats
+        datanode_sync_counter += 1
+        if datanode_sync_counter >= DATANODE_SYNC_INTERVAL:
+            datanode_sync_counter = 0
+            try:
+                # Ejecutar en background para no bloquear heartbeats
+                def sync_in_background():
+                    try:
+                        sync_datanodes_to_followers()
+                    except Exception as e:
+                        print(f"[NAMENODE] ⚠️  [SYNC_DATANODES] Error en sincronización background: {e}")
+                        import traceback
+                        traceback.print_exc()
+                
+                sync_thread = threading.Thread(target=sync_in_background, daemon=True, name="datanode-sync")
+                sync_thread.start()
+            except Exception as e:
+                print(f"[NAMENODE] ⚠️  [HEARTBEAT] Error iniciando sincronización de datanodes: {e}")
         
         # Enviar heartbeat para mantener el liderazgo
         with cluster_lock:
@@ -2085,12 +3133,25 @@ def leader_heartbeat_loop():
             # Usar la lista de seguidores activos actualizada (si está disponible)
             # Si no está actualizada, usar todos los peers
             active_followers_from_state = cluster_state.get("active_followers", [])
-            all_peers = [p for p in cluster_state["peers"] if p != leader_id]
+            
+            # Crear set con todas las variaciones del líder para filtrar
+            leader_variations = {
+                leader_id,
+                f"tbfs-{leader_id}",
+                leader_id.replace("tbfs-", ""),
+                leader_id.replace("namenode-", ""),
+                f"namenode-{leader_id.replace('namenode-', '')}" if "namenode" in leader_id else leader_id
+            }
+            
+            # Filtrar el líder de la lista de peers (todas las variaciones)
+            all_peers = [p for p in cluster_state["peers"] if p not in leader_variations]
             
             # Priorizar verificar seguidores que están marcados como activos
             # Pero también intentar con todos los peers por si alguno se recuperó
             peers_to_check = list(set(active_followers_from_state + all_peers))
-            peers = [p for p in peers_to_check if p != leader_id]
+            peers = [p for p in peers_to_check if p not in leader_variations]
+            
+            # all_known_peers es lo que se envía a los followers - debe excluir al líder
             all_known_peers = peers.copy()
         
         # Obtener token de servicio para autenticación
@@ -2155,12 +3216,98 @@ def leader_heartbeat_loop():
             except Exception:
                 update_peer_status(peer, False)
         
+        # Detectar nuevos seguidores antes de actualizar el estado
+        with cluster_lock:
+            previous_active_followers = set(cluster_state.get("active_followers", []))
+        
+        new_followers = set(active_followers) - previous_active_followers
+        
         # Actualizar lista de seguidores activos en el estado del cluster
         with cluster_lock:
             cluster_state["last_heartbeat_time"] = time.time()
             # Combinar seguidores activos verificados vía heartbeat con los del estado anterior
             # Mantener solo los que respondieron exitosamente
             cluster_state["active_followers"] = active_followers.copy()
+        
+        # Sincronizar inmediatamente a nuevos seguidores
+        if new_followers:
+            print(f"[NAMENODE] 🆕 [HEARTBEAT] Nuevos seguidores detectados: {sorted(new_followers)}")
+            print(f"[NAMENODE] 🔄 [HEARTBEAT] Sincronizando tabla datanodes inmediatamente a nuevos seguidores...")
+            
+            # Sincronizar solo a los nuevos seguidores (en background para no bloquear)
+            def sync_new_followers():
+                try:
+                    # Obtener datanodes del líder
+                    db_path = get_db_path(NODE_ID)
+                    from namenode.database import get_connection, close_connection
+                    from namenode.rw_lock import ReadLock
+                    from namenode.database import metadata_rw_lock
+                    
+                    datanodes = []
+                    with ReadLock(metadata_rw_lock):
+                        conn, cursor = get_connection(db_path=db_path, node_id=NODE_ID)
+                        try:
+                            cursor.execute("""
+                                SELECT node_id, url, port, ip, total_space, free_space, 
+                                       last_heartbeat, status, registered_at, draining
+                                FROM datanodes
+                            """)
+                            for row in cursor.fetchall():
+                                datanodes.append({
+                                    "node_id": row[0],
+                                    "url": row[1],
+                                    "port": row[2],
+                                    "ip": row[3],
+                                    "total_space": row[4],
+                                    "free_space": row[5],
+                                    "last_heartbeat": row[6],
+                                    "status": row[7],
+                                    "registered_at": row[8],
+                                    "draining": bool(row[9]) if row[9] is not None else False
+                                })
+                        finally:
+                            close_connection(conn)
+                    
+                    # Enviar a cada nuevo seguidor
+                    with cluster_lock:
+                        term = cluster_state["term"]
+                        leader_id = cluster_state["node_id"]
+                    
+                    try:
+                        service_token = generate_service_token(leader_id, "service")
+                    except Exception:
+                        service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+                    
+                    for follower in new_followers:
+                        try:
+                            follower_url = get_peer_url(follower)
+                            response = requests.post(
+                                f"{follower_url}/internal/sync-datanodes",
+                                json={
+                                    "datanodes": datanodes,
+                                    "term": term,
+                                    "leader_id": leader_id,
+                                    "timestamp": time.time()
+                                },
+                                headers={"Authorization": f"Bearer {service_token}"},
+                                timeout=10
+                            )
+                            
+                            if response.status_code == 200:
+                                print(f"[NAMENODE] ✅ [HEARTBEAT] Tabla datanodes sincronizada a nuevo seguidor {follower}")
+                            else:
+                                print(f"[NAMENODE] ⚠️  [HEARTBEAT] Error sincronizando a nuevo seguidor {follower}: HTTP {response.status_code}")
+                        except Exception as e:
+                            print(f"[NAMENODE] ⚠️  [HEARTBEAT] Error sincronizando a nuevo seguidor {follower}: {e}")
+                
+                except Exception as e:
+                    print(f"[NAMENODE] ❌ [HEARTBEAT] Error en sincronización de nuevos seguidores: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Ejecutar en background
+            sync_thread = threading.Thread(target=sync_new_followers, daemon=True, name="new-follower-sync")
+            sync_thread.start()
         
         # Log del estado de seguidores
         with cluster_lock:
@@ -2532,13 +3679,19 @@ def follower_heartbeat_check():
         
         # Verificar si el líder responde directamente
         print(f"[NAMENODE] 🔍 [FOLLOWER] Verificando líder {leader_id} (último heartbeat hace {time_since_heartbeat:.1f}s)...")
+        print(f"[DEBUG] 🔍 [FOLLOWER] Intentando contactar líder: {leader_id}")
         leader_responding = False
         
         try:
             leader_url = get_peer_url(leader_id)
+            print(f"[DEBUG] 🔍 [FOLLOWER] URL del líder: {leader_url}")
             response = requests.get(f"{leader_url}/", timeout=3)
+            print(f"[DEBUG] 🔍 [FOLLOWER] Respuesta del líder: HTTP {response.status_code}")
+            
             if response.status_code == 200:
                 data = response.json()
+                print(f"[DEBUG] 🔍 [FOLLOWER] Data del líder: is_leader={data.get('is_leader')}, term={data.get('term')}")
+                
                 if data.get("is_leader"):
                     # El líder está vivo, actualizar timestamp
                     with cluster_lock:
@@ -2547,8 +3700,10 @@ def follower_heartbeat_check():
                     leader_responding = True
                 else:
                     print(f"[NAMENODE] ⚠️  [FOLLOWER] Líder {leader_id} reportado pero no es líder activo")
+                    print(f"[DEBUG] 🚨 [FOLLOWER] ¡Líder reporta NO ser líder! Posible split-brain")
         except Exception as e:
             print(f"[NAMENODE] ⚠️  [FOLLOWER] Líder {leader_id} no responde: {e}")
+            print(f"[DEBUG] ❌ [FOLLOWER] Error contactando líder: {type(e).__name__}: {e}")
         
         # Si el líder no responde Y ha pasado LEADER_TIMEOUT, iniciar elección
         if not leader_responding:
@@ -3204,9 +4359,11 @@ def register_datanode_endpoint(
     leader_url = get_leader_url()
     if leader_url:
         try:
+            # IMPORTANTE: Pasar el header de Authorization al líder
             response = requests.post(
                 f"{leader_url}/datanodes/register",
                 json=registration.dict(),
+                headers={"Authorization": authorization},  # Pasar el token al líder
                 timeout=5
             )
             return response.json()
@@ -3290,9 +4447,11 @@ def datanode_heartbeat_endpoint(
     leader_url = get_leader_url()
     if leader_url:
         try:
+            # IMPORTANTE: Pasar el header de Authorization al líder
             response = requests.post(
                 f"{leader_url}/datanodes/{node_id}/heartbeat",
                 json=heartbeat.dict(),
+                headers={"Authorization": authorization},  # Pasar el token al líder
                 timeout=5
             )
             return response.json()
@@ -3632,8 +4791,14 @@ async def add_file_compat(
     with log_lock:
         operation_log.append(operation)
     
+    # 🔍 DEBUG: Operación creada
+    print(f"[DEBUG] 📝 Operación creada: add_file | archivo='{file.filename}' | term={operation.term} | t={operation.timestamp:.2f}")
+    
     # Guardar en log persistente (Fase 2)
     save_operation_to_log(operation, NODE_ID)
+    
+    # 🔍 DEBUG: Confirmar guardado
+    print(f"[DEBUG] ✅ Operación add_file guardada en log para '{file.filename}'")
     
     replicate_to_peers(operation)
     
@@ -4099,7 +5264,14 @@ def finalize_chunked_upload(
     with log_lock:
         operation_log.append(operation)
     
+    # 🔍 DEBUG: Operación creada (chunked upload)
+    print(f"[DEBUG] 📝 Operación creada (chunked): add_file | archivo='{filename}' | term={operation.term} | t={operation.timestamp:.2f}")
+    
     save_operation_to_log(operation, NODE_ID)
+    
+    # 🔍 DEBUG: Confirmar guardado
+    print(f"[DEBUG] ✅ Operación add_file guardada en log para '{filename}' (chunked upload)")
+    
     replicate_to_peers(operation)
     
     # Limpiar upload de la lista activa
@@ -4255,13 +5427,26 @@ def delete_file_by_id(
     deleted = delete_file_metadata(file_id, node_id=NODE_ID, user_id=current_user.username, term=current_term)
     
     if deleted:
+        # CRÍTICO: Usar hash como identificador único para evitar colisiones de file_id entre particiones
+        file_hash = file_info.get("hash", "")
+        file_name = file_info.get("name", "N/A")
+        
         operation = OperationLog(
             operation="delete_file",
-            data={"file_id": file_id, "user_id": current_user.username},
+            data={
+                "file_id": file_id,  # Mantener para compatibilidad local
+                "hash": file_hash,   # NUEVO: Identificador único global
+                "name": file_name,   # Para debugging y búsqueda alternativa
+                "user_id": current_user.username
+            },
             term=cluster_state["term"],
             timestamp=time.time()
         )
-        with cluster_lock:
+        
+        # 🔍 DEBUG: Operación delete creada
+        print(f"[DEBUG] 🗑️  Operación delete_file creada: ID={file_id}, nombre='{file_name}', hash={file_hash[:16] if file_hash else 'N/A'}..., term={cluster_state['term']}")
+        
+        with log_lock:
             operation_log.append(operation)
         save_operation_to_log(operation, NODE_ID)
         replicate_to_peers(operation)
@@ -4763,7 +5948,14 @@ def internal_replicate(
                     save_file_replicas(file_id, datanode_ids, node_id_db=NODE_ID)
                     print(f"[NAMENODE] Réplicas replicadas para file_id={file_id}: {datanode_ids}")
         elif operation == "delete_file":
-            delete_file_metadata(operation_data["file_id"], node_id=NODE_ID, term=term)
+            # Usar apply_operation_safely para aprovechar la búsqueda por hash
+            op_log = OperationLog(
+                operation="delete_file",
+                data=operation_data,
+                term=term,
+                timestamp=timestamp
+            )
+            apply_operation_safely(op_log, NODE_ID)
         elif operation == "delete_files_by_tags":
             delete_files_by_tags(operation_data["tags"], node_id=NODE_ID, 
                                 user_id=operation_data.get("user_id", "system"), term=term)
@@ -5420,6 +6612,455 @@ def internal_replicate_sql(
         return {"success": False, "message": str(e)}
 
 
+@app.get("/internal/get-datanodes")
+def internal_get_datanodes(
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """
+    Endpoint interno para obtener la tabla completa de datanodes de este nodo.
+    Usado durante la reconciliación para fusionar información de todos los peers.
+    """
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene de otro namenode
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not (service_id.startswith("namenode-") or service_id.startswith("tbfs-namenode-")):
+        raise HTTPException(status_code=403, detail="Solo namenodes pueden obtener datanodes")
+    
+    try:
+        # Obtener todos los datanodes de este nodo
+        db_path = get_db_path(NODE_ID)
+        
+        from namenode.rw_lock import ReadLock
+        from namenode.database import metadata_rw_lock
+        
+        datanodes = []
+        with ReadLock(metadata_rw_lock):
+            conn, cursor = get_connection(db_path=db_path, node_id=NODE_ID)
+            
+            try:
+                cursor.execute("""
+                    SELECT node_id, url, port, ip, total_space, free_space, 
+                           last_heartbeat, status, registered_at, draining
+                    FROM datanodes
+                """)
+                
+                for row in cursor.fetchall():
+                    datanodes.append({
+                        "node_id": row[0],
+                        "url": row[1],
+                        "port": row[2],
+                        "ip": row[3],
+                        "total_space": row[4],
+                        "free_space": row[5],
+                        "last_heartbeat": row[6],
+                        "status": row[7],
+                        "registered_at": row[8],
+                        "draining": bool(row[9]) if row[9] is not None else False
+                    })
+            finally:
+                close_connection(conn)
+        
+        print(f"[NAMENODE] 📤 [GET_DATANODES] Compartiendo tabla de datanodes: {len(datanodes)} entradas (solicitado por {service_id})")
+        
+        return {
+            "node_id": NODE_ID,
+            "datanodes": datanodes,
+            "timestamp": time.time(),
+            "count": len(datanodes)
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[NAMENODE] ❌ [GET_DATANODES] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"node_id": NODE_ID, "datanodes": [], "error": str(e)}
+
+
+@app.post("/internal/sync-datanodes")
+def internal_sync_datanodes(
+    data: Dict,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """
+    Endpoint interno para recibir sincronización completa de la tabla datanodes del líder.
+    Este endpoint reemplaza completamente la tabla datanodes local con el snapshot del líder.
+    """
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene de otro namenode
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not (service_id.startswith("namenode-") or service_id.startswith("tbfs-namenode-")):
+        raise HTTPException(status_code=403, detail="Solo namenodes pueden sincronizar datanodes")
+    
+    try:
+        datanodes = data.get("datanodes", [])
+        term = data.get("term")
+        leader_id = data.get("leader_id")
+        timestamp = data.get("timestamp")
+        
+        print(f"[NAMENODE] 🔄 [SYNC_DATANODES] Recibido snapshot de datanodes del líder {leader_id}")
+        print(f"[NAMENODE] 🔄 [SYNC_DATANODES] Term: {term}, Timestamp: {timestamp}")
+        print(f"[NAMENODE] 🔄 [SYNC_DATANODES] Total datanodes en snapshot: {len(datanodes)}")
+        
+        # Actualizar término si es necesario
+        with cluster_lock:
+            current_term = cluster_state["term"]
+            if term > current_term:
+                cluster_state["term"] = term
+                cluster_state["is_leader"] = False
+                cluster_state["leader_id"] = leader_id
+                cluster_state["last_heartbeat_time"] = time.time()
+        
+        # Sincronizar tabla datanodes (optimizado para reducir tiempo con lock)
+        db_path = get_db_path(NODE_ID)
+        
+        # Preparar datos fuera del lock
+        old_datanodes = set()
+        new_datanodes = {dn["node_id"] for dn in datanodes}
+        inserted_count = 0
+        
+        # Adquirir write lock solo durante la escritura
+        with db_lock:
+            conn, cursor = get_connection(db_path=db_path, node_id=NODE_ID)
+            
+            try:
+                # Marcar que estamos replicando para evitar replicación recursiva
+                conn._is_replicating = True
+                
+                # Obtener estado actual antes de sincronizar (rápido)
+                cursor.execute("SELECT node_id FROM datanodes")
+                old_datanodes = {row[0] for row in cursor.fetchall()}
+                
+                # Limpiar tabla datanodes (sincronización completa)
+                cursor.execute("DELETE FROM datanodes")
+                
+                # Preparar batch insert para ser más eficiente
+                insert_values = []
+                for datanode in datanodes:
+                    insert_values.append((
+                        datanode["node_id"],
+                        datanode["url"],
+                        datanode["port"],
+                        datanode.get("ip"),
+                        datanode["total_space"],
+                        datanode["free_space"],
+                        datanode.get("last_heartbeat"),
+                        datanode["status"],
+                        1 if datanode.get("draining") else 0,
+                        datanode.get("registered_at")
+                    ))
+                
+                # Insertar todos de una vez (batch insert - mucho más rápido)
+                if insert_values:
+                    cursor.executemany("""
+                        INSERT INTO datanodes 
+                        (node_id, url, port, ip, total_space, free_space, 
+                         last_heartbeat, status, draining, registered_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, insert_values)
+                    inserted_count = len(insert_values)
+                
+                conn.commit()
+                
+            except Exception as e:
+                conn.rollback()
+                print(f"[NAMENODE] ❌ [SYNC_DATANODES] Error sincronizando tabla: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+            finally:
+                close_connection(conn)
+        
+        # Calcular diferencias y logging fuera del lock
+        added = new_datanodes - old_datanodes
+        removed = old_datanodes - new_datanodes
+        
+        print(f"[NAMENODE] ✅ [SYNC_DATANODES] Sincronización completada:")
+        print(f"[NAMENODE] ✅ [SYNC_DATANODES]   - Total insertados: {inserted_count}")
+        print(f"[NAMENODE] ✅ [SYNC_DATANODES]   - Nuevos datanodes: {len(added)}")
+        print(f"[NAMENODE] ✅ [SYNC_DATANODES]   - Datanodes removidos: {len(removed)}")
+        
+        # Actualizar cache de datanodes (fuera del lock)
+        try:
+            from namenode.datanode_cache import get_datanode_cache
+            cache = get_datanode_cache(node_id_db=NODE_ID)
+            
+            # Invalidar cache para forzar recarga desde BD
+            cache.invalidate()
+            
+            print(f"[NAMENODE] ✅ [SYNC_DATANODES] Cache de datanodes invalidado")
+        except Exception as cache_error:
+            print(f"[NAMENODE] ⚠️  [SYNC_DATANODES] Error actualizando cache: {cache_error}")
+        
+        return {
+            "success": True,
+            "inserted": inserted_count,
+            "added": len(added),
+            "removed": len(removed)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[NAMENODE] ❌ [SYNC_DATANODES] Error en internal_sync_datanodes: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "message": str(e)}
+
+
+# Variable global para almacenar propuestas de consenso pendientes
+_consensus_proposals = {}
+_consensus_lock = threading.Lock()
+
+
+@app.post("/internal/consensus-propose")
+def internal_consensus_propose(
+    data: Dict,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """
+    Fase 1 del protocolo de consenso: PROPOSE
+    El coordinador propone un orden de operaciones a los followers.
+    """
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene de otro namenode
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not (service_id.startswith("namenode-") or service_id.startswith("tbfs-namenode-")):
+        raise HTTPException(status_code=403, detail="Solo namenodes pueden proponer consenso")
+    
+    try:
+        coordinator_id = data.get("coordinator_id")
+        term = data.get("term")
+        operations_data = data.get("operations", [])
+        proposed_checksum = data.get("checksum")
+        operation_count = data.get("operation_count", len(operations_data))
+        
+        print(f"[NAMENODE] 🤝 [CONSENSUS-PROPOSE] Recibida propuesta de {coordinator_id}")
+        print(f"[NAMENODE] 🤝 [CONSENSUS-PROPOSE] Term: {term}, Operaciones: {operation_count}")
+        print(f"[NAMENODE] 🤝 [CONSENSUS-PROPOSE] Checksum propuesto: {proposed_checksum[:16]}...")
+        print(f"[DEBUG] 🔍 PROPOSE recibido: {operation_count} operaciones, checksum={proposed_checksum}")
+        
+        # Verificar que el term es válido
+        with cluster_lock:
+            current_term = cluster_state["term"]
+            if term < current_term:
+                print(f"[NAMENODE] 🤝 [CONSENSUS-PROPOSE] ❌ Rechazado: term {term} < current term {current_term}")
+                return {
+                    "accepted": False,
+                    "message": f"Term obsoleto: {term} < {current_term}",
+                    "current_term": current_term
+                }
+        
+        # Reconstruir operaciones desde los datos
+        operations = []
+        for op_data in operations_data:
+            operations.append(OperationLog(
+                operation=op_data["operation"],
+                data=op_data["data"],
+                term=op_data["term"],
+                timestamp=op_data["timestamp"]
+            ))
+        
+        # Verificar checksum
+        calculated_checksum = calculate_operations_checksum(operations)
+        
+        if calculated_checksum != proposed_checksum:
+            print(f"[NAMENODE] 🤝 [CONSENSUS-PROPOSE] ❌ Checksums no coinciden!")
+            print(f"[NAMENODE] 🤝 [CONSENSUS-PROPOSE]   Propuesto: {proposed_checksum[:16]}...")
+            print(f"[NAMENODE] 🤝 [CONSENSUS-PROPOSE]   Calculado: {calculated_checksum[:16]}...")
+            return {
+                "accepted": False,
+                "message": "Checksum no coincide",
+                "proposed_checksum": proposed_checksum,
+                "calculated_checksum": calculated_checksum
+            }
+        
+        print(f"[NAMENODE] 🤝 [CONSENSUS-PROPOSE] ✅ Checksum verificado correctamente")
+        
+        # Guardar propuesta pendiente
+        with _consensus_lock:
+            _consensus_proposals[proposed_checksum] = {
+                "coordinator_id": coordinator_id,
+                "term": term,
+                "operations": operations,
+                "checksum": proposed_checksum,
+                "timestamp": time.time(),
+                "applied": False
+            }
+        
+        print(f"[NAMENODE] 🤝 [CONSENSUS-PROPOSE] ✅ Propuesta aceptada, esperando COMMIT")
+        
+        return {
+            "accepted": True,
+            "checksum": calculated_checksum,
+            "message": f"Propuesta aceptada: {operation_count} operaciones",
+            "node_id": NODE_ID
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[NAMENODE] 🤝 [CONSENSUS-PROPOSE] ❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "accepted": False,
+            "message": f"Error procesando propuesta: {str(e)}"
+        }
+
+
+@app.post("/internal/consensus-commit")
+def internal_consensus_commit(
+    data: Dict,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """
+    Fase 3 del protocolo de consenso: COMMIT
+    El coordinador notifica que el consenso fue alcanzado y se deben aplicar las operaciones.
+    """
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene de otro namenode
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not (service_id.startswith("namenode-") or service_id.startswith("tbfs-namenode-")):
+        raise HTTPException(status_code=403, detail="Solo namenodes pueden confirmar consenso")
+    
+    try:
+        coordinator_id = data.get("coordinator_id")
+        term = data.get("term")
+        checksum = data.get("checksum")
+        
+        print(f"[NAMENODE] 🤝 [CONSENSUS-COMMIT] Recibida confirmación de {coordinator_id}")
+        print(f"[NAMENODE] 🤝 [CONSENSUS-COMMIT] Term: {term}, Checksum: {checksum[:16]}...")
+        
+        # Buscar propuesta pendiente
+        with _consensus_lock:
+            proposal = _consensus_proposals.get(checksum)
+        
+        if not proposal:
+            print(f"[NAMENODE] 🤝 [CONSENSUS-COMMIT] ❌ No hay propuesta pendiente para este checksum")
+            return {
+                "committed": False,
+                "message": "No hay propuesta pendiente para este checksum"
+            }
+        
+        if proposal["applied"]:
+            print(f"[NAMENODE] 🤝 [CONSENSUS-COMMIT] ⚠️  Propuesta ya fue aplicada anteriormente")
+            return {
+                "committed": True,
+                "message": "Operaciones ya fueron aplicadas",
+                "node_id": NODE_ID
+            }
+        
+        # Aplicar operaciones Y guardarlas en el log
+        print(f"[NAMENODE] 🤝 [CONSENSUS-COMMIT] Aplicando {len(proposal['operations'])} operaciones...")
+        
+        applied_count = 0
+        for operation in proposal['operations']:
+            try:
+                # Aplicar operación
+                apply_operation_safely(operation, NODE_ID)
+                
+                # CRÍTICO: Guardar en log persistente para que no se pierda
+                save_operation_to_log(operation, NODE_ID)
+                
+                # Agregar al log en memoria
+                with log_lock:
+                    # Verificar si ya existe antes de agregar
+                    op_key = get_operation_key(operation)
+                    already_exists = any(
+                        get_operation_key(op) == op_key and 
+                        abs(op.timestamp - operation.timestamp) < 0.1
+                        for op in operation_log
+                    )
+                    if not already_exists:
+                        operation_log.append(operation)
+                
+                applied_count += 1
+                
+                # Log detallado de cada operación aplicada
+                if operation.operation == "add_file":
+                    print(f"[NAMENODE] 🤝 [CONSENSUS-COMMIT]   ✅ {operation.operation}: {operation.data.get('name', 'N/A')} (term={operation.term})")
+                elif operation.operation == "delete_file":
+                    print(f"[NAMENODE] 🤝 [CONSENSUS-COMMIT]   ✅ {operation.operation}: {operation.data.get('name', 'N/A')} (term={operation.term})")
+                else:
+                    print(f"[NAMENODE] 🤝 [CONSENSUS-COMMIT]   ✅ {operation.operation} (term={operation.term})")
+                    
+            except Exception as e:
+                print(f"[NAMENODE] 🤝 [CONSENSUS-COMMIT] ⚠️  Error aplicando operación {operation.operation}: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Marcar como aplicado
+        with _consensus_lock:
+            proposal["applied"] = True
+            proposal["applied_at"] = time.time()
+        
+        # Actualizar estado del cluster
+        with cluster_lock:
+            cluster_state["last_consensus_checksum"] = checksum
+            cluster_state["last_consensus_term"] = term
+            if term > cluster_state["term"]:
+                cluster_state["term"] = term
+        
+        print(f"[NAMENODE] 🤝 [CONSENSUS-COMMIT] ✅ {applied_count}/{len(proposal['operations'])} operaciones aplicadas y guardadas en log")
+        
+        return {
+            "committed": True,
+            "applied_count": applied_count,
+            "total_operations": len(proposal['operations']),
+            "message": f"Consenso aplicado: {applied_count} operaciones",
+            "node_id": NODE_ID
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[NAMENODE] 🤝 [CONSENSUS-COMMIT] ❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "committed": False,
+            "message": f"Error aplicando consenso: {str(e)}"
+        }
+
+
 @app.post("/internal/vote")
 def internal_vote(
     request: VoteRequest,
@@ -5545,12 +7186,30 @@ def internal_heartbeat(
         # El líder conoce todos los peers del clúster, así que actualizamos nuestra lista
         if peers_from_leader:
             # Excluir este nodo de la lista de peers (no somos nuestro propio peer)
-            # Filtrar todas las variaciones del node_id (IPs y nombres DNS)
-            node_id_variations = [current_node_id, f"tbfs-{current_node_id}", current_node_id.replace("tbfs-", "")]
+            # Crear set completo con todas las variaciones posibles del nodo actual
+            node_id_variations = {
+                current_node_id,
+                f"tbfs-{current_node_id}",
+                current_node_id.replace("tbfs-", ""),
+                current_node_id.replace("namenode-", "") if "namenode" in current_node_id else current_node_id
+            }
+            
+            # Agregar IP local si está disponible
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(('8.8.8.8', 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+                node_id_variations.add(local_ip)
+            except Exception:
+                pass
+            
+            # Filtrar TODAS las variaciones del nodo actual
             updated_peers = [p for p in peers_from_leader if p not in node_id_variations]
             
-            # Asegurar que el líder esté incluido en la lista de peers conocidos (solo si no es este nodo)
-            if leader_id and leader_id != current_node_id and leader_id not in node_id_variations:
+            # Asegurar que el líder esté incluido en la lista de peers conocidos
+            # SOLO si no es este nodo (verificar contra todas las variaciones)
+            if leader_id and leader_id not in node_id_variations:
                 if leader_id not in updated_peers:
                     updated_peers.append(leader_id)
                     print(f"[NAMENODE] 📥 Líder {leader_id} agregado a la lista de peers conocidos")
@@ -5593,8 +7252,8 @@ def internal_heartbeat(
         # Actualizar lista de seguidores activos desde el líder
         if active_followers_from_leader is not None:
             # Excluir este nodo de la lista de seguidores activos (no somos nuestro propio seguidor)
-            current_node_id = cluster_state["node_id"]
-            updated_active_followers = [f for f in active_followers_from_leader if f != current_node_id]
+            # Usar las mismas variaciones que ya calculamos arriba
+            updated_active_followers = [f for f in active_followers_from_leader if f not in node_id_variations]
             
             # Comparar con la lista actual
             old_active_followers = set(cluster_state.get("active_followers", []))

@@ -32,3 +32,19 @@ Esperar a que el lider reconozca la inactividad del datanode
 Tumbar el lider
 Esperar a que los seguidores hagan la nueva elección
 Levantar el datanode inactivo.
+
+
+=======ERRORES============
+- 3 namenodes, dos datanodes, tumbar dos namenodes (lider +1) y un datanode (todo a la vez), resulta en error al descargar archivos de menos de 5mb
+    porque busca chunks automaticamente, archivos de mas de 5 mb se descargan bien.
+- misma situacion, no se replicaron los usuarios. (al parecer si, solo habia que dejar mas tiempo.)
+- en el namenode-4 no h;ay constancia de que una vez existio el datanode-1 y se detuvo 
+    y eso es porque al inicar un nuevo namenode, los datanodes no se estan replicando(ese asunto esta arreglado en mi laptop)
+- al eliminar dos namenodes a la vez, se causa un bloqueo en el tercer namenode
+-al agregar un nuevo namenode, no se esta replicando bien la tabla datanodes.
+
+
+
+@namenode aqui hay dos problemas:
+1- cuando se crea un nuevo namenode, la tabla datanodes no se replica, revisa el codigo, explicame por que y recuelvelo de la manera mas sencilla y efectiva posible.
+2- por otra parte, en esta situacion : cuando se crean n namenodes, se sube un archivo de menos de 5 mb, no tiene ningun chunk, es un archivo entero, al crear un nuevo namenode y eliminar los n namenodes anteriores, da error al descargar el archivo porque va directo a buscar chunks que no existen porque era un archivo de meenos de 5 mb, resuelve eso de la manera mas sencilla y efectiva posible.

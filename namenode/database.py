@@ -83,9 +83,12 @@ def _replication_worker():
             
             print(f"[DATABASE] [REPLICATE] 🔄 Procesando {len(sql_writes)} escrituras SQL de la cola...")
             for idx, write in enumerate(sql_writes):
-                sql_preview = write.get('sql', '')[:50]
+                sql_preview = write.get('sql', '')[:60]
                 db_type = write.get('db_type', 'unknown')
-                print(f"[DATABASE] [REPLICATE]   [{idx+1}/{len(sql_writes)}] SQL: {sql_preview}... (db_type={db_type})")
+                sql_normalized = ' '.join(sql_preview.strip().split())
+                is_datanodes_table = 'datanodes' in sql_normalized.lower()
+                table_info = "tabla 'datanodes'" if is_datanodes_table else f"db_type={db_type}"
+                print(f"[DATABASE] [REPLICATE]   [{idx+1}/{len(sql_writes)}] SQL ({table_info}): {sql_preview}...")
             
             try:
                 from namenode.namenode import replicate_sql_writes, is_leader
@@ -160,26 +163,48 @@ class ReplicatingConnection:
         self._conn.commit()
         
         # Programar replicación asíncrona si hay escrituras pendientes
-        if self._pending_writes and not self._is_replicating:
+        pending_count = len(self._pending_writes) if self._pending_writes else 0
+        if pending_count > 0 and not self._is_replicating:
             try:
                 from namenode.namenode import is_leader
                 is_leader_flag = is_leader()
+                
                 if is_leader_flag:
+                    # Verificar que realmente hay escrituras antes de enviar
+                    if not self._pending_writes:
+                        print(f"[DATABASE] [REPLICATE] ⚠️ _pending_writes vacío justo antes de enviar a cola (esto no debería pasar)")
+                        return
+                    
                     # Enviar a cola para replicación asíncrona (no bloquea)
                     _start_replication_thread_if_needed()
                     writes_to_replicate = self._pending_writes.copy()
+                    
+                    # Log detallado de las escrituras que se van a replicar
+                    for idx, write in enumerate(writes_to_replicate):
+                        sql_preview = write.get('sql', '')[:60]
+                        db_type = write.get('db_type', 'unknown')
+                        print(f"[DATABASE] [REPLICATE] 📤 [{idx+1}/{len(writes_to_replicate)}] Enviando a cola: {sql_preview}... (db_type={db_type})")
+                    
                     _sql_replication_queue.put({
                         'sql_writes': writes_to_replicate,
                         'node_id': self._node_id
                     })
-                    print(f"[DATABASE] [REPLICATE] ✅ {len(writes_to_replicate)} escrituras SQL enviadas a cola de replicación (db_type={self._db_type if writes_to_replicate else 'N/A'})")
+                    
+                    # Verificar que se agregó a la cola (para diagnóstico)
+                    queue_size = _sql_replication_queue.qsize()
+                    print(f"[DATABASE] [REPLICATE] ✅ {len(writes_to_replicate)} escrituras SQL enviadas a cola de replicación (db_type={self._db_type}, tamaño_cola={queue_size})")
                 else:
-                    print(f"[DATABASE] [REPLICATE] ⚠️ {len(self._pending_writes)} escrituras NO replicadas: nodo no es líder durante commit()")
+                    print(f"[DATABASE] [REPLICATE] ⚠️ {pending_count} escrituras NO replicadas: nodo no es líder durante commit() (db_type={self._db_type})")
+                    # Log detallado de qué escrituras se están perdiendo
+                    for idx, write in enumerate(self._pending_writes):
+                        sql_preview = write.get('sql', '')[:60]
+                        print(f"[DATABASE] [REPLICATE] ❌   [{idx+1}/{pending_count}] Perdida: {sql_preview}...")
             except Exception as e:
                 print(f"[DATABASE] [REPLICATE] ❌ Error programando replicación: {e}")
                 import traceback
                 traceback.print_exc()
             finally:
+                # Limpiar escrituras pendientes después de intentar replicarlas
                 self._pending_writes = []
     
     # Delegar todos los demás métodos a la conexión real
@@ -237,9 +262,31 @@ class ReplicatingCursor:
                         'db_type': self._db_type
                     }
                     self._conn_wrapper._pending_writes.append(write_info)
-                    print(f"[DATABASE] [REPLICATE] ✅ Escritura capturada para replicación: {sql[:50]}... (db_type={self._db_type}, pending={len(self._conn_wrapper._pending_writes)})")
+                    
+                    # Identificar si es una escritura en datanodes para logging especial
+                    is_datanodes_table = 'datanodes' in sql_normalized.lower()
+                    table_info = "tabla 'datanodes'" if is_datanodes_table else f"db_type={self._db_type}"
+                    
+                    # Logging detallado para UPDATEs en datanodes que incluyen IP
+                    if is_datanodes_table and "UPDATE" in sql_upper and params_serialized and isinstance(params_serialized, list):
+                        if len(params_serialized) == 8:
+                            # UPDATE completo con IP
+                            try:
+                                url, port, ip, total_space, free_space, last_heartbeat, status, node_id = params_serialized
+                                ip_info = f" (IP capturada: {ip})" if ip else " (IP capturada: NULL)"
+                                print(f"[DATABASE] [REPLICATE] ✅ Escritura capturada para replicación ({table_info}): UPDATE completo datanode '{node_id}' - url={url}, port={port}{ip_info} (pending={len(self._conn_wrapper._pending_writes)})")
+                            except Exception as e:
+                                print(f"[DATABASE] [REPLICATE] ✅ Escritura capturada para replicación ({table_info}): {sql[:60]}... (pending={len(self._conn_wrapper._pending_writes)})")
+                                print(f"[DATABASE] [REPLICATE] ⚠️ Error parseando parámetros de UPDATE completo: {e}, params={params_serialized}")
+                        else:
+                            print(f"[DATABASE] [REPLICATE] ✅ Escritura capturada para replicación ({table_info}): {sql[:60]}... (pending={len(self._conn_wrapper._pending_writes)}, params_count={len(params_serialized)})")
+                    else:
+                        print(f"[DATABASE] [REPLICATE] ✅ Escritura capturada para replicación ({table_info}): {sql[:60]}... (pending={len(self._conn_wrapper._pending_writes)})")
                 else:
-                    print(f"[DATABASE] [REPLICATE] ⚠️ Escritura NO capturada: nodo no es líder (SQL: {sql[:50]}...)")
+                    # Identificar si es una escritura en datanodes para logging especial
+                    is_datanodes_table = 'datanodes' in sql_normalized.lower()
+                    table_info = "tabla 'datanodes'" if is_datanodes_table else f"db_type={self._db_type}"
+                    print(f"[DATABASE] [REPLICATE] ⚠️ Escritura NO capturada: nodo no es líder ({table_info}): {sql[:60]}...")
             except Exception as e:
                 # Si falla la verificación de líder, continuar sin replicar
                 # (puede pasar durante inicialización)
@@ -350,6 +397,10 @@ def init_metadata_db(db_path: str = None, node_id: str = None):
         db_path = get_metadata_db_path(node_id)
     
     conn, cursor = get_connection(db_path=db_path, db_type="metadata")
+    
+    # Marcar como replicando para evitar que las operaciones de inicialización se capturen para replicación
+    # Estas son operaciones de setup, no de replicación de datos
+    conn._is_replicating = True
     
     # Tabla de archivos - solo metadatos
     cursor.execute("""
@@ -694,6 +745,8 @@ def init_metadata_db(db_path: str = None, node_id: str = None):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
     
     conn.commit()
+    # Restaurar flag antes de cerrar (las operaciones de inicialización no deben replicarse)
+    conn._is_replicating = False
     conn.close()
     print(f"[DATABASE] Base de datos de METADATOS inicializada: {db_path}")
 
@@ -705,6 +758,10 @@ def init_operations_db(node_id: str = None):
     """
     db_path = get_operations_db_path(node_id)
     conn, cursor = get_connection(db_path=db_path, db_type="operations")
+    
+    # Marcar como replicando para evitar que las operaciones de inicialización se capturen para replicación
+    # Estas son operaciones de setup, no de replicación de datos
+    conn._is_replicating = True
     
     # Tabla para log persistente de operaciones (Fase 2)
     cursor.execute("""
@@ -755,6 +812,8 @@ def init_operations_db(node_id: str = None):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_operation_state_log_time ON operation_state_log(timestamp)")
     
     conn.commit()
+    # Restaurar flag antes de cerrar (las operaciones de inicialización no deben replicarse)
+    conn._is_replicating = False
     conn.close()
     print(f"[DATABASE] Base de datos de OPERACIONES inicializada: {db_path}")
 
@@ -762,9 +821,21 @@ def init_operations_db(node_id: str = None):
 def close_connection(conn):
     """
     Cierra la conexión con la base de datos.
+    Si es un ReplicatingConnection, cierra la conexión interna correctamente.
     """
     if conn:
-        conn.close()
+        # Si es un ReplicatingConnection, cerrar la conexión interna
+        if hasattr(conn, '_conn') and hasattr(conn, '_is_replicating'):
+            # Asegurar que no hay escrituras pendientes antes de cerrar
+            try:
+                # Forzar un commit si hay transacciones pendientes
+                if hasattr(conn._conn, 'in_transaction') and conn._conn.in_transaction:
+                    conn._conn.commit()
+            except:
+                pass
+            conn._conn.close()
+        else:
+            conn.close()
 
 
 def reset_db(db_path: str = None, node_id: str = None) -> None:

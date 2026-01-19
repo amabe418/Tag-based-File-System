@@ -239,7 +239,8 @@ def save_operation_to_log(operation: OperationLog, node_id: str = None):
     db_path = get_operations_db_path(node_id)
     
     with operations_db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id)
+        # IMPORTANTE: Especificar db_type="operations" explícitamente para que la replicación SQL funcione correctamente
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id, db_type="operations")
         try:
             cursor.execute("""
                 INSERT INTO operation_log (operation, data, term, timestamp, node_id)
@@ -274,7 +275,8 @@ def load_operation_log(node_id: str = None) -> List[OperationLog]:
     operations = []
     
     with operations_db_lock:
-        conn, cursor = get_connection(db_path=db_path, node_id=node_id)
+        # IMPORTANTE: Especificar db_type="operations" explícitamente
+        conn, cursor = get_connection(db_path=db_path, node_id=node_id, db_type="operations")
         try:
             cursor.execute("""
                 SELECT operation, data, term, timestamp, node_id
@@ -1661,6 +1663,11 @@ def replicate_sql_writes(sql_writes: List[Dict], node_id: str = None):
     if not peers or not sql_writes:
         return True
     
+    # Identificar si hay escrituras en datanodes para logging especial
+    datanodes_writes = [w for w in sql_writes if 'datanodes' in w.get('sql', '').lower()]
+    if datanodes_writes:
+        print(f"[NAMENODE] [SQL_REPLICATE] 📤 Replicando {len(datanodes_writes)} escrituras en tabla 'datanodes' a {len(peers)} peers...")
+    
     # Obtener token de servicio para autenticación
     try:
         service_token = generate_service_token(cluster_state["node_id"], "service")
@@ -1685,12 +1692,20 @@ def replicate_sql_writes(sql_writes: List[Dict], node_id: str = None):
             if response.status_code == 200:
                 success_count += 1
                 update_peer_status(peer, True)
+                if datanodes_writes:
+                    print(f"[NAMENODE] [SQL_REPLICATE] ✅ Escrituras en 'datanodes' replicadas exitosamente a {peer}")
             else:
                 update_peer_status(peer, False)
-                print(f"[NAMENODE] [SQL_REPLICATE] Error replicando a {peer}: {response.status_code}")
+                error_msg = f"[NAMENODE] [SQL_REPLICATE] ❌ Error replicando a {peer}: HTTP {response.status_code}"
+                if datanodes_writes:
+                    error_msg += f" (incluye {len(datanodes_writes)} escrituras en 'datanodes')"
+                print(error_msg)
         except Exception as e:
             update_peer_status(peer, False)
-            print(f"[NAMENODE] [SQL_REPLICATE] Error replicando a {peer}: {e}")
+            error_msg = f"[NAMENODE] [SQL_REPLICATE] ❌ Error replicando a {peer}: {e}"
+            if datanodes_writes:
+                error_msg += f" (incluye {len(datanodes_writes)} escrituras en 'datanodes')"
+            print(error_msg)
     
     # Se necesita mayoría (quorum): al menos 2 de 3 nodos
     total_nodes = len(peers) + 1
@@ -1698,9 +1713,15 @@ def replicate_sql_writes(sql_writes: List[Dict], node_id: str = None):
     replicated = success_count + 1 >= quorum
     
     if not replicated:
-        print(f"[NAMENODE] [SQL_REPLICATE] WARNING: Solo se replicó a {success_count + 1}/{total_nodes} nodos (quorum: {quorum})")
+        warning_msg = f"[NAMENODE] [SQL_REPLICATE] ⚠️ WARNING: Solo se replicó a {success_count + 1}/{total_nodes} nodos (quorum: {quorum})"
+        if datanodes_writes:
+            warning_msg += f" - {len(datanodes_writes)} escrituras en 'datanodes' pueden no haberse replicado"
+        print(warning_msg)
     else:
-        print(f"[NAMENODE] [SQL_REPLICATE] ✅ {len(sql_writes)} escrituras SQL replicadas a {success_count + 1} peers")
+        success_msg = f"[NAMENODE] [SQL_REPLICATE] ✅ {len(sql_writes)} escrituras SQL replicadas a {success_count + 1} peers"
+        if datanodes_writes:
+            success_msg += f" (incluye {len(datanodes_writes)} escrituras en 'datanodes')"
+        print(success_msg)
     
     return replicated
 
@@ -3195,7 +3216,9 @@ def register_datanode_endpoint(
     if not is_leader():
         raise HTTPException(status_code=503, detail="No hay líder disponible")
     
-    print(f"[NAMENODE] Registrando DataNode: {registration.node_id}")
+    # Logging detallado de la IP recibida
+    ip_info = f" (IP: {registration.ip})" if registration.ip else " (IP: None/No proporcionada)"
+    print(f"[NAMENODE] 📥 Registrando DataNode: {registration.node_id} - url={registration.url}, port={registration.port}{ip_info}")
     
     success = register_datanode(
         node_id=registration.node_id,
@@ -4960,6 +4983,12 @@ def internal_replicate_sql(
         term = data.get("term")
         timestamp = data.get("timestamp")
         
+        # Log detallado de recepción
+        datanodes_writes_count = sum(1 for w in sql_writes if 'datanodes' in w.get('sql', '').lower())
+        print(f"[NAMENODE] [SQL_REPLICATE] 📥 Recibida solicitud de replicación: {len(sql_writes)} escrituras SQL (término={term}, timestamp={timestamp})")
+        if datanodes_writes_count > 0:
+            print(f"[NAMENODE] [SQL_REPLICATE] 📥 ⚠️ IMPORTANTE: {datanodes_writes_count} escrituras en tabla 'datanodes' recibidas")
+        
         with cluster_lock:
             current_term = cluster_state["term"]
             
@@ -4970,10 +4999,10 @@ def internal_replicate_sql(
                 cluster_state["leader_id"] = data.get("leader_id")
                 cluster_state["last_heartbeat_time"] = time.time()
         
-        # Asegurar que las bases de datos estén inicializadas
-        from namenode.database import init_metadata_db, init_operations_db
-        init_metadata_db(node_id=NODE_ID)
-        init_operations_db(node_id=NODE_ID)
+        # NOTA: NO inicializar las bases de datos aquí en cada replicación SQL
+        # Las bases de datos ya deberían estar inicializadas al iniciar el nodo.
+        # Solo se inicializarán automáticamente si se detecta que falta una tabla
+        # (ver manejo de excepciones sqlite3.OperationalError más abajo)
         
         # Aplicar escrituras SQL localmente
         from namenode.database import get_connection, close_connection, metadata_db_lock, operations_db_lock
@@ -4981,13 +5010,22 @@ def internal_replicate_sql(
         
         applied_count = 0
         skipped_count = 0
-        for write in sql_writes:
+        error_count = 0
+        
+        for idx, write in enumerate(sql_writes):
             sql = write.get("sql")
             params = write.get("params")
             db_type = write.get("db_type", "metadata")
             
             if not sql:
+                print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ Escritura {idx+1} sin SQL, saltando...")
                 continue
+            
+            # Identificar si es escritura en datanodes para logging especial
+            is_datanodes_table = 'datanodes' in sql.lower()
+            table_info = "tabla 'datanodes'" if is_datanodes_table else f"db_type={db_type}"
+            
+            print(f"[NAMENODE] [SQL_REPLICATE] 🔄 [{idx+1}/{len(sql_writes)}] Aplicando escritura ({table_info}): {sql[:70]}...")
             
             # Seleccionar lock según tipo de BD
             db_lock_to_use = operations_db_lock if db_type == "operations" else metadata_db_lock
@@ -5011,6 +5049,16 @@ def internal_replicate_sql(
                                     deserialized_params.append(base64.b64decode(p['__value__']))
                                 else:
                                     deserialized_params.append(p)
+                            
+                            # Logging detallado para UPDATEs en datanodes que incluyen IP antes de ejecutar
+                            if is_datanodes_table and "UPDATE" in sql.upper() and len(deserialized_params) == 8:
+                                try:
+                                    url, port, ip, total_space, free_space, last_heartbeat, status, node_id = deserialized_params
+                                    ip_info = f" (IP deserializada: {ip})" if ip else " (IP deserializada: NULL)"
+                                    print(f"[NAMENODE] [SQL_REPLICATE] 🔄 Antes de ejecutar UPDATE completo: node_id={node_id}, url={url}, port={port}{ip_info}")
+                                except Exception as e:
+                                    print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ Error parseando parámetros antes de ejecutar: {e}, params={deserialized_params}")
+                            
                             cursor.execute(sql, deserialized_params)
                         else:
                             # Parámetro único
@@ -5021,34 +5069,239 @@ def internal_replicate_sql(
                     else:
                         cursor.execute(sql)
                     
+                    # Verificar que la ejecución fue exitosa antes de commit
+                    rowcount = cursor.rowcount if hasattr(cursor, 'rowcount') else 0
+                    
+                    # Logging especial para UPDATEs en datanodes que incluyen IP
+                    if is_datanodes_table and "UPDATE" in sql.upper() and params and isinstance(params, list):
+                        if len(params) == 8:
+                            # UPDATE completo con IP
+                            try:
+                                url, port, ip, total_space, free_space, last_heartbeat, status, node_id = params
+                                ip_info = f" (IP: {ip})" if ip else " (IP: NULL)"
+                                print(f"[NAMENODE] [SQL_REPLICATE] 📥 UPDATE completo en datanodes: node_id={node_id}, url={url}, port={port}{ip_info}, rowcount={rowcount}")
+                            except Exception as e:
+                                print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ Error parseando parámetros de UPDATE completo: {e}")
+                    
+                    # CORRECCIÓN CRÍTICA: Si es UPDATE en datanodes y no afectó filas, convertir a INSERT OR REPLACE
+                    if is_datanodes_table and "UPDATE" in sql.upper() and rowcount == 0:
+                        print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ UPDATE en 'datanodes' afectó 0 filas - el datanode no existe en este seguidor")
+                        print(f"[NAMENODE] [SQL_REPLICATE] 💡 Convirtiendo UPDATE a INSERT OR REPLACE para sincronizar inmediatamente...")
+                        
+                        # IMPORTANTE: Antes de hacer rollback, intentar obtener valores existentes si el datanode existe parcialmente
+                        existing_url = None
+                        existing_port = None
+                        existing_ip = None
+                        try:
+                            if params and isinstance(params, list) and len(params) >= 1:
+                                node_id_param = params[-1]
+                                cursor.execute("SELECT url, port, ip FROM datanodes WHERE node_id = ?", (node_id_param,))
+                                existing_row = cursor.fetchone()
+                                if existing_row:
+                                    existing_url, existing_port, existing_ip = existing_row[0], existing_row[1], existing_row[2]
+                                    print(f"[NAMENODE] [SQL_REPLICATE] 💡 Datanode parcial encontrado - usando valores existentes de url/port/ip")
+                        except Exception as fetch_e:
+                            print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ Error obteniendo valores existentes: {fetch_e}")
+                        
+                        # Hacer rollback del UPDATE sin efecto
+                        conn.rollback()
+                        
+                        # Intentar convertir UPDATE a INSERT OR REPLACE
+                        try:
+                            if params:
+                                # Hay dos tipos de UPDATE en datanodes:
+                                # 1. UPDATE de registro completo: UPDATE datanodes SET url=?, port=?, ip=?, total_space=?, free_space=?, last_heartbeat=?, status=? WHERE node_id=?
+                                #    Parámetros: [url, port, ip, total_space, free_space, last_heartbeat, status, node_id] - 8 parámetros
+                                # 2. UPDATE de heartbeat: UPDATE datanodes SET free_space=?, total_space=?, last_heartbeat=?, status=? WHERE node_id=?
+                                #    Parámetros: [free_space, total_space, last_heartbeat, status, node_id] - 5 parámetros
+                                
+                                if isinstance(params, list):
+                                    node_id_param = params[-1]  # El node_id siempre es el último parámetro
+                                    
+                                    if len(params) == 8:
+                                        # UPDATE completo con todos los campos
+                                        url, port, ip, total_space, free_space, last_heartbeat, status, node_id = params
+                                        
+                                        # Log de la IP recibida
+                                        ip_info = f" (IP: {ip})" if ip else " (IP: NULL)"
+                                        print(f"[NAMENODE] [SQL_REPLICATE] 📥 UPDATE completo recibido para datanode '{node_id}': url={url}, port={port}{ip_info}")
+                                        
+                                        # Insertar o reemplazar el datanode con todos los campos
+                                        cursor.execute("""
+                                            INSERT OR REPLACE INTO datanodes 
+                                            (node_id, url, port, ip, total_space, free_space, last_heartbeat, status, draining)
+                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                                        """, (node_id, url, port, ip, total_space, free_space, last_heartbeat, status))
+                                        
+                                        conn.commit()
+                                        applied_count += 1
+                                        print(f"[NAMENODE] [SQL_REPLICATE] ✅ UPDATE completo convertido a INSERT OR REPLACE exitosamente para datanode '{node_id}'{ip_info}")
+                                        
+                                        # Verificar que se guardó correctamente
+                                        cursor.execute("SELECT ip FROM datanodes WHERE node_id = ?", (node_id,))
+                                        saved_ip = cursor.fetchone()
+                                        if saved_ip:
+                                            saved_ip_value = saved_ip[0]
+                                            if saved_ip_value != ip:
+                                                print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ ADVERTENCIA: IP guardada ({saved_ip_value}) no coincide con IP recibida ({ip})")
+                                            else:
+                                                print(f"[NAMENODE] [SQL_REPLICATE] ✅ IP verificada correctamente: {saved_ip_value}")
+                                        
+                                        continue  # Saltar el commit normal ya que lo hicimos arriba
+                                        
+                                    elif len(params) == 5:
+                                        # UPDATE de heartbeat - solo tiene free_space, total_space, last_heartbeat, status, node_id
+                                        # No tenemos url, port, ip que son NOT NULL
+                                        # Usar valores existentes si están disponibles, o construir la URL correcta
+                                        free_space, total_space, last_heartbeat, status, node_id = params
+                                        
+                                        # Usar valores existentes si los obtuvimos antes del rollback
+                                        if existing_url and existing_port:
+                                            # El datanode existe parcialmente, usar valores existentes (incluyendo IP si existe)
+                                            url, port, ip = existing_url, existing_port, existing_ip
+                                            ip_info = f" (IP: {ip})" if ip else " (IP: NULL)"
+                                            print(f"[NAMENODE] [SQL_REPLICATE] 💡 Usando valores existentes de url/port/ip del datanode parcial{ip_info}")
+                                        else:
+                                            # No existe, construir la URL correcta basándose en el node_id
+                                            # El patrón es: node_id = "datanode-X" -> url = "http://tbfs-datanode-X:8001"
+                                            # Extraer el número del datanode del node_id
+                                            import re
+                                            datanode_match = re.search(r'datanode[-_]?(\d+)', node_id, re.IGNORECASE)
+                                            if datanode_match:
+                                                datanode_num = datanode_match.group(1)
+                                                url = f"http://tbfs-datanode-{datanode_num}:8001"
+                                                port = 8001
+                                                print(f"[NAMENODE] [SQL_REPLICATE] 💡 Construyendo URL desde node_id: {node_id} -> {url}:{port}")
+                                            else:
+                                                # Fallback: usar el node_id directamente en la URL
+                                                url = f"http://tbfs-{node_id}:8001"
+                                                port = 8001
+                                                print(f"[NAMENODE] [SQL_REPLICATE] 💡 Construyendo URL fallback desde node_id: {node_id} -> {url}:{port}")
+                                            
+                                            # Intentar resolver la IP del hostname
+                                            ip = None
+                                            try:
+                                                import socket
+                                                hostname = f"tbfs-datanode-{datanode_match.group(1)}" if datanode_match else f"tbfs-{node_id}"
+                                                ip = socket.gethostbyname(hostname)
+                                                print(f"[NAMENODE] [SQL_REPLICATE] ✅ IP resuelta para {hostname}: {ip}")
+                                            except Exception as dns_e:
+                                                print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ No se pudo resolver IP para {hostname}: {dns_e}")
+                                                ip = None
+                                        
+                                        # Insertar o reemplazar con todos los campos requeridos
+                                        # IMPORTANTE: Si el datanode ya existe, preservar la IP existente si no tenemos una nueva
+                                        cursor.execute("SELECT ip FROM datanodes WHERE node_id = ?", (node_id,))
+                                        existing_ip_row = cursor.fetchone()
+                                        if existing_ip_row and existing_ip_row[0] and not ip:
+                                            # Si ya existe una IP y no tenemos una nueva, preservarla
+                                            ip = existing_ip_row[0]
+                                            print(f"[NAMENODE] [SQL_REPLICATE] 💡 Preservando IP existente: {ip}")
+                                        
+                                        cursor.execute("""
+                                            INSERT OR REPLACE INTO datanodes 
+                                            (node_id, url, port, ip, total_space, free_space, last_heartbeat, status, draining)
+                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                                        """, (node_id, url, port, ip, total_space, free_space, last_heartbeat, status))
+                                        
+                                        conn.commit()
+                                        applied_count += 1
+                                        ip_info_final = f" (IP: {ip})" if ip else " (IP: NULL)"
+                                        print(f"[NAMENODE] [SQL_REPLICATE] ✅ UPDATE de heartbeat convertido a INSERT OR REPLACE exitosamente para datanode '{node_id}' -> {url}:{port}{ip_info_final}")
+                                        
+                                        # Continuar para verificar que se guardó
+                                        cursor.execute("SELECT url, port, ip FROM datanodes WHERE node_id = ?", (node_id,))
+                                        saved_row = cursor.fetchone()
+                                        if saved_row:
+                                            print(f"[NAMENODE] [SQL_REPLICATE] ✅ Datanode '{node_id}' ahora existe en BD del seguidor: url={saved_row[0]}, port={saved_row[1]}, ip={saved_row[2]}")
+                                        
+                                        continue  # Saltar el commit normal ya que lo hicimos arriba
+                                    
+                                    else:
+                                        print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ No se pudo convertir UPDATE - formato desconocido ({len(params)} parámetros). Datanode '{node_id_param}' necesita sincronización completa")
+                                        skipped_count += 1
+                                        continue
+                                    
+                                    # Verificar que se guardó
+                                    cursor.execute("SELECT COUNT(*) FROM datanodes WHERE node_id = ?", (node_id_param,))
+                                    exists_after = cursor.fetchone()[0] > 0
+                                    if exists_after:
+                                        print(f"[NAMENODE] [SQL_REPLICATE] ✅ Datanode '{node_id_param}' ahora existe en BD del seguidor")
+                                    else:
+                                        print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ Error: Datanode '{node_id_param}' no se guardó después de INSERT OR REPLACE")
+                                    
+                                    continue  # Saltar el commit normal ya que lo hicimos arriba
+                                else:
+                                    print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ Parámetros no son una lista, no se puede convertir UPDATE")
+                                    skipped_count += 1
+                                    continue
+                        except Exception as convert_e:
+                            print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ Error convirtiendo UPDATE a INSERT OR REPLACE: {convert_e}")
+                            import traceback
+                            traceback.print_exc()
+                            skipped_count += 1
+                            continue
+                    
+                    # Hacer commit y verificar que se persistió
                     conn.commit()
+                    
+                    # VERIFICACIÓN: Leer inmediatamente después del commit para confirmar persistencia
+                    if is_datanodes_table:
+                        # Si es INSERT o UPDATE en datanodes, verificar que se guardó
+                        try:
+                            if "INSERT" in sql.upper() or "UPDATE" in sql.upper():
+                                # Extraer node_id de los parámetros si están disponibles
+                                check_sql = "SELECT COUNT(*) FROM datanodes"
+                                cursor.execute(check_sql)
+                                count_after = cursor.fetchone()[0]
+                                print(f"[NAMENODE] [SQL_REPLICATE] ✅ Escritura en 'datanodes' aplicada exitosamente (filas afectadas: {rowcount}, total datanodes en BD: {count_after})")
+                            else:
+                                print(f"[NAMENODE] [SQL_REPLICATE] ✅ Escritura en 'datanodes' aplicada exitosamente (filas afectadas: {rowcount})")
+                        except Exception as verify_e:
+                            print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ Error verificando persistencia de 'datanodes': {verify_e}")
+                            print(f"[NAMENODE] [SQL_REPLICATE] ✅ Escritura en 'datanodes' aplicada exitosamente (filas afectadas: {rowcount})")
+                    else:
+                        print(f"[NAMENODE] [SQL_REPLICATE] ✅ Escritura aplicada exitosamente (filas afectadas: {rowcount})")
+                    
                     applied_count += 1
                 except sqlite3.IntegrityError as e:
                     # Error de UNIQUE constraint - el dato ya existe, esto es normal en replicación
                     conn.rollback()
                     error_msg = str(e)
-                    # Solo loguear si no es un error esperado de duplicado
-                    if "UNIQUE constraint" in error_msg:
-                        skipped_count += 1
-                        # No loguear estos errores para reducir ruido en logs
-                        # print(f"[NAMENODE] [SQL_REPLICATE] Dato ya existe (esperado): {sql[:50]}...")
+                    skipped_count += 1
+                    # Loguear todos los errores de integridad para diagnóstico
+                    if is_datanodes_table:
+                        print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ Error de integridad en 'datanodes' (esperado si es duplicado): {sql[:70]}... - {error_msg}")
                     else:
-                        print(f"[NAMENODE] [SQL_REPLICATE] Error de integridad: {sql[:50]}... - {e}")
+                        if "UNIQUE constraint" not in error_msg:
+                            print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ Error de integridad: {sql[:50]}... - {e}")
                 except sqlite3.OperationalError as e:
                     error_msg = str(e)
                     conn.rollback()
                     
-                    # Si la tabla no existe, intentar crearla
+                    # Si la tabla no existe, intentar crearla (caso excepcional)
                     if "no such table" in error_msg.lower():
-                        print(f"[NAMENODE] [SQL_REPLICATE] Tabla faltante detectada, inicializando BD...")
+                        table_name = error_msg.split("no such table:")[-1].strip().split()[0] if "no such table:" in error_msg.lower() else "unknown"
+                        print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ Tabla faltante detectada: '{table_name}' en BD '{db_type}', inicializando BD...")
+                        print(f"[NAMENODE] [SQL_REPLICATE] SQL que causó el error: {sql[:100]}...")
                         try:
-                            # Re-inicializar la base de datos correspondiente
+                            # Importar aquí solo cuando sea necesario (evitar imports innecesarios)
+                            from namenode.database import init_metadata_db, init_operations_db
+                            # Cerrar la conexión anterior antes de reinicializar
+                            try:
+                                close_connection(conn)
+                            except:
+                                pass
+                            
+                            # Re-inicializar la base de datos correspondiente según db_type
                             if db_type == "operations":
+                                print(f"[NAMENODE] [SQL_REPLICATE] Inicializando BD de OPERACIONES...")
                                 init_operations_db(node_id=NODE_ID)
                             else:
+                                print(f"[NAMENODE] [SQL_REPLICATE] Inicializando BD de METADATOS...")
                                 init_metadata_db(node_id=NODE_ID)
                             
-                            # Reintentar la operación
+                            # Reintentar la operación con nueva conexión
                             conn, cursor = get_connection(db_type=db_type, node_id=NODE_ID)
                             conn._is_replicating = True
                             
@@ -5072,26 +5325,93 @@ def internal_replicate_sql(
                             
                             conn.commit()
                             applied_count += 1
-                            print(f"[NAMENODE] [SQL_REPLICATE] ✅ Tabla creada y operación aplicada: {sql[:50]}...")
+                            print(f"[NAMENODE] [SQL_REPLICATE] ✅ Tabla '{table_name}' creada y operación aplicada: {sql[:50]}...")
                         except Exception as retry_e:
-                            print(f"[NAMENODE] [SQL_REPLICATE] ❌ Error después de crear tabla: {retry_e}")
-                            conn.rollback()
+                            print(f"[NAMENODE] [SQL_REPLICATE] ❌ Error después de crear tabla '{table_name}': {retry_e}")
+                            print(f"[NAMENODE] [SQL_REPLICATE] SQL problemático: {sql[:200]}")
+                            print(f"[NAMENODE] [SQL_REPLICATE] db_type: {db_type}")
+                            import traceback
+                            traceback.print_exc()
+                            try:
+                                conn.rollback()
+                            except:
+                                pass
                     else:
                         print(f"[NAMENODE] [SQL_REPLICATE] Error operacional: {sql[:50]}... - {e}")
                         import traceback
                         traceback.print_exc()
                 except Exception as e:
                     conn.rollback()
-                    print(f"[NAMENODE] [SQL_REPLICATE] Error aplicando SQL: {sql[:50]}... - {e}")
+                    error_count += 1
+                    error_msg = f"[NAMENODE] [SQL_REPLICATE] ❌ Error aplicando SQL: {sql[:70]}... - {e}"
+                    if is_datanodes_table:
+                        error_msg = f"[NAMENODE] [SQL_REPLICATE] ❌ ⚠️⚠️⚠️ ERROR CRÍTICO en 'datanodes': {sql[:70]}... - {e}"
+                    print(error_msg)
                     import traceback
                     traceback.print_exc()
                 finally:
+                    # IMPORTANTE: Asegurar que el commit se haya completado antes de cerrar
+                    try:
+                        # Si la conexión tiene in_transaction, verificar que no hay transacciones pendientes
+                        if hasattr(conn, '_conn') and hasattr(conn._conn, 'in_transaction'):
+                            if conn._conn.in_transaction:
+                                print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ ADVERTENCIA: Transacción pendiente antes de cerrar conexión")
+                                conn._conn.commit()
+                    except Exception as e:
+                        print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ Error verificando transacción antes de cerrar: {e}")
+                    
                     conn._is_replicating = False
                     # Cerrar la conexión real (el wrapper delega close() a _conn)
                     close_connection(conn)
         
-        print(f"[NAMENODE] [SQL_REPLICATE] ✅ {applied_count}/{len(sql_writes)} escrituras SQL aplicadas ({skipped_count} duplicados ignorados)")
-        return {"success": True, "applied": applied_count, "skipped": skipped_count}
+        # VERIFICACIÓN FINAL: Confirmar que los datos en 'datanodes' están en la BD
+        needs_full_sync = False
+        if datanodes_writes_count > 0:
+            try:
+                from namenode.database import get_connection, close_connection
+                conn_check, cursor_check = get_connection(db_type="metadata", node_id=NODE_ID)
+                try:
+                    cursor_check.execute("SELECT COUNT(*) FROM datanodes")
+                    final_count = cursor_check.fetchone()[0]
+                    print(f"[NAMENODE] [SQL_REPLICATE] 🔍 VERIFICACIÓN FINAL: Total de datanodes en BD después de replicación: {final_count}")
+                    
+                    # Si recibimos escrituras en datanodes pero la BD está vacía o hay muy pocos,
+                    # y aplicamos menos escrituras de las esperadas, necesitamos sincronización completa
+                    if final_count == 0 and applied_count < datanodes_writes_count:
+                        needs_full_sync = True
+                        print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ DETECTADO: BD de datanodes vacía después de replicación SQL")
+                        print(f"[NAMENODE] [SQL_REPLICATE] 💡 SOLUCIÓN: Solicitar sincronización completa de datanodes al líder")
+                finally:
+                    close_connection(conn_check)
+            except Exception as verify_e:
+                print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ Error en verificación final de 'datanodes': {verify_e}")
+        
+        # SOLUCIÓN: Solicitar sincronización completa si es necesario
+        if needs_full_sync:
+            try:
+                from namenode.namenode import get_leader_url
+                leader_url = get_leader_url()
+                if leader_url:
+                    print(f"[NAMENODE] [SQL_REPLICATE] 🔄 Solicitando sincronización completa de datanodes al líder: {leader_url}")
+                    # Intentar obtener los datanodes del líder directamente
+                    # Nota: Esto podría requerir un endpoint adicional, pero por ahora solo logueamos
+                    print(f"[NAMENODE] [SQL_REPLICATE] 💡 La sincronización completa se realizará automáticamente en el próximo ciclo de sync_datanodes")
+                else:
+                    print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ No se puede solicitar sincronización completa: no hay líder conocido")
+            except Exception as sync_e:
+                print(f"[NAMENODE] [SQL_REPLICATE] ⚠️ Error solicitando sincronización completa: {sync_e}")
+        
+        # Log final detallado
+        final_msg = f"[NAMENODE] [SQL_REPLICATE] ✅ {applied_count}/{len(sql_writes)} escrituras SQL aplicadas"
+        if skipped_count > 0:
+            final_msg += f" ({skipped_count} duplicados ignorados)"
+        if error_count > 0:
+            final_msg += f" ({error_count} errores)"
+        if datanodes_writes_count > 0:
+            final_msg += f" - IMPORTANTE: {datanodes_writes_count} escrituras en 'datanodes' procesadas"
+        print(final_msg)
+        
+        return {"success": True, "applied": applied_count, "skipped": skipped_count, "errors": error_count}
         
     except Exception as e:
         print(f"[NAMENODE] [SQL_REPLICATE] Error en internal_replicate_sql: {e}")

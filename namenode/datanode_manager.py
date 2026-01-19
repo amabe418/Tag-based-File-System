@@ -21,6 +21,11 @@ def register_datanode(node_id: str, url: str, port: int, ip: Optional[str],
     
     # Preparar datos fuera del lock
     current_time = time.time()
+    
+    # Logging de la IP recibida
+    ip_info = f" (IP: {ip})" if ip else " (IP: None)"
+    print(f"[DATANODE_MANAGER] 📥 Registrando/actualizando DataNode '{node_id}': url={url}, port={port}{ip_info}")
+    
     update_params = (url, port, ip, total_space, free_space, current_time, node_id)
     insert_params = (node_id, url, port, ip, total_space, free_space, current_time)
     
@@ -64,20 +69,64 @@ def register_datanode(node_id: str, url: str, port: int, ip: Optional[str],
                 
                 # Actualizar DataNode existente (preservar estado de draining si existe)
                 update_params_with_status = (url, port, ip, total_space, free_space, current_time, new_status, node_id)
+                
+                # Logging detallado antes de ejecutar UPDATE
+                ip_info_update = f" (IP: {ip})" if ip else " (IP: None)"
+                print(f"[DATANODE_MANAGER] 🔄 Ejecutando UPDATE completo para DataNode '{node_id}'{ip_info_update} (status={new_status})")
+                
                 cursor.execute("""
                     UPDATE datanodes 
                     SET url = ?, port = ?, ip = ?, total_space = ?, free_space = ?, 
                         last_heartbeat = ?, status = ?
                     WHERE node_id = ?
                 """, update_params_with_status)
+                
+                # Verificar que la IP se guardó correctamente después del UPDATE
+                if cursor.rowcount > 0:
+                    cursor.execute("SELECT ip FROM datanodes WHERE node_id = ?", (node_id,))
+                    saved_ip_row = cursor.fetchone()
+                    if saved_ip_row:
+                        saved_ip = saved_ip_row[0]
+                        if saved_ip != ip:
+                            print(f"[DATANODE_MANAGER] ⚠️ ADVERTENCIA: IP guardada ({saved_ip}) no coincide con IP recibida ({ip}) para datanode '{node_id}'")
+                        else:
+                            ip_info_saved = f" (IP guardada: {saved_ip})" if saved_ip else " (IP guardada: None)"
+                            print(f"[DATANODE_MANAGER] ✅ UPDATE completo exitoso para DataNode '{node_id}'{ip_info_saved}")
             else:
                 # Insertar nuevo DataNode
+                ip_info_insert = f" (IP: {ip})" if ip else " (IP: None)"
+                print(f"[DATANODE_MANAGER] 🔄 Ejecutando INSERT para nuevo DataNode '{node_id}'{ip_info_insert}")
+                
                 cursor.execute("""
                     INSERT INTO datanodes (node_id, url, port, ip, total_space, free_space, last_heartbeat, status, draining)
                     VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 0)
                 """, insert_params)
+                
+                # Verificar que la IP se guardó correctamente después del INSERT
+                cursor.execute("SELECT ip FROM datanodes WHERE node_id = ?", (node_id,))
+                saved_ip_row = cursor.fetchone()
+                if saved_ip_row:
+                    saved_ip = saved_ip_row[0]
+                    ip_info_saved = f" (IP guardada: {saved_ip})" if saved_ip else " (IP guardada: None)"
+                    print(f"[DATANODE_MANAGER] ✅ INSERT exitoso para nuevo DataNode '{node_id}'{ip_info_saved}")
+            
+            # Verificar que somos líder antes de commit para asegurar replicación
+            from namenode.namenode import is_leader
+            is_leader_before_commit = is_leader()
+            
+            if is_leader_before_commit:
+                print(f"[DATANODE_MANAGER] [REPLICATE] ✅ Líder confirmado antes de commit para DataNode {node_id}")
+            else:
+                print(f"[DATANODE_MANAGER] [REPLICATE] ⚠️ Nodo NO es líder antes de commit para DataNode {node_id} - escritura NO se replicará")
             
             conn.commit()
+            
+            # Verificar después del commit si todavía somos líder
+            is_leader_after_commit = is_leader()
+            if is_leader_before_commit and not is_leader_after_commit:
+                print(f"[DATANODE_MANAGER] [REPLICATE] ⚠️ Nodo dejó de ser líder durante commit para DataNode {node_id}")
+            elif is_leader_before_commit and is_leader_after_commit:
+                print(f"[DATANODE_MANAGER] [REPLICATE] ✅ Commit completado, escritura debería replicarse para DataNode {node_id}")
         except Exception as e:
             conn.rollback()
             print(f"[DATANODE_MANAGER] Error al registrar DataNode {node_id}: {e}")
@@ -223,7 +272,21 @@ def update_datanode_heartbeat(node_id: str, free_space: int, total_space: int,
                 print(f"[DATANODE_MANAGER] DataNode {node_id} no encontrado para heartbeat")
                 return False
             
+            # Verificar que somos líder antes de commit para asegurar replicación
+            from namenode.namenode import is_leader
+            is_leader_before_commit = is_leader()
+            
+            if is_leader_before_commit:
+                print(f"[DATANODE_MANAGER] [REPLICATE] ✅ Líder confirmado antes de commit para heartbeat de {node_id}")
+            else:
+                print(f"[DATANODE_MANAGER] [REPLICATE] ⚠️ Nodo NO es líder antes de commit para heartbeat de {node_id} - escritura NO se replicará")
+            
             conn.commit()
+            
+            # Verificar después del commit
+            is_leader_after_commit = is_leader()
+            if is_leader_before_commit and is_leader_after_commit:
+                print(f"[DATANODE_MANAGER] [REPLICATE] ✅ Commit completado, heartbeat debería replicarse para {node_id}")
         except Exception as e:
             conn.rollback()
             print(f"[DATANODE_MANAGER] Error al actualizar heartbeat de {node_id}: {e}")

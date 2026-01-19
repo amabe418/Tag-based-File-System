@@ -642,18 +642,34 @@ def api_download(filename):
                             final_file.write(chunk_file.read())
                 
                 # Verificar hash del archivo ensamblado
+                print(f"[FLASK] Verificando hash del archivo ensamblado...")
+                print(f"[FLASK] Hash esperado del servidor: '{file_hash}' (len={len(file_hash) if file_hash else 0})")
+                
                 with open(final_file_path, 'rb') as f:
                     file_content = f.read()
                     calculated_hash = hashlib.sha256(file_content).hexdigest()
                 
-                if calculated_hash != file_hash:
-                    error_msg = f"Hash del archivo no coincide (esperado: {file_hash[:16]}..., calculado: {calculated_hash[:16]}...)"
+                print(f"[FLASK] Hash calculado del archivo: '{calculated_hash}' (len={len(calculated_hash)})")
+                
+                # Limpiar hash del servidor por si tiene prefijo o espacios
+                clean_file_hash = file_hash.strip() if file_hash else ""
+                if clean_file_hash.startswith("sha256:"):
+                    clean_file_hash = clean_file_hash[7:]
+                    print(f"[FLASK] Hash limpio (sin prefijo): '{clean_file_hash}'")
+                
+                if calculated_hash != clean_file_hash:
+                    error_msg = f"Hash del archivo no coincide (esperado: {clean_file_hash[:16]}..., calculado: {calculated_hash[:16]}...)"
+                    print(f"[FLASK] ❌ ERROR: {error_msg}")
+                    print(f"[FLASK] Hash esperado completo: {clean_file_hash}")
+                    print(f"[FLASK] Hash calculado completo: {calculated_hash}")
                     with download_lock:
                         if download_id in download_progress:
                             download_progress[download_id]["status"] = "error"
                             download_progress[download_id]["error"] = error_msg
                     os.remove(final_file_path)
                     return
+                
+                print(f"[FLASK] ✅ Hash verificado correctamente")
                 
                 # Limpiar chunks temporales
                 try:
@@ -664,13 +680,17 @@ def api_download(filename):
                     print(f"[FLASK] Advertencia: No se pudieron eliminar chunks temporales: {e}")
                 
                 # Actualizar estado: completado
+                print(f"[FLASK] 🎉 Actualizando estado a 'completed' para download_id={download_id}")
                 with download_lock:
                     if download_id in download_progress:
                         download_progress[download_id]["status"] = "completed"
                         download_progress[download_id]["file_path"] = final_file_path
                         download_progress[download_id]["final_filename"] = safe_filename
+                        print(f"[FLASK] ✅ Estado actualizado correctamente a 'completed'")
+                    else:
+                        print(f"[FLASK] ⚠️ download_id={download_id} ya no existe en download_progress!")
                 
-                print(f"[FLASK] Archivo descargado y ensamblado: {final_file_path} ({len(file_content)} bytes)")
+                print(f"[FLASK] ✅ Archivo descargado y ensamblado exitosamente: {final_file_path} ({len(file_content)} bytes)")
                 
             except Exception as e:
                 print(f"[FLASK] Error en hilo de descarga: {e}")
@@ -708,7 +728,13 @@ def api_download_progress(download_id):
         progress_data = download_progress.get(download_id)
     
     if not progress_data:
+        print(f"[FLASK] ⚠️ Consulta de progreso para download_id={download_id} - NO ENCONTRADO")
         return jsonify({"success": False, "error": "Descarga no encontrada"}), 404
+    
+    # Logging del estado actual
+    status = progress_data.get("status")
+    if status in ["completed", "error"]:
+        print(f"[FLASK] 📊 Progreso consultado: download_id={download_id}, status={status}")
     
     return jsonify({
         "success": True,

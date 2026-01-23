@@ -2209,8 +2209,118 @@ def perform_full_reconciliation(reunited_peers: List[str]):
     except Exception as e:
         print(f"[NAMENODE] ❌ [PASO 10.3] Error en aplicación local: {e}")
     
+    # PASO 10.5: Reconstruir tabla file_replicas basándose en hashes
+    print(f"[NAMENODE] 🔄 [PASO 10.5] Reconstruyendo tabla file_replicas con file_ids correctos...")
+    
+    try:
+        # Obtener mapeo hash → file_id actual
+        db_path = get_db_path(NODE_ID)
+        hash_to_file_id = {}
+        
+        from namenode.rw_lock import ReadLock
+        from namenode.database import metadata_rw_lock
+        
+        with ReadLock(metadata_rw_lock):
+            conn, cursor = get_connection(db_path=db_path, node_id=NODE_ID)
+            try:
+                cursor.execute("SELECT id, hash FROM files")
+                for row in cursor.fetchall():
+                    file_id, file_hash = row
+                    if file_hash:
+                        hash_to_file_id[file_hash] = file_id
+                
+                print(f"[DEBUG] 🔍 [PASO 10.5] Mapeo hash→file_id creado: {len(hash_to_file_id)} archivos")
+            finally:
+                close_connection(conn)
+        
+        # Obtener todas las réplicas actuales
+        replicas_to_update = []
+        
+        with db_lock:
+            conn, cursor = get_connection(db_path=db_path, node_id=NODE_ID)
+            try:
+                # Obtener todas las réplicas con hash del archivo
+                cursor.execute("""
+                    SELECT fr.file_id, fr.datanode_id, fr.replica_type, f.hash
+                    FROM file_replicas fr
+                    LEFT JOIN files f ON fr.file_id = f.id
+                """)
+                
+                for row in cursor.fetchall():
+                    old_file_id, datanode_id, replica_type, file_hash = row
+                    
+                    if file_hash is None:
+                        # Archivo no existe, réplica huérfana
+                        print(f"[DEBUG] ⚠️  [PASO 10.5] Réplica huérfana detectada: file_id={old_file_id}, datanode={datanode_id} (archivo no existe)")
+                        replicas_to_update.append({
+                            "action": "delete",
+                            "old_file_id": old_file_id,
+                            "datanode_id": datanode_id
+                        })
+                    elif file_hash in hash_to_file_id:
+                        correct_file_id = hash_to_file_id[file_hash]
+                        
+                        if old_file_id != correct_file_id:
+                            # File_id cambió, necesita actualización
+                            print(f"[DEBUG] 🔄 [PASO 10.5] Réplica necesita actualización: file_id {old_file_id} → {correct_file_id} (hash={file_hash[:16]}..., datanode={datanode_id})")
+                            replicas_to_update.append({
+                                "action": "update",
+                                "old_file_id": old_file_id,
+                                "new_file_id": correct_file_id,
+                                "datanode_id": datanode_id,
+                                "replica_type": replica_type,
+                                "hash": file_hash
+                            })
+                
+                print(f"[DEBUG] 🔍 [PASO 10.5] Réplicas a actualizar: {len(replicas_to_update)}")
+                
+                # Aplicar actualizaciones
+                if replicas_to_update:
+                    for update in replicas_to_update:
+                        if update["action"] == "delete":
+                            # Eliminar réplica huérfana
+                            cursor.execute("""
+                                DELETE FROM file_replicas 
+                                WHERE file_id = ? AND datanode_id = ?
+                            """, (update["old_file_id"], update["datanode_id"]))
+                            print(f"[DEBUG] 🗑️  [PASO 10.5] Réplica huérfana eliminada: file_id={update['old_file_id']}, datanode={update['datanode_id']}")
+                        
+                        elif update["action"] == "update":
+                            # Actualizar file_id de la réplica
+                            # Primero eliminar la entrada antigua
+                            cursor.execute("""
+                                DELETE FROM file_replicas 
+                                WHERE file_id = ? AND datanode_id = ?
+                            """, (update["old_file_id"], update["datanode_id"]))
+                            
+                            # Insertar con el file_id correcto
+                            cursor.execute("""
+                                INSERT OR REPLACE INTO file_replicas (file_id, datanode_id, replica_type)
+                                VALUES (?, ?, ?)
+                            """, (update["new_file_id"], update["datanode_id"], update["replica_type"]))
+                            
+                            print(f"[DEBUG] ✅ [PASO 10.5] Réplica actualizada: file_id {update['old_file_id']} → {update['new_file_id']}, datanode={update['datanode_id']}")
+                    
+                    conn.commit()
+                    print(f"[NAMENODE] 🔄 [PASO 10.5] ✅ Tabla file_replicas actualizada: {len(replicas_to_update)} cambios aplicados")
+                else:
+                    print(f"[NAMENODE] 🔄 [PASO 10.5] ✅ Tabla file_replicas correcta, sin cambios necesarios")
+                
+            except Exception as e:
+                conn.rollback()
+                print(f"[NAMENODE] ❌ [PASO 10.5] Error actualizando file_replicas: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                close_connection(conn)
+    
+    except Exception as e:
+        print(f"[NAMENODE] ❌ [PASO 10.5] Error en reconstrucción de file_replicas: {e}")
+        import traceback
+        traceback.print_exc()
+    
     # CUARTO: Si somos el líder, sincronizar tabla fusionada a todos los peers
-    print(f"[NAMENODE] 🔄 [PASO 10.4] Sincronizando tabla fusionada a todos los peers...")
+    print(f"[NAMENODE] 🔄 [PASO 10.6] Sincronizando tabla fusionada a todos los peers...")
     
     if is_leader_now:
         try:
@@ -2220,7 +2330,32 @@ def perform_full_reconciliation(reunited_peers: List[str]):
                     # Esperar 2 segundos para que los peers terminen su reconciliación
                     time.sleep(2)
                     
-                    # Enviar tabla fusionada a cada peer reunificado
+                    # Obtener file_replicas del líder también
+                    db_path = get_db_path(NODE_ID)
+                    from namenode.rw_lock import ReadLock
+                    from namenode.database import metadata_rw_lock
+                    
+                    file_replicas = []
+                    with ReadLock(metadata_rw_lock):
+                        conn, cursor = get_connection(db_path=db_path, node_id=NODE_ID)
+                        try:
+                            cursor.execute("""
+                                SELECT file_id, datanode_id, replica_type
+                                FROM file_replicas
+                                ORDER BY file_id, replica_type
+                            """)
+                            for row in cursor.fetchall():
+                                file_replicas.append({
+                                    "file_id": row[0],
+                                    "datanode_id": row[1],
+                                    "replica_type": row[2]
+                                })
+                        finally:
+                            close_connection(conn)
+                    
+                    print(f"[NAMENODE] 🔄 [PASO 10.6] Sincronizando {len(final_datanodes)} datanodes y {len(file_replicas)} réplicas...")
+                    
+                    # Enviar tablas fusionadas a cada peer reunificado
                     with cluster_lock:
                         term = cluster_state["term"]
                         leader_id = cluster_state["node_id"]
@@ -2234,7 +2369,9 @@ def perform_full_reconciliation(reunited_peers: List[str]):
                     for peer in reunited_peers:
                         try:
                             peer_url = get_peer_url(peer)
-                            response = requests.post(
+                            
+                            # Sincronizar datanodes
+                            response_dn = requests.post(
                                 f"{peer_url}/internal/sync-datanodes",
                                 json={
                                     "datanodes": final_datanodes,  # Usar tabla fusionada
@@ -2246,30 +2383,49 @@ def perform_full_reconciliation(reunited_peers: List[str]):
                                 timeout=10
                             )
                             
-                            if response.status_code == 200:
-                                sync_count += 1
-                                print(f"[NAMENODE] ✅ [PASO 10.4] Tabla fusionada sincronizada a {peer}")
+                            if response_dn.status_code == 200:
+                                print(f"[NAMENODE] ✅ [PASO 10.6] Tabla datanodes sincronizada a {peer}")
                             else:
-                                print(f"[NAMENODE] ⚠️  [PASO 10.4] Error sincronizando a {peer}: HTTP {response.status_code}")
+                                print(f"[NAMENODE] ⚠️  [PASO 10.6] Error sincronizando datanodes a {peer}: HTTP {response_dn.status_code}")
+                            
+                            # Sincronizar file_replicas
+                            response_fr = requests.post(
+                                f"{peer_url}/internal/sync-file-replicas",
+                                json={
+                                    "file_replicas": file_replicas,
+                                    "term": term,
+                                    "leader_id": leader_id,
+                                    "timestamp": time.time()
+                                },
+                                headers={"Authorization": f"Bearer {service_token}"},
+                                timeout=10
+                            )
+                            
+                            if response_fr.status_code == 200:
+                                sync_count += 1
+                                print(f"[NAMENODE] ✅ [PASO 10.6] Tabla file_replicas sincronizada a {peer}")
+                            else:
+                                print(f"[NAMENODE] ⚠️  [PASO 10.6] Error sincronizando file_replicas a {peer}: HTTP {response_fr.status_code}")
+                            
                         except Exception as e:
-                            print(f"[NAMENODE] ⚠️  [PASO 10.4] Error sincronizando a {peer}: {e}")
+                            print(f"[NAMENODE] ⚠️  [PASO 10.6] Error sincronizando a {peer}: {e}")
                     
-                    print(f"[NAMENODE] 🔄 [PASO 10.4] ✅ Sincronización completada: {sync_count}/{len(reunited_peers)} peers")
+                    print(f"[NAMENODE] 🔄 [PASO 10.6] ✅ Sincronización completada: {sync_count}/{len(reunited_peers)} peers con datanodes y file_replicas")
                 
                 except Exception as e:
-                    print(f"[NAMENODE] ❌ [PASO 10.4] Error en sincronización: {e}")
+                    print(f"[NAMENODE] ❌ [PASO 10.6] Error en sincronización: {e}")
                     import traceback
                     traceback.print_exc()
             
             # Ejecutar en background
             sync_thread = threading.Thread(target=sync_merged_table, daemon=True, name="merged-table-sync")
             sync_thread.start()
-            print(f"[NAMENODE] 🔄 [PASO 10.4] Líder sincronizando tabla fusionada en background...")
+            print(f"[NAMENODE] 🔄 [PASO 10.6] Líder sincronizando tabla fusionada en background...")
             
         except Exception as e:
-            print(f"[NAMENODE] ⚠️  [PASO 10.4] Error iniciando sincronización: {e}")
+            print(f"[NAMENODE] ⚠️  [PASO 10.6] Error iniciando sincronización: {e}")
     else:
-        print(f"[NAMENODE] 🔄 [PASO 10.4] Este nodo NO es líder, tabla fusionada ya aplicada localmente")
+        print(f"[NAMENODE] 🔄 [PASO 10.6] Este nodo NO es líder, tabla fusionada ya aplicada localmente")
     
     # Estadísticas finales
     final_log = load_operation_log(NODE_ID)
@@ -2921,6 +3077,97 @@ def update_active_followers_from_dns():
         print(f"[NAMENODE] 🔍 [FOLLOWER_TRACKING] 📋 Lista actualizada: {len(verified_active_followers)}/{len(peers)} seguidores activos: {sorted(verified_active_followers)}")
 
 
+def sync_file_replicas_to_followers():
+    """
+    Sincroniza la tabla completa de file_replicas del líder con los seguidores.
+    Se ejecuta periódicamente desde el líder para asegurar consistencia.
+    """
+    if not is_leader():
+        return
+    
+    try:
+        # Obtener todas las réplicas del líder (solo lectura, rápido)
+        db_path = get_db_path(NODE_ID)
+        
+        # Usar solo read lock para lectura, liberar rápidamente
+        from namenode.rw_lock import ReadLock
+        from namenode.database import metadata_rw_lock
+        
+        file_replicas = []
+        with ReadLock(metadata_rw_lock):
+            conn, cursor = get_connection(db_path=db_path, node_id=NODE_ID)
+            
+            try:
+                cursor.execute("""
+                    SELECT file_id, datanode_id, replica_type
+                    FROM file_replicas
+                    ORDER BY file_id, replica_type
+                """)
+                
+                for row in cursor.fetchall():
+                    file_replicas.append({
+                        "file_id": row[0],
+                        "datanode_id": row[1],
+                        "replica_type": row[2]
+                    })
+            finally:
+                close_connection(conn)
+        
+        if not file_replicas:
+            print(f"[NAMENODE] 🔄 [SYNC_FILE_REPLICAS] No hay réplicas para sincronizar")
+            return
+        
+        print(f"[NAMENODE] 🔄 [SYNC_FILE_REPLICAS] Sincronizando {len(file_replicas)} réplicas a seguidores")
+        
+        # Obtener lista de seguidores activos
+        with cluster_lock:
+            leader_id = cluster_state["node_id"]
+            active_followers = cluster_state.get("active_followers", [])
+            term = cluster_state["term"]
+        
+        if not active_followers:
+            print(f"[NAMENODE] 🔄 [SYNC_FILE_REPLICAS] No hay seguidores activos para sincronizar")
+            return
+        
+        # Obtener token de servicio
+        try:
+            service_token = generate_service_token(leader_id, "service")
+        except Exception:
+            service_token = os.getenv("NAMENODE_SERVICE_TOKEN", "namenode-service-token")
+        
+        # Enviar snapshot a cada seguidor activo
+        success_count = 0
+        for follower in active_followers:
+            try:
+                follower_url = get_peer_url(follower)
+                response = requests.post(
+                    f"{follower_url}/internal/sync-file-replicas",
+                    json={
+                        "file_replicas": file_replicas,
+                        "term": term,
+                        "leader_id": leader_id,
+                        "timestamp": time.time()
+                    },
+                    headers={"Authorization": f"Bearer {service_token}"},
+                    timeout=10
+                )
+                
+                if response.status_code == 200:
+                    success_count += 1
+                    print(f"[NAMENODE] ✅ [SYNC_FILE_REPLICAS] Tabla file_replicas sincronizada a {follower}")
+                else:
+                    print(f"[NAMENODE] ⚠️  [SYNC_FILE_REPLICAS] Error sincronizando a {follower}: HTTP {response.status_code}")
+            except Exception as e:
+                print(f"[NAMENODE] ⚠️  [SYNC_FILE_REPLICAS] Error sincronizando a {follower}: {e}")
+        
+        print(f"[NAMENODE] 🔄 [SYNC_FILE_REPLICAS] Sincronización completada: {success_count}/{len(active_followers)} seguidores actualizados")
+        
+    except Exception as e:
+        print(f"[NAMENODE] ❌ [SYNC_FILE_REPLICAS] Error en sincronización: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 def sync_datanodes_to_followers():
     """
     Sincroniza la tabla completa de datanodes del líder con los seguidores.
@@ -3027,9 +3274,11 @@ def leader_heartbeat_loop():
     """
     follower_check_counter = 0
     datanode_sync_counter = 0
+    file_replicas_sync_counter = 0
     multi_leader_check_counter = 0
     FOLLOWER_CHECK_INTERVAL = 6  # Verificar seguidores vía DNS cada 6 ciclos (~30 segundos)
     DATANODE_SYNC_INTERVAL = 12  # Sincronizar datanodes cada 12 ciclos (~60 segundos)
+    FILE_REPLICAS_SYNC_INTERVAL = 12  # Sincronizar file_replicas cada 12 ciclos (~60 segundos)
     MULTI_LEADER_CHECK_INTERVAL = 6  # Verificar múltiples líderes cada 6 ciclos (~30 segundos)
     
     while True:
@@ -3113,7 +3362,7 @@ def leader_heartbeat_loop():
             datanode_sync_counter = 0
             try:
                 # Ejecutar en background para no bloquear heartbeats
-                def sync_in_background():
+                def sync_datanodes_bg():
                     try:
                         sync_datanodes_to_followers()
                     except Exception as e:
@@ -3121,10 +3370,30 @@ def leader_heartbeat_loop():
                         import traceback
                         traceback.print_exc()
                 
-                sync_thread = threading.Thread(target=sync_in_background, daemon=True, name="datanode-sync")
+                sync_thread = threading.Thread(target=sync_datanodes_bg, daemon=True, name="datanode-sync")
                 sync_thread.start()
             except Exception as e:
                 print(f"[NAMENODE] ⚠️  [HEARTBEAT] Error iniciando sincronización de datanodes: {e}")
+        
+        # Sincronizar tabla file_replicas periódicamente (cada ~60 segundos)
+        # Ejecutar en thread separado para no bloquear heartbeats
+        file_replicas_sync_counter += 1
+        if file_replicas_sync_counter >= FILE_REPLICAS_SYNC_INTERVAL:
+            file_replicas_sync_counter = 0
+            try:
+                # Ejecutar en background para no bloquear heartbeats
+                def sync_file_replicas_bg():
+                    try:
+                        sync_file_replicas_to_followers()
+                    except Exception as e:
+                        print(f"[NAMENODE] ⚠️  [SYNC_FILE_REPLICAS] Error en sincronización background: {e}")
+                        import traceback
+                        traceback.print_exc()
+                
+                sync_thread = threading.Thread(target=sync_file_replicas_bg, daemon=True, name="file-replicas-sync")
+                sync_thread.start()
+            except Exception as e:
+                print(f"[NAMENODE] ⚠️  [HEARTBEAT] Error iniciando sincronización de file_replicas: {e}")
         
         # Enviar heartbeat para mantener el liderazgo
         with cluster_lock:
@@ -3232,21 +3501,25 @@ def leader_heartbeat_loop():
         # Sincronizar inmediatamente a nuevos seguidores
         if new_followers:
             print(f"[NAMENODE] 🆕 [HEARTBEAT] Nuevos seguidores detectados: {sorted(new_followers)}")
-            print(f"[NAMENODE] 🔄 [HEARTBEAT] Sincronizando tabla datanodes inmediatamente a nuevos seguidores...")
+            print(f"[NAMENODE] 🔄 [HEARTBEAT] Sincronizando tablas inmediatamente a nuevos seguidores...")
             
             # Sincronizar solo a los nuevos seguidores (en background para no bloquear)
             def sync_new_followers():
                 try:
-                    # Obtener datanodes del líder
+                    # Obtener datanodes y file_replicas del líder
                     db_path = get_db_path(NODE_ID)
                     from namenode.database import get_connection, close_connection
                     from namenode.rw_lock import ReadLock
                     from namenode.database import metadata_rw_lock
                     
+                    # Obtener datanodes
                     datanodes = []
+                    file_replicas = []
+                    
                     with ReadLock(metadata_rw_lock):
                         conn, cursor = get_connection(db_path=db_path, node_id=NODE_ID)
                         try:
+                            # Leer datanodes
                             cursor.execute("""
                                 SELECT node_id, url, port, ip, total_space, free_space, 
                                        last_heartbeat, status, registered_at, draining
@@ -3265,8 +3538,23 @@ def leader_heartbeat_loop():
                                     "registered_at": row[8],
                                     "draining": bool(row[9]) if row[9] is not None else False
                                 })
+                            
+                            # Leer file_replicas
+                            cursor.execute("""
+                                SELECT file_id, datanode_id, replica_type
+                                FROM file_replicas
+                                ORDER BY file_id, replica_type
+                            """)
+                            for row in cursor.fetchall():
+                                file_replicas.append({
+                                    "file_id": row[0],
+                                    "datanode_id": row[1],
+                                    "replica_type": row[2]
+                                })
                         finally:
                             close_connection(conn)
+                    
+                    print(f"[NAMENODE] 🔄 [HEARTBEAT] Sincronizando {len(datanodes)} datanodes y {len(file_replicas)} réplicas...")
                     
                     # Enviar a cada nuevo seguidor
                     with cluster_lock:
@@ -3281,7 +3569,9 @@ def leader_heartbeat_loop():
                     for follower in new_followers:
                         try:
                             follower_url = get_peer_url(follower)
-                            response = requests.post(
+                            
+                            # Sincronizar datanodes
+                            response_dn = requests.post(
                                 f"{follower_url}/internal/sync-datanodes",
                                 json={
                                     "datanodes": datanodes,
@@ -3293,10 +3583,29 @@ def leader_heartbeat_loop():
                                 timeout=10
                             )
                             
-                            if response.status_code == 200:
+                            if response_dn.status_code == 200:
                                 print(f"[NAMENODE] ✅ [HEARTBEAT] Tabla datanodes sincronizada a nuevo seguidor {follower}")
                             else:
-                                print(f"[NAMENODE] ⚠️  [HEARTBEAT] Error sincronizando a nuevo seguidor {follower}: HTTP {response.status_code}")
+                                print(f"[NAMENODE] ⚠️  [HEARTBEAT] Error sincronizando datanodes a {follower}: HTTP {response_dn.status_code}")
+                            
+                            # Sincronizar file_replicas
+                            response_fr = requests.post(
+                                f"{follower_url}/internal/sync-file-replicas",
+                                json={
+                                    "file_replicas": file_replicas,
+                                    "term": term,
+                                    "leader_id": leader_id,
+                                    "timestamp": time.time()
+                                },
+                                headers={"Authorization": f"Bearer {service_token}"},
+                                timeout=10
+                            )
+                            
+                            if response_fr.status_code == 200:
+                                print(f"[NAMENODE] ✅ [HEARTBEAT] Tabla file_replicas sincronizada a nuevo seguidor {follower}")
+                            else:
+                                print(f"[NAMENODE] ⚠️  [HEARTBEAT] Error sincronizando file_replicas a {follower}: HTTP {response_fr.status_code}")
+                            
                         except Exception as e:
                             print(f"[NAMENODE] ⚠️  [HEARTBEAT] Error sincronizando a nuevo seguidor {follower}: {e}")
                 
@@ -6685,6 +6994,113 @@ def internal_get_datanodes(
         import traceback
         traceback.print_exc()
         return {"node_id": NODE_ID, "datanodes": [], "error": str(e)}
+
+
+@app.post("/internal/sync-file-replicas")
+def internal_sync_file_replicas(
+    data: Dict,
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    """
+    Endpoint interno para recibir sincronización completa de la tabla file_replicas del líder.
+    Este endpoint reemplaza completamente la tabla file_replicas local con el snapshot del líder.
+    """
+    # Verificar autenticación de servicio
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Se requiere token de servicio")
+    
+    token = authorization.split(" ")[1]
+    payload = verify_service_token(token)
+    
+    if not payload:
+        raise HTTPException(status_code=403, detail="Token de servicio inválido")
+    
+    # Verificar que viene de otro namenode
+    service_id = payload.get("service_id") or payload.get("sub", "")
+    if not (service_id.startswith("namenode-") or service_id.startswith("tbfs-namenode-")):
+        raise HTTPException(status_code=403, detail="Solo namenodes pueden sincronizar file_replicas")
+    
+    try:
+        file_replicas = data.get("file_replicas", [])
+        term = data.get("term")
+        leader_id = data.get("leader_id")
+        timestamp = data.get("timestamp")
+        
+        print(f"[NAMENODE] 🔄 [SYNC_FILE_REPLICAS] Recibido snapshot de file_replicas del líder {leader_id}")
+        print(f"[NAMENODE] 🔄 [SYNC_FILE_REPLICAS] Term: {term}, Timestamp: {timestamp}")
+        print(f"[NAMENODE] 🔄 [SYNC_FILE_REPLICAS] Total réplicas en snapshot: {len(file_replicas)}")
+        
+        # Actualizar término si es necesario
+        with cluster_lock:
+            current_term = cluster_state["term"]
+            if term > current_term:
+                cluster_state["term"] = term
+                cluster_state["is_leader"] = False
+                cluster_state["leader_id"] = leader_id
+                cluster_state["last_heartbeat_time"] = time.time()
+        
+        # Sincronizar tabla file_replicas
+        db_path = get_db_path(NODE_ID)
+        
+        # Preparar datos fuera del lock
+        old_replicas_count = 0
+        new_replicas_count = 0
+        
+        # Adquirir write lock solo durante la escritura
+        with db_lock:
+            conn, cursor = get_connection(db_path=db_path, node_id=NODE_ID)
+            
+            try:
+                # Marcar que estamos replicando para evitar replicación recursiva
+                conn._is_replicating = True
+                
+                # Obtener estado actual antes de sincronizar (rápido)
+                cursor.execute("SELECT COUNT(*) FROM file_replicas")
+                old_replicas_count = cursor.fetchone()[0]
+                
+                # Limpiar tabla file_replicas (sincronización completa)
+                cursor.execute("DELETE FROM file_replicas")
+                
+                # Preparar batch insert para ser más eficiente
+                if file_replicas:
+                    insert_values = [(r["file_id"], r["datanode_id"], r["replica_type"]) for r in file_replicas]
+                    
+                    cursor.executemany("""
+                        INSERT INTO file_replicas (file_id, datanode_id, replica_type)
+                        VALUES (?, ?, ?)
+                    """, insert_values)
+                    new_replicas_count = len(insert_values)
+                
+                conn.commit()
+                
+            except Exception as e:
+                conn.rollback()
+                print(f"[NAMENODE] ❌ [SYNC_FILE_REPLICAS] Error sincronizando tabla: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+            finally:
+                close_connection(conn)
+        
+        # Calcular diferencias y logging fuera del lock
+        print(f"[NAMENODE] ✅ [SYNC_FILE_REPLICAS] Sincronización completada:")
+        print(f"[NAMENODE] ✅ [SYNC_FILE_REPLICAS]   - Réplicas anteriores: {old_replicas_count}")
+        print(f"[NAMENODE] ✅ [SYNC_FILE_REPLICAS]   - Réplicas nuevas: {new_replicas_count}")
+        print(f"[NAMENODE] ✅ [SYNC_FILE_REPLICAS]   - Diferencia: {new_replicas_count - old_replicas_count:+d}")
+        
+        return {
+            "success": True,
+            "old_count": old_replicas_count,
+            "new_count": new_replicas_count
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[NAMENODE] ❌ [SYNC_FILE_REPLICAS] Error en internal_sync_file_replicas: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "message": str(e)}
 
 
 @app.post("/internal/sync-datanodes")
